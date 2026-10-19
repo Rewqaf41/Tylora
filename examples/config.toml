@@ -1,6 +1,27 @@
 # Copy to ~/.config/tylora/config.toml. Hotkeys reload automatically.
 # Read native_space_id values from `tylora space list --json`.
-# Optional application rule (exact bundle ID; initial mode on discovery):
+# Application rules (see README "Application rules"):
+# [[rules]]
+# id = "vscode-code"
+# bundle_id = "com.microsoft.VSCode"
+# workspace = "Code"
+# mode = "tiled"
+# priority = 100
+# apply = "on_create"
+# Scratchpad: a window toggled with a hotkey, never tiled.
+# [[scratchpads]]
+# id = "term"
+# hotkey = "option+grave"
+# scope = "global"
+# width = 0.7
+# height = 0.65
+# alignment = "center"
+# hide = "park"
+# [[rules]]
+# id = "terminal-scratchpad"
+# bundle_id = "com.apple.Terminal"
+# scratchpad = "term"
+# Legacy mode-only rule (still supported):
 # [[window_rules]]
 # application_id = "com.example.Editor"
 # mode = "floating"

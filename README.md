@@ -124,6 +124,94 @@ Mouse resize changes split ratios in BSP/Dwindle and the focused column width in
 
 Windows left mostly off screen are journaled in `$TMPDIR/tylora-<uid>.offscreen.json` (mode 0600). `tylora stop` brings them all back on screen; after a crash the next `tylora start` or an offline `tylora recover-windows` restores them, matching by process, frame and title. With the daemon running, `recover-windows` leaves columns the Scrolling layout parks on purpose — reach them by navigation or switch the workspace to BSP.
 
+## Application rules
+
+`[[rules]]` place windows of an application in a workspace or on a display and set their mode. Matching is deterministic: rules are visited by `priority` (higher first, then file order); each action (move, mode) comes from the first matching rule that sets it, and `stop = true` (default) ends the walk. Workspace and display always come from the same rule, so a window never gets two conflicting moves.
+
+```toml
+[[rules]]
+id = "vscode-code"
+name = "VS Code to Code"
+bundle_id = "com.microsoft.VSCode"
+workspace = "code"          # workspace name or ID; uses its bound native Space
+mode = "tiled"              # unchanged | tiled | floating | unmanaged
+priority = 100
+apply = "on_create"         # on_create | on_first_seen | on_title_change | manual
+
+[[rules]]
+id = "calculator-floating"
+bundle_id = "com.apple.calculator"
+mode = "floating"
+
+[[rules]]
+id = "quick-notes"
+bundle_id = "com.apple.Notes"
+title = "^Quick"            # optional; title_match = exact | contains | regex
+title_match = "regex"
+display = 2                 # with workspace: that workspace's Space on display 2, else an error
+mode = "floating"
+```
+
+- **Moves** use the native Space bound to the workspace (`native_space_id`/`native_space_ids`) and the existing verified mover; Tylora updates its state only after WindowServer confirms the move. Nothing is minimized, placed off screen or chosen by Desktop order.
+- **When rules run**: `on_create` for windows opened while the daemon runs (windows open at startup are excluded), `on_first_seen` also for those, `on_title_change` again when the title changes, `manual` only through `rules apply`. A configuration reload never re-applies rules to open windows. A rule with a title condition waits briefly (a few observations, at most two seconds) for the title.
+- **Manual override**: once a rule moved a window, any later move to another Space (by you, a hotkey or Mission Control) marks an override and rules leave the window alone until it closes or you apply the rule again. Each window gets at most two automatic attempts.
+- Dialogs, sheets and other non-standard windows are never tiled or moved. Legacy `[[window_rules]]` keep working as mode-only rules applied on first sight.
+
+```sh
+tylora rules list [--json]
+tylora rules validate [--json]                 # config file + bound Spaces/displays
+tylora rules test --window <CGWindowID> [--json] # preview: matches, winner, reasons, plan; moves nothing
+tylora rules apply --window <CGWindowID> [--json] # apply now, clearing a manual override
+tylora rules reload [--json]
+tylora rules diagnostics [--json]              # timings, moves, modes, errors, overrides, recent actions
+tylora apps list [--json]                      # running apps with real bundle IDs
+```
+
+CGWindowIDs are shown by `tylora windows --json`. The Settings app's Window Rules page edits rules (create, edit, delete, enable, drag to reorder), picks applications from the running ones, and has a Rule Preview with an explicitly confirmed **Apply rule now**.
+
+## Scratchpads
+
+A scratchpad is a named window kept one hotkey away (like Hyprland special workspaces). It never takes part in BSP, Dwindle or Scrolling: assigning a tiled window floats it and the rest reflows; unassigning tiles it again.
+
+```toml
+[[scratchpads]]
+id = "term"                 # 1-32 letters, digits, '-' or '_'
+name = "Terminal"
+hotkey = "option+grave"     # toggles; checked against other hotkeys
+scope = "global"            # global: shown on the current Space | local: only on its own Space
+width = 0.7                 # fractions of the work area (0.1-1)
+height = 0.65
+alignment = "center"        # center | top | bottom | left | right | top_left | ... | bottom_right
+offset_x = 0
+offset_y = 0
+target = "pointer"          # pointer | focused; `display = ID` pins it to one display
+remember_position = true
+remember_size = true
+hide = "park"               # park (default) | minimize (explicit opt-in)
+bundle_id = "com.apple.Terminal"   # optional; filters the window list in Settings
+
+[[rules]]
+id = "terminal-scratchpad"
+bundle_id = "com.apple.Terminal"
+scratchpad = "term"         # cannot be combined with workspace, display or mode
+```
+
+- **Hide** moves the window with the verified native mover to a *parking* Desktop on its display. Tylora adds that Desktop through Mission Control the first time it needs one. There is no off-screen placement, and no window gets "all Spaces" behaviour (SIP stays enabled; nothing is injected into the Dock or WindowServer). `hide = "minimize"` uses AXMinimized instead, and only when you choose it.
+- **Show** moves the window to the active Space of the target display, sets the frame, raises and focuses it, then checks that it is on screen. Hiding returns focus to the previously focused window. Focus follows mouse is paused while a show or hide runs.
+- **Assignment**: manual assignment (CLI or Settings) always wins. A rule only fills an empty scratchpad, with the first matching new window, once.
+- **Recovery**: `tylora stop`, `tylora recover-windows` (also when the daemon is not running) and `tylora scratchpad recover` move parked windows back to their home Space, or to the active Space of their display. State is kept in `~/.local/state/tylora/scratchpads.json`. Closed windows become `unavailable`; removed parking Desktops are recreated on the next hide.
+
+```sh
+tylora scratchpad list [--json]
+tylora scratchpad assign <id> [--window <CGWindowID>] [--force] [--json]  # default: focused window
+tylora scratchpad unassign <id> [--json]
+tylora scratchpad toggle|show|hide <id> [--json]
+tylora scratchpad recover [--json]
+tylora scratchpad capabilities [--json]
+```
+
+The Settings app's Scratchpads page creates, edits and deletes scratchpads, records the hotkey, shows state, size and position with a geometry preview, and has **Assign Focused Window** (the window focused before Settings), toggle/show/hide and the backend capabilities.
+
 ## Manual macOS validation
 
 1. In a graphical session, run `list-windows --ax`; confirm CG geometry and separate AX geometry are plausible. Verify the CLI warns when Accessibility access is absent.
@@ -137,6 +225,7 @@ Windows left mostly off screen are journaled in `$TMPDIR/tylora-<uid>.offscreen.
 9. Test an app that denies or delays AX operations. Confirm other apps remain responsive, `status` works, and failures are logged.
 10. Stop with `tylora stop`; verify any windows from the old recovery journal return and the process and socket disappear. Restart the daemon and recheck native Space discovery.
 11. Layouts: open four disposable TextEdit documents on one Space and run `layout set scrolling`. `layout current` must show `visible`/`partial`/`parked` columns and `windows` must show observed frames equal to desired ones (parked frames at the bottom-right or bottom-left corner). Use Option+H/L, Option+Control+H/L, Option+Control+C and Option+Control+W and recheck. Click a parked sliver or Cmd-Tab to its app: the strip scrolls to it. Switch to `dwindle`, focus one window and open another document: it must split the focused window. Option+right-drag in each layout. Switch Spaces and back: order, ratios and widths return. Finally `tylora stop` with parked columns and confirm every window is back on screen (`list-windows --ax`).
+12. Rules: add a rule for TextEdit with `workspace` set to an inactive bound workspace, open a new document and check `rules diagnostics` and `space windows N`. Move the window elsewhere with a hotkey: it must stay (manual override). `rules apply --window` brings it back. Edit the rule in Settings and confirm `rules list` changes without restarting.
 
 Automated tests and CLI smoke checks do not replace the modifier-drag and display hotplug checks above.
 
