@@ -1,0 +1,21 @@
+[package]
+name = "tylora-daemon"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tylora-core = { path = "../../crates/tylora-core" }
+tylora-layout = { path = "../../crates/tylora-layout" }
+tylora-macos = { path = "../../crates/tylora-macos" }
+tylora-config = { path = "../../crates/tylora-config" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[[bin]]
+name = "tylora"
+path = "src/main.rs"

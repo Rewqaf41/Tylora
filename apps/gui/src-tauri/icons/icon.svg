@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#344550"/><stop offset=".54" stop-color="#172229"/><stop offset="1" stop-color="#0b1419"/></linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#02d4f3"/><stop offset=".57" stop-color="#00aef6"/><stop offset="1" stop-color="#086bf7"/></linearGradient>
+    <linearGradient id="silver" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#d4e0e8"/><stop offset="1" stop-color="#8da5b7"/></linearGradient>
+    <linearGradient id="stem" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#899da9"/><stop offset="1" stop-color="#40515d"/></linearGradient>
+  </defs>
+  <rect x="8" y="8" width="496" height="496" rx="115" fill="url(#background)"/>
+  <path d="M91 150c0-18 14-32 32-32h121c6 0 10 4 10 10v137c0 7-5 12-12 10L116 240c-15-4-25-17-25-33z" fill="url(#blue)"/>
+  <path d="M270 128c0-6 4-10 10-10h105c21 0 36 16 36 36v61c0 17-9 28-23 35l-118 55c-5 2-10-1-10-7z" fill="url(#silver)"/>
+  <path d="M210 277c0-8 6-13 14-11l42 13c5 1 8 5 8 10v127c0 8-7 13-14 10l-30-11c-13-5-20-16-20-29z" fill="url(#stem)"/>
+</svg>

@@ -1,0 +1,21 @@
+[package]
+name = "tylora-macos"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tylora-core = { path = "../tylora-core" }
+tylora-config = { path = "../tylora-config" }
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "=0.2.2", features = ["NSScreen", "NSRunningApplication", "NSWorkspace", "libc"] }
+objc2-foundation = { version = "=0.2.2", features = ["NSArray", "NSGeometry", "NSThread"] }
+# NSScreen.screens may be backed by a Swift array whose count encodes Int
+# instead of NSUInteger. objc2 explicitly supports this compatible case.
+objc2 = { version = "=0.5.2", features = ["relax-sign-encoding"] }
+

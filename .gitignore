@@ -1,0 +1,7 @@
+/target/
+.DS_Store
+/apps/gui/node_modules/
+/apps/gui/dist/
+/apps/gui/src-tauri/binaries/
+/apps/gui/src-tauri/gen/
+CLAUDE.MD

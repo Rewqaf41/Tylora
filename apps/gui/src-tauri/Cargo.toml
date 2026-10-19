@@ -1,0 +1,22 @@
+[package]
+name = "tylora-gui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "=2.11.6", features = ["tray-icon"] }
+tauri-runtime = "=2.11.3"
+tauri-runtime-wry = "=2.11.4"
+tauri-macros = "=2.6.3"
+tauri-codegen = "=2.6.3"
+serde.workspace = true
+serde_json.workspace = true
+tylora-config = { path = "../../../crates/tylora-config" }
+tylora-core = { path = "../../../crates/tylora-core" }
+libc = "0.2"

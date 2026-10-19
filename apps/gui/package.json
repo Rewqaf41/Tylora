@@ -1,0 +1,38 @@
+{
+  "name": "tylora-gui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "lint": "eslint src --max-warnings 0",
+    "test": "vitest run",
+    "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
+    "desktop:dev": "bun run prepare:sidecar && tauri dev",
+    "desktop:build": "bun run prepare:sidecar -- --release && tauri build --bundles app"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.90.3",
+    "@tauri-apps/api": "2.11.1",
+    "lucide-react": "^0.548.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router": "^7.9.4",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.0",
+    "@tauri-apps/cli": "^2.12.3",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "eslint": "^9.0.0",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.0.0",
+    "vite": "^6.3.0",
+    "vitest": "5.0.5"
+  }
+}

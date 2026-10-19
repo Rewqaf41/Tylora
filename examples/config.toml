@@ -1,0 +1,124 @@
+# Copy to ~/.config/tylora/config.toml. Hotkeys reload automatically.
+# Read native_space_id values from `tylora space list --json`.
+# Optional application rule (exact bundle ID; initial mode on discovery):
+# [[window_rules]]
+# application_id = "com.example.Editor"
+# mode = "floating"
+# priority = 0
+# enabled = true
+version = 1
+# Layouts: "bsp", "dwindle" or "scrolling". Per workspace: layout = "scrolling".
+# default_layout = "bsp"
+# [dwindle]
+# initial_orientation = "vertical"
+# split_ratio = 0.5
+# [scrolling]
+# default_column_width = 0.65
+# column_width_presets = [0.3333, 0.5, 0.65, 1.0]
+# viewport_alignment = "nearest"
+resize_step = 50.0
+cross_monitor_navigation = true
+disconnect_policy = "move_to_primary"
+
+[gaps]
+inner = 8.0
+outer = 8.0
+
+[zoom]
+respect_outer_gaps = false
+
+[window_movement]
+focus_after_move = false
+wrap_around = true
+preserve_floating_position = true
+
+[mouse]
+enabled = true
+modifier = "option"
+drag_threshold = 6.0
+update_interval_ms = 16
+resize_sensitivity = 1.0
+
+[focus]
+follows_mouse = false
+mode = "delayed"                   # disabled | instant | delayed
+delay_ms = 120                     # 0..500; used by delayed mode
+raise_behavior = "focus_and_raise"
+ignore_apps = []                   # e.g. [{ bundle_id = "com.example.Panel", enabled = true }]
+restore_last_window = true
+
+[[workspaces]]
+id = 1
+name = "Browser"
+# native_space_id = <Browser Space ID from tylora space list>
+
+[[workspaces]]
+id = 2
+name = "Code"
+# native_space_id = <Code Space ID from tylora space list>
+
+[[hotkeys]]
+chord = "option+h"
+enabled = true
+[hotkeys.command]
+command = "focus_window"
+direction = "left"
+
+[[hotkeys]]
+chord = "option+shift+h"
+enabled = true
+[hotkeys.command]
+command = "move_window"
+direction = "left"
+
+[[hotkeys]]
+chord = "option+r"
+enabled = true
+[hotkeys.command]
+command = "reconcile_windows"
+
+[[hotkeys]]
+chord = "option+shift+f"
+enabled = true
+[hotkeys.command]
+command = "toggle_layout_zoom"
+
+[[hotkeys]]
+chord = "option+shift+tab"
+enabled = true
+[hotkeys.command]
+command = "move_window_to_next_display"
+
+[[hotkeys]]
+chord = "alt+1"
+[hotkeys.command]
+command = "focus_named_workspace"
+name = "Browser"
+
+[[hotkeys]]
+chord = "alt+2"
+[hotkeys.command]
+command = "focus_named_workspace"
+name = "Code"
+
+[[hotkeys]]
+chord = "alt+shift+1"
+[hotkeys.command]
+command = "move_window_to_named_workspace"
+name = "Browser"
+
+[[hotkeys]]
+chord = "alt+shift+2"
+[hotkeys.command]
+command = "move_window_to_named_workspace"
+name = "Code"
+
+[[hotkeys]]
+chord = "alt+right"
+[hotkeys.command]
+command = "focus_next_workspace"
+
+[[hotkeys]]
+chord = "alt+left"
+[hotkeys.command]
+command = "focus_previous_workspace"

@@ -1,0 +1,152 @@
+# Tylora
+
+An experimental Rust tiling window manager for macOS. A standalone daemon manages multiple displays, global hotkeys and mouse drag, with three layouts: BSP, Dwindle and Scrolling. Tylora Settings is a React/Tauri desktop companion that edits the daemon's TOML configuration through local IPC. Native Space discovery remains an isolated experimental SkyLight backend; window animations are not implemented.
+
+## Tylora Settings
+
+From `apps/gui`, install dependencies with `bun install`, then run `bun run desktop:dev` for development or `bun run desktop:build` for a local macOS `.app`. The release build is written to `target/release/bundle/macos/Tylora.app`; copy it to `/Applications` if desired. The GUI bundles the `tylora` daemon executable, but closing or quitting Settings does not stop a running daemon. The menu bar icon shows daemon status and opens Settings. Launch at login and automatic daemon start are opt-in.
+
+The GUI connects to a same-user Unix socket, reads live daemon state, and sends typed commands and conflict-checked TOML patches. It can edit native Space bindings, hotkeys, BSP gaps and basic application rules for initial floating or tiled mode. Display controls, global split orientation, logging level and advanced rule targets are shown as unsupported until the daemon has matching capabilities. See [apps/gui/README.md](apps/gui/README.md) for the full development workflow and current limits.
+
+The former command `fluxwm` is now `tylora`. On first access, Tylora copies an existing `~/.config/fluxwm/config.toml` into `~/.config/tylora/config.toml` and imports active workspace state if a new file is absent; the old files are retained. The Unix socket and log prefix also changed from `fluxwm-<uid>` to `tylora-<uid>`. **Stop the older FluxWM daemon before starting Tylora**. Tylora refuses to start alongside an older daemon so that two coordinators cannot manage the same windows.
+
+## Build and run
+
+```sh
+cargo check --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build -p tylora-daemon
+```
+
+Run from a logged-in graphical session. On the first `start`, macOS should prompt for Accessibility access. Approve the application **named in the prompt** in System Settings → Privacy & Security → Accessibility, restart that application, then run `start` again. When launching from an integrated terminal, macOS may name its host (for example, Visual Studio Code) even if `tylora` is already enabled:
+
+```sh
+target/debug/tylora list-windows --ax  # read-only CG and AX diagnostics
+target/debug/tylora start              # all connected displays
+target/debug/tylora status --json
+target/debug/tylora windows
+target/debug/tylora layout
+target/debug/tylora focus left
+target/debug/tylora move right
+target/debug/tylora resize left --amount 50
+target/debug/tylora floating toggle
+target/debug/tylora zoom toggle
+target/debug/tylora display list --json
+target/debug/tylora display focus next
+target/debug/tylora display move-window next
+target/debug/tylora window move-to-display next --json
+target/debug/tylora window move-to-display previous --json
+target/debug/tylora window move-to-display 12345 --json  # use an ID from display list
+target/debug/tylora hotkeys list
+target/debug/tylora space capabilities --json
+target/debug/tylora space list --json
+target/debug/tylora space current --json
+target/debug/tylora space windows 2 --json
+target/debug/tylora space diagnostics --json
+target/debug/tylora space focus Code --json  # after binding Code to a native Space ID
+target/debug/tylora space focus-id 4 --json  # diagnostic: use an ID from `space list`
+target/debug/tylora space move-diagnostics --json
+target/debug/tylora space move-window Browser --json  # moves the focused window after native verification
+target/debug/tylora space move-window Browser --window-id 12345 --json  # explicit CGWindowID for diagnostics
+target/debug/tylora recover-windows
+target/debug/tylora reconcile
+target/debug/tylora stop
+```
+
+`start` changes positions and sizes of eligible ordinary windows on all connected displays. `--display ID` validates a visible display but does not restrict management to it. Use `stop` to end management promptly and restore windows hidden by Tylora; it does not restore previous positions. If a crash leaves windows minimized, restart Tylora or run `recover-windows` even while the daemon is stopped. Recovery identifies windows conservatively; if a window cannot be matched, restore it from Dock. Logs are at `$TMPDIR/tylora-<uid>.log`; set `RUST_LOG=debug` before `start` for latency diagnostics. Global input may additionally require Input Monitoring permission. After rebuilding, macOS may require permissions to be renewed for the executable.
+
+`status` reports `degraded=N` when N tiled windows have not reached their requested geometry and `stale=N` for discarded AX results. Tylora checks AX geometry after a short settling delay and retries mismatches with bounded backoff (250 ms, 750 ms, 5 s, 15 s, then once per minute). After three mismatches it learns a window's observed minimum size for future BSP calculations. If the combined minimum sizes cannot fit, some windows may still overlap. `windows` shows each window's target, actual geometry, and retry count.
+
+## Input, workspaces and configuration
+
+Default tiling hotkeys: Option+H/J/K/L focuses geometrically, Option+Shift+H/J/K/L swaps tiles, Option+F toggles floating, Option+Shift+F toggles Layout Zoom, and Option+R reconciles. Option+1…9 is bound to _logical workspace IDs_. Each logical workspace needs an explicit `native_space_id` from `tylora space list --json`; unresolved bindings are shown as unavailable and left with macOS. The experimental switcher synthesizes Dock swipe gestures and verifies the resulting native Space ID. Option+Shift+1…9 moves the focused window to the configured native Space, follows it there after WindowServer confirms the move, and focuses the reacquired window through Accessibility. The digit maps to a logical workspace, not the current Desktop order. Neither operation uses Mission Control's numeric keyboard shortcuts, disables SIP, or minimizes windows. Mouse drag and resize code was not changed.
+
+Layout Zoom keeps the BSP tree and split ratios intact. It expands one tiled window per Native Space to the display work area, or leaves the configured outer gap when `[zoom] respect_outer_gaps = true`. Other windows remain present behind it. macOS may raise another window when that app is explicitly activated; Layout Zoom does not make the Space exclusively fullscreen. Floating windows return `unsupported` for this command. `status --json` reports each zoom target and whether AX confirmed its geometry.
+
+Option+Shift+Tab moves the focused window to the next physical display in left-to-right order. The command targets that display's currently active native Space through the existing SkyLight move bridge and returns a verified native transfer result with source and target IDs; target BSP insertion follows AX reconciliation. The hotkey is available only while at least two displays and the native mover are available. `[window_movement]` configures `focus_after_move` (default `false`), `wrap_around` (default `true`), and `preserve_floating_position` (default `true`). This top-level table is used because `[[displays]]` already names the display assignment array in the TOML schema. Floating windows retain their mode and relative position, clamped to the target work area. Explicit native transfer does not use AX offscreen placement or minimize windows.
+
+A workspace may own one Space per display: `native_space_ids = [4665]` next to `native_space_id = 7` binds Browser to Desktop 1 of both displays. Its focus key opens the instance with the most recent focus; pressing it again from one instance moves to the next. Its move key uses the instance on the window's current display, else the most recently focused one. When macOS recreates a bound Space with a new ID (display reconnect, sleep, lock), the daemon rebinds the workspace to the unbound Space now at the same display and Desktop position, remembered in `~/.local/state/tylora/space-slots.json`, and logs the change; it never guesses without a remembered slot or between several candidates.
+
+Copy [examples/config.toml](examples/config.toml) to `~/.config/tylora/config.toml`, add each workspace's `native_space_id`, and run `tylora space diagnostics --json` to confirm the bindings resolve. For example, `name = "Code"` with `native_space_id = 4` binds Code to macOS Space ID 4 **only on a machine where ID 4 exists**. Reordering Desktops does not change this binding; deleting that Space makes it unresolved. The TOML schema supports `focus_named_workspace`, `move_window_to_named_workspace`, `focus_next_workspace`, and `focus_previous_workspace` commands with arbitrary supported modifier/key combinations. The daemon hot reloads valid TOML edits within about one second, reinstalls active hotkeys after any mouse drag finishes, and rejects conflicts while preserving the last valid configuration. Other layout settings may require restarting the daemon. Digit chords use physical macOS keycodes, so Option+Shift+1 is recognized by key position even if the keyboard layout produces a symbol.
+
+The old virtual workspace switching path is disabled; recovery for its old minimized-window journal remains. The coordinator keeps BSP layouts for configured workspaces and selects the corresponding tree after observing a native Space change. It does not apply geometry to inactive Spaces. A confirmed move removes the window from the source tree and records it as pending in the target tree until AX rediscovers it there. A window may get a new managed AX token after the move; CGWindowID connects the two observations. The move hotkey follows and focuses the window; the diagnostic `space move-window` CLI command only moves it. Native Space behavior remains experimental, particularly during app closure or display changes while the target Space is inactive.
+
+Space discovery and CGWindowID membership use runtime-resolved private SkyLight symbols. The move bridge resolves a local Mach-O symbol and checks the Objective-C class and initializer ABI at runtime; this was tested on macOS 26.3 Apple Silicon with SIP enabled. The asynchronous native call is followed by a three-second membership check. A timeout means the result is indeterminate; reconciliation checks the actual state and Tylora never claims success from submission alone. The switching gesture uses public Core Graphics. Both paths may change across macOS releases. Another process without Accessibility permission may report a different capability result, even for the same binary. Cross-display switching currently requires moving the pointer to the target display.
+
+The previous FluxWM build may have left a recovery journal for windows it minimized. Tylora copies that journal on first recovery access and retains the original; `tylora recover-windows` still matches windows conservatively. Restore unmatched windows manually from Dock. Legacy active workspace state from `~/.local/state/fluxwm/workspaces.json` is imported, but is not an authority for native Space IDs and must not be interpreted as a Desktop mapping.
+
+Core Graphics display callbacks trigger a debounced AppKit work-area refresh, with a 30-second safety refresh after missed events or sleep. On display disconnect, the old layout is suspended and managed windows are requested to move into the remaining work area. Apps may refuse AX geometry; macOS relocation is then the fallback. Automatic restoration to the original display is not implemented. `display list` includes a public ColorSync UUID, full bounds, work area, scale and primary flag.
+
+## Layouts
+
+Every native Space keeps its own layout state: the BSP or Dwindle tree with its split ratios, or the Scrolling strip with its column order, widths and viewport. Switching Spaces restores exactly that state, including for Spaces no workspace is bound to.
+
+- **BSP** — the original layout: new windows split the most recent region.
+- **Dwindle** — Hyprland-style: a new window splits the _focused_ window; the first split follows `[dwindle] initial_orientation` (`vertical` = side by side) and later splits alternate. `split_ratio` (0.1–0.9) applies to new splits only. Removing a window collapses its parent split.
+- **Scrolling** — niri-style: each window is a column in a horizontal strip that may be wider than the display. Columns keep their own width (a fraction of the usable width, default 65%). Keyboard focus scrolls the viewport only as far as needed (`viewport_alignment = "nearest"`) or keeps the column centred (`"center"`). New windows open right of the focused column and are revealed.
+
+```sh
+tylora layout list [--json]          # kinds and where they are active
+tylora layout current [--json]       # per display: Space, workspace, layout, Scrolling viewport and columns
+tylora layout set bsp|dwindle|scrolling [--json]
+tylora layout cycle [--json]
+tylora focus next|previous           # layout order; strip order in Scrolling
+tylora scroll left|right             # move the viewport without changing focus
+tylora center                        # centre the focused column
+tylora column cycle-width            # 33% → 50% → 65% → 100% (configurable presets)
+tylora column width 0.1              # grow (or shrink with a negative value) by a fraction
+```
+
+`layout set`/`cycle` apply to the current workspace (the focused window's display, else the pointer's) and are not saved. Persistent choices live in the configuration: `default_layout` and an optional `layout = "scrolling"` per `[[workspaces]]` entry; the Settings app edits both. Default bindings are added only when you have not bound the same action or the chord yourself: Option+Control+H/L scrolls, Option+Control+C centres, Option+Control+W cycles column width, Option+Control+T cycles the layout. Option+H/L and Option+Shift+H/L focus and move between neighbouring columns in Scrolling.
+
+```toml
+default_layout = "bsp"
+
+[dwindle]
+initial_orientation = "vertical"   # or "horizontal"
+split_ratio = 0.5
+
+[scrolling]
+default_column_width = 0.65
+min_column_width = 0.2
+max_column_width = 1.0
+column_width_presets = [0.3333, 0.5, 0.65, 1.0]
+viewport_alignment = "nearest"     # or "center"
+focus_auto_scroll = true
+mouse_resize = true                # modifier + right drag changes column width
+scroll_sensitivity = 0.25          # fraction of the viewport per scroll command
+```
+
+Mouse resize changes split ratios in BSP/Dwindle and the focused column width in Scrolling (following columns shift; the viewport stays). Layout Zoom works in every layout and leaves ratios, widths and the viewport untouched.
+
+**Scrolling and macOS limits.** WindowServer never lets a window leave every display: `AXPosition` reports success but silently keeps at least 40 points of the window visible horizontally (about 32 points at the bottom edge). This was measured with `cargo run -p tylora-macos --example offscreen_probe -- <pid>` on macOS 26.3. Tylora therefore parks columns that are outside the viewport in a bottom corner of their own display, leaving a 40 × 32 point sliver visible; partly visible columns are shown at their real position. A park position whose off-display part would touch another display is rejected; if neither corner is safe the strip falls back to a _bounded_ mode that fits every column on screen (`layout current` reports `mode`). Windows are never minimized or moved to other Spaces to emulate scrolling. Focus-follows-mouse ignores parked slivers, and passive focus (a click or Cmd-Tab) scrolls only when the newly focused column was parked, so focus cannot start a scroll loop.
+
+Windows left mostly off screen are journaled in `$TMPDIR/tylora-<uid>.offscreen.json` (mode 0600). `tylora stop` brings them all back on screen; after a crash the next `tylora start` or an offline `tylora recover-windows` restores them, matching by process, frame and title. With the daemon running, `recover-windows` leaves columns the Scrolling layout parks on purpose — reach them by navigation or switch the workspace to BSP.
+
+## Manual macOS validation
+
+1. In a graphical session, run `list-windows --ax`; confirm CG geometry and separate AX geometry are plausible. Verify the CLI warns when Accessibility access is absent.
+2. Grant Accessibility access, run `start`, and inspect `status`, `windows` and `layout`. Confirm only normal windows move into each display's visible work area. Check that the log reports global hotkeys active; if not, check Input Monitoring and restart the terminal.
+3. Open two or more windows in an observed app; verify automatic BSP insertion. Close one; verify the other expands. Run `reconcile` and confirm no destroyed window remains in `windows` or `layout`.
+4. Minimize and restore a window; verify it leaves and rejoins tiling. Move or resize a window manually; confirm there is no repeated resize loop in the log.
+5. Test Option+H/J/K/L and Option+Shift+H/J/K/L with two tiles. Option+left drag one tile onto another; Option+right drag to change a split ratio. Toggle floating with Option+F, then drag and resize it. Release Option mid-drag and confirm cancellation. Secure Event Input must not be intercepted.
+6. Repeat with a second display, a Retina display, negative display coordinates and a window spanning displays. Check `display focus next` and `display move-window next` with a disposable window. Confirm spanning windows and fullscreen/system panels are not tiled.
+7. Disconnect/reconnect a monitor; change resolution, arrangement and primary display; sleep/wake. Confirm no managed window becomes inaccessible. Inspect `display list`, `windows` and `status` after each change.
+8. Run `space capabilities --json`, `space list --json`, and `space current --json`; compare the IDs with Mission Control. Put the desired IDs in `config.toml`, check `space diagnostics --json`, then run `space focus Code` and `space focus Browser`. With the daemon running, physically press Option+1/2 and verify the native Desktop changes without minimizing windows. For a disposable ordinary window, physically press Option+Shift+1/2: Tylora should follow it to the target Desktop and focus that same window. Check its destination in Mission Control and `space windows N --json`, and verify the source tile reflows. Reorder those Desktops in Mission Control and repeat; the names must still target the same Space IDs. Edit a hotkey chord in TOML and check `hotkeys list --json` without restarting. Synthetic key input from automation may bypass the Event Tap, so test on the keyboard.
+9. Test an app that denies or delays AX operations. Confirm other apps remain responsive, `status` works, and failures are logged.
+10. Stop with `tylora stop`; verify any windows from the old recovery journal return and the process and socket disappear. Restart the daemon and recheck native Space discovery.
+11. Layouts: open four disposable TextEdit documents on one Space and run `layout set scrolling`. `layout current` must show `visible`/`partial`/`parked` columns and `windows` must show observed frames equal to desired ones (parked frames at the bottom-right or bottom-left corner). Use Option+H/L, Option+Control+H/L, Option+Control+C and Option+Control+W and recheck. Click a parked sliver or Cmd-Tab to its app: the strip scrolls to it. Switch to `dwindle`, focus one window and open another document: it must split the focused window. Option+right-drag in each layout. Switch Spaces and back: order, ratios and widths return. Finally `tylora stop` with parked columns and confirm every window is back on screen (`list-windows --ax`).
+
+Automated tests and CLI smoke checks do not replace the modifier-drag and display hotplug checks above.
+
+The ignored native integration test moves one explicitly chosen disposable window and returns it to its source Space. Run it only from a graphical terminal with Accessibility permission, substituting IDs from `space windows N --json` and `space list --json`:
+
+```sh
+TYLORA_TEST_WINDOW_ID=12345 TYLORA_TEST_SOURCE_SPACE_ID=7 TYLORA_TEST_TARGET_SPACE_ID=4 \
+  cargo test -p tylora-macos --test native_move -- --ignored --nocapture
+```
+
+The test was run on a blank TextEdit window with CGWindowID 163539, source Space 7 and target Space 4 on macOS 26.3 Apple Silicon with SIP enabled. It passed and restored the window to Space 7. The IDs are machine-specific and should not be reused elsewhere.
+
+See [architecture.md](architecture.md) for state ownership, reconciliation rules and known limits.
