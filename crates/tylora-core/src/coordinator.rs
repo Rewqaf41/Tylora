@@ -246,12 +246,71 @@ impl<L: LayoutPolicy> Coordinator<L> {
     }
 
     fn sync_tree(&mut self) {
-        let eligible: HashSet<_> = self
+        let mut eligible: HashSet<_> = self
             .registry
             .iter()
             .filter(|(_, r)| self.eligible(&r.observed))
             .map(|(id, _)| *id)
             .collect();
+        // AX can report both an old and a reacquired element for the same CG
+        // window before a complete process scan. Tokens increase when the AX
+        // worker creates them, so only the newest element may own a tile.
+        let mut newest_by_cg = HashMap::new();
+        for &id in &eligible {
+            if let Some(cg) = self.registry.get(id).and_then(|r| r.observed.cg_window_id) {
+                newest_by_cg
+                    .entry((id.process, cg))
+                    .and_modify(|newest: &mut ManagedWindowId| {
+                        if id.token > newest.token {
+                            *newest = id;
+                        }
+                    })
+                    .or_insert(id);
+                self.known_cg.insert(id, cg);
+            }
+        }
+        eligible.retain(|id| {
+            self.registry
+                .get(*id)
+                .and_then(|r| r.observed.cg_window_id)
+                .is_none_or(|cg| newest_by_cg.get(&(id.process, cg)) == Some(id))
+        });
+
+        // Reassign a saved leaf before removing stale tokens. Removing first
+        // collapses a Dwindle split and changes its order and ratio; adding
+        // first briefly gives one physical window two tiles.
+        let mut added: Vec<_> = eligible.difference(&self.tiled_ids).copied().collect();
+        added.sort();
+        for id in added {
+            let Some(cg) = self.known_cg.get(&id).copied() else {
+                continue;
+            };
+            let previous = self
+                .awaiting
+                .iter()
+                .find(|(old, (_, slot))| {
+                    **old != id && old.process == id.process && *slot == Some(cg)
+                })
+                .map(|(old, _)| *old)
+                .or_else(|| {
+                    self.tiled_ids.iter().copied().find(|old| {
+                        *old != id
+                            && old.process == id.process
+                            && self.known_cg.get(old) == Some(&cg)
+                    })
+                });
+            if let Some(old) = previous {
+                self.awaiting.remove(&old);
+                self.known_cg.remove(&old);
+                if self.layout.replace_window(old, id) {
+                    self.tiled_ids.remove(&old);
+                    self.tiled_ids.insert(id);
+                } else {
+                    self.layout.remove_window(old);
+                    self.tiled_ids.remove(&old);
+                }
+            }
+        }
         let mut removed: Vec<_> = self.tiled_ids.difference(&eligible).copied().collect();
         removed.sort();
         for id in removed {
@@ -268,31 +327,11 @@ impl<L: LayoutPolicy> Coordinator<L> {
         let mut added: Vec<_> = eligible.difference(&self.tiled_ids).copied().collect();
         added.sort();
         for id in added {
-            let cg = self.registry.get(id).and_then(|r| r.observed.cg_window_id);
-            if let Some(cg) = cg {
-                self.known_cg.insert(id, cg);
-            }
             // A window returning to a restored layout keeps its old slot:
             // inserting an existing member is a no-op in every layout.
             if self.awaiting.remove(&id).is_some() {
                 self.layout.insert_window(id);
                 continue;
-            }
-            // The same window under a new AX token takes over its saved slot
-            // instead of sharing the screen with a placeholder.
-            let previous = cg.and_then(|cg| {
-                self.awaiting
-                    .iter()
-                    .find(|(_, (_, slot))| *slot == Some(cg))
-                    .map(|(old, _)| *old)
-            });
-            if let Some(old) = previous {
-                self.awaiting.remove(&old);
-                self.known_cg.remove(&old);
-                if self.layout.replace_window(old, id) {
-                    continue;
-                }
-                self.layout.remove_window(old);
             }
             self.layout.insert_window(id);
         }

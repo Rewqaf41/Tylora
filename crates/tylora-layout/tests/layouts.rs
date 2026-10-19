@@ -811,6 +811,50 @@ mod reacquired_windows {
     }
 
     #[test]
+    fn dwindle_reacquires_before_stale_ax_token_is_removed() {
+        let mut c = Coordinator::new(
+            TilingLayout::new(LayoutKind::Dwindle, &LayoutSettings::default()),
+            DisplayId(1),
+            area(),
+        );
+        c.handle(CoordinatorEvent::Observed(window(27, 500)));
+        let full = c.layout.calculate_layout(area())[0].1;
+        // A quick Space round trip can restore the saved layout before a
+        // complete scan removes the old AX token from the registry.
+        c.replace_layout(c.layout.clone());
+        assert_eq!(c.awaiting(), 0);
+        c.handle(CoordinatorEvent::Observed(window(29, 500)));
+        assert_eq!(c.layout.windows(), vec![id(29)]);
+        assert_eq!(c.layout.calculate_layout(area())[0].1, full);
+        assert_eq!(c.plan().len(), 1);
+
+        // A genuinely new second window should create the first split.
+        c.handle(CoordinatorEvent::Observed(window(30, 600)));
+        assert_eq!(c.layout.windows(), vec![id(29), id(30)]);
+        assert_eq!(c.layout.splits().len(), 1);
+    }
+
+    #[test]
+    fn dwindle_reconcile_rekeys_leaf_without_changing_order_or_ratio() {
+        let mut c = Coordinator::new(
+            TilingLayout::new(LayoutKind::Dwindle, &LayoutSettings::default()),
+            DisplayId(1),
+            area(),
+        );
+        c.handle(CoordinatorEvent::Observed(window(1, 501)));
+        c.handle(CoordinatorEvent::Observed(window(2, 502)));
+        let split = c.layout.splits()[0].0;
+        c.layout.resize_split(split, 0.7).unwrap();
+        c.handle(CoordinatorEvent::Reconciled {
+            process: id(1).process,
+            windows: vec![window(11, 501), window(2, 502)],
+        });
+        assert_eq!(c.layout.windows(), vec![id(11), id(2)]);
+        assert_eq!(c.layout.splits().len(), 1);
+        assert!((c.layout.splits()[0].2 - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
     fn reacquired_window_keeps_its_position_among_others() {
         let mut c = Coordinator::new(
             TilingLayout::new(LayoutKind::Bsp, &LayoutSettings::default()),
