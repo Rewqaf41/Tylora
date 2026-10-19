@@ -6,6 +6,10 @@ use tylora_core::commands::{Direction, StateCommand};
 pub use tylora_core::layout::{
     DwindleSettings, LayoutKind, ScrollingSettings, SplitOrientation, ViewportAlignment,
 };
+pub use tylora_core::rules::{ApplyPolicy, RuleDefinition, RuleMode, TitleMatch};
+pub use tylora_core::scratchpad::{
+    HideStrategy, ScratchpadAlignment, ScratchpadDefinition, ScratchpadScope, ScratchpadTarget,
+};
 
 pub mod mutation;
 
@@ -19,7 +23,10 @@ pub struct Config {
     pub dwindle: DwindleSettings,
     pub scrolling: ScrollingSettings,
     pub hotkeys: Vec<Hotkey>,
+    /// Legacy mode-only rules; still applied, see `rules` for the full engine.
     pub window_rules: Vec<WindowRule>,
+    pub rules: Vec<RuleDefinition>,
+    pub scratchpads: Vec<ScratchpadDefinition>,
     pub mouse: Mouse,
     pub focus: Focus,
     pub workspaces: Vec<WorkspaceDefinition>,
@@ -151,6 +158,7 @@ pub fn compile_hotkey(binding: &Hotkey) -> Result<CompiledHotkey, ConfigError> {
                     "n" => 45,
                     "m" => 46,
                     "tab" => 48,
+                    "grave" => 50,
                     "left" => 123,
                     "right" => 124,
                     "down" => 125,
@@ -378,6 +386,8 @@ impl Default for Config {
             scrolling: ScrollingSettings::default(),
             hotkeys,
             window_rules: Vec::new(),
+            rules: Vec::new(),
+            scratchpads: Vec::new(),
             mouse: Mouse::default(),
             focus: Focus::default(),
             workspaces: (1..=9)
@@ -397,6 +407,21 @@ impl Default for Config {
             disconnect_policy: DisconnectPolicy::MoveToPrimary,
         }
     }
+}
+
+/// Toggle bindings declared on scratchpads.
+pub fn scratchpad_hotkeys(config: &Config) -> Vec<Hotkey> {
+    config
+        .scratchpads
+        .iter()
+        .filter_map(|pad| {
+            pad.hotkey.as_ref().map(|chord| Hotkey {
+                chord: chord.clone(),
+                command: StateCommand::ToggleScratchpad { id: pad.id.clone() },
+                enabled: true,
+            })
+        })
+        .collect()
 }
 
 /// Default layout bindings. The daemon only installs one when the user has
@@ -466,6 +491,22 @@ impl Config {
             return fail("gaps must be finite and nonnegative");
         }
         self.dwindle.validate().map_err(ConfigError::Invalid)?;
+        tylora_core::rules::validate_rules(&self.rules, |selector| {
+            self.workspace(selector).is_some()
+        })
+        .map_err(ConfigError::Invalid)?;
+        tylora_core::scratchpad::validate_scratchpads(&self.scratchpads)
+            .map_err(ConfigError::Invalid)?;
+        for rule in &self.rules {
+            if let Some(pad) = &rule.scratchpad {
+                if !self.scratchpads.iter().any(|known| known.id == *pad) {
+                    return fail(&format!(
+                        "rule {:?}: scratchpad {pad:?} is not configured",
+                        rule.id
+                    ));
+                }
+            }
+        }
         self.scrolling.validate().map_err(ConfigError::Invalid)?;
         if !self.resize_step.is_finite() || self.resize_step <= 0.0 {
             return fail("resize_step must be positive");
@@ -531,6 +572,22 @@ impl Config {
             let compiled = compile_hotkey(hotkey)?;
             if !chords.insert((compiled.keycode, compiled.modifiers)) {
                 return fail("conflicting or empty hotkey chord");
+            }
+        }
+        for pad in &self.scratchpads {
+            let Some(chord) = &pad.hotkey else {
+                continue;
+            };
+            let compiled = compile_hotkey(&Hotkey {
+                chord: chord.clone(),
+                command: StateCommand::ToggleScratchpad { id: pad.id.clone() },
+                enabled: true,
+            })?;
+            if !chords.insert((compiled.keycode, compiled.modifiers)) {
+                return fail(&format!(
+                    "scratchpad {:?} hotkey {chord:?} is already bound",
+                    pad.id
+                ));
             }
         }
         for rule in &self.window_rules {

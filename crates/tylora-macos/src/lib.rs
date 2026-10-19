@@ -184,14 +184,15 @@ pub use native::input::{
 };
 #[cfg(target_os = "macos")]
 pub use native::managed::{
-    suppress_pointer_focus, work_areas, DisplayEvents, ManagedAdapter, ManagedCommand,
-    ManagedEvent, WorkArea, VISIBILITY_ROLLBACK_FAILED,
+    running_applications, suppress_pointer_focus, work_areas, DisplayEvents, ManagedAdapter,
+    ManagedCommand, ManagedEvent, RunningApplication, WorkArea, VISIBILITY_ROLLBACK_FAILED,
 };
 
 #[cfg(target_os = "macos")]
 mod native {
     pub mod input;
     pub mod managed;
+    pub mod mission_control;
     use super::*;
     use std::{
         collections::BTreeSet,

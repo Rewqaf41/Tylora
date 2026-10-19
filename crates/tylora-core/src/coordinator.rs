@@ -685,7 +685,10 @@ impl<L: LayoutPolicy> Coordinator<L> {
                 {
                     return Err(CommandError::Unsupported);
                 }
-                if self.floating_ids.remove(&id) {
+                // Follow the window's actual mode: a rule may have floated it
+                // without going through this toggle.
+                if record.observed.mode == ManagementMode::Floating {
+                    self.floating_ids.remove(&id);
                     record.observed.mode = ManagementMode::Tiled;
                 } else {
                     self.floating_ids.insert(id);

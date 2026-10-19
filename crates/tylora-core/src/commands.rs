@@ -83,6 +83,16 @@ pub enum StateCommand {
     ResizeScrollingColumn {
         delta: Option<f64>,
     },
+    /// Show the scratchpad if hidden (on the current Space), else hide it.
+    ToggleScratchpad {
+        id: String,
+    },
+    ShowScratchpad {
+        id: String,
+    },
+    HideScratchpad {
+        id: String,
+    },
     ReconcileWindows,
 }
 

@@ -155,6 +155,54 @@ fn application_details(pid: i32) -> (Option<String>, bool, bool) {
     (identifier, regular, hidden)
 }
 
+/// A regular application that currently owns at least one window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunningApplication {
+    pub pid: i32,
+    pub bundle_id: String,
+    pub name: Option<String>,
+    pub windows: usize,
+}
+
+/// Regular applications with windows on any Space, with their real bundle
+/// IDs. Process IDs come from WindowServer; metadata from NSRunningApplication.
+pub fn running_applications() -> Vec<RunningApplication> {
+    let Ok(windows) = crate::discover_all_cg_windows() else {
+        return Vec::new();
+    };
+    let mut counts: HashMap<i32, usize> = HashMap::new();
+    for window in &windows {
+        *counts.entry(window.owner_pid).or_default() += 1;
+    }
+    let mut apps: Vec<_> = counts
+        .into_iter()
+        .filter_map(|(pid, windows)| {
+            let app = unsafe {
+                objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            }?;
+            if unsafe { app.activationPolicy() }
+                != objc2_app_kit::NSApplicationActivationPolicy::Regular
+            {
+                return None;
+            }
+            Some(RunningApplication {
+                pid,
+                bundle_id: unsafe { app.bundleIdentifier() }?.to_string(),
+                name: unsafe { app.localizedName() }.map(|name| name.to_string()),
+                windows,
+            })
+        })
+        .collect();
+    apps.sort_by(|a, b| {
+        a.name
+            .as_deref()
+            .unwrap_or(&a.bundle_id)
+            .to_lowercase()
+            .cmp(&b.name.as_deref().unwrap_or(&b.bundle_id).to_lowercase())
+    });
+    apps
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct WorkArea {
     pub display: DisplayId,
@@ -318,6 +366,15 @@ pub enum ManagedCommand {
     RestoreVisibility {
         request: u64,
     },
+    /// Finds a window by CGWindowID (rescanning its process), optionally sets
+    /// its frame, raises and focuses it, and reports the frame read back.
+    Present {
+        request: u64,
+        pid: i32,
+        cg_window_id: u32,
+        frame: Option<Rect>,
+        focus: bool,
+    },
     /// Windows a Scrolling layout deliberately keeps outside the viewport.
     /// `RestoreVisibility` leaves them parked; `Stop` restores everything.
     SetParked(Vec<ManagedWindowId>),
@@ -360,6 +417,10 @@ pub enum ManagedEvent {
         result: Result<(), i32>,
     },
     VisibilityGone(ManagedWindowId),
+    Presented {
+        request: u64,
+        result: Result<Rect, i32>,
+    },
     QueueOverflow,
 }
 
@@ -869,6 +930,18 @@ impl Worker {
                             .events
                             .send(ManagedEvent::VisibilityDone { request, result });
                     }
+                    Ok(ManagedCommand::Present {
+                        request,
+                        pid,
+                        cg_window_id,
+                        frame,
+                        focus,
+                    }) => {
+                        let result = self.present(pid, cg_window_id, frame, focus);
+                        let _ = self
+                            .events
+                            .send(ManagedEvent::Presented { request, result });
+                    }
                     Ok(ManagedCommand::SetParked(ids)) => {
                         self.parked = ids.into_iter().collect();
                     }
@@ -1214,6 +1287,8 @@ impl Worker {
                     c"AXResized",
                     c"AXWindowMiniaturized",
                     c"AXWindowDeminiaturized",
+                    // Rules may match titles that are set after creation.
+                    c"AXTitleChanged",
                 ] {
                     add_notification(watch.observer.0, element, name, refcon);
                 }
@@ -1267,11 +1342,15 @@ impl Worker {
                     .ok()?;
                 (memberships.len() == 1).then_some(memberships[0].0)
             });
+            let title = ax_attribute(element, c"AXTitle")
+                .ok()
+                .and_then(|value| cf_text(value.0));
             windows.push(WindowSnapshot {
                 id,
                 cg_window_id,
                 native_space_id,
                 application_id: app_id.clone(),
+                title,
                 frame,
                 display_id,
                 lifecycle,
@@ -1392,6 +1471,46 @@ impl Worker {
 
     fn focused_application_pid(&self) -> Option<i32> {
         super::frontmost_application_pid()
+    }
+
+    fn present(
+        &mut self,
+        pid: i32,
+        cg_window_id: u32,
+        frame: Option<Rect>,
+        focus: bool,
+    ) -> Result<Rect, i32> {
+        // A window that just arrived from another Space has no handle yet.
+        self.scan_pid(pid);
+        let id = self
+            .apps
+            .get(&pid)
+            .and_then(|watch| {
+                watch.handles.iter().find(|handle| {
+                    crate::spaces::ax_cg_window(handle.element.0) == Some(cg_window_id)
+                })
+            })
+            .map(|handle| handle.id)
+            .ok_or(-25202)?;
+        if let Some(target) = frame {
+            self.apply(ApplyCommand {
+                id,
+                generation: 0,
+                version: 0,
+                target,
+            })?;
+        }
+        if focus {
+            self.focus(id)?;
+        }
+        // Applications may settle the frame asynchronously; read it back.
+        thread::sleep(Duration::from_millis(120));
+        self.read_geometry(ApplyCommand {
+            id,
+            generation: 0,
+            version: 0,
+            target: frame.unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0).expect("unit rect")),
+        })
     }
 
     fn focus(&self, id: ManagedWindowId) -> Result<(), i32> {

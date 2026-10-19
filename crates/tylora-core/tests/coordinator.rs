@@ -52,6 +52,7 @@ fn snapshot(id: ManagedWindowId) -> WindowSnapshot {
         cg_window_id: None,
         native_space_id: None,
         application_id: Some("test.app".into()),
+        title: None,
         frame: Rect::new(10.0, 10.0, 200.0, 100.0).unwrap(),
         display_id: Some(DisplayId(1)),
         lifecycle: WindowLifecycle::Discovered,

@@ -8,6 +8,8 @@ pub mod coordinator;
 pub mod layout;
 pub mod navigation;
 pub mod registry;
+pub mod rules;
+pub mod scratchpad;
 pub mod workspace;
 
 pub use coordinator::{

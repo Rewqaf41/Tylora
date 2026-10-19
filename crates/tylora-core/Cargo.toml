@@ -8,4 +8,7 @@ license.workspace = true
 [dependencies]
 tracing.workspace = true
 serde.workspace = true
+regex.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true

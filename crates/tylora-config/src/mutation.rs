@@ -1,8 +1,8 @@
 //! Narrow, validated edits that retain unrelated TOML entries and comments.
 
 use crate::{
-    Config, ConfigError, DwindleSettings, Focus, LayoutKind, ScrollingSettings, WindowMovement,
-    WindowRule,
+    Config, ConfigError, DwindleSettings, Focus, LayoutKind, RuleDefinition, ScratchpadDefinition,
+    ScrollingSettings, WindowMovement, WindowRule,
 };
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -61,6 +61,177 @@ pub enum ConfigPatch {
     SetScrolling {
         settings: ScrollingSettings,
     },
+    /// Creates or updates a `[[rules]]` entry. `previous_id` names the entry
+    /// being edited (it may be renamed); `None` appends a new rule.
+    SetRule {
+        previous_id: Option<String>,
+        rule: RuleDefinition,
+    },
+    RemoveRule {
+        id: String,
+    },
+    SetRulePriorities {
+        priorities: Vec<RulePriority>,
+    },
+    /// Creates or updates a `[[scratchpads]]` entry (renaming allowed).
+    SetScratchpad {
+        previous_id: Option<String>,
+        scratchpad: ScratchpadDefinition,
+    },
+    RemoveScratchpad {
+        id: String,
+    },
+    /// Replaces a legacy `[[window_rules]]` entry with an equivalent rule.
+    ConvertWindowRule {
+        index: usize,
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RulePriority {
+    pub id: String,
+    pub priority: i32,
+}
+
+fn rule_tables(doc: &mut DocumentMut) -> &mut ArrayOfTables {
+    if !doc
+        .as_table()
+        .get("rules")
+        .is_some_and(Item::is_array_of_tables)
+    {
+        doc["rules"] = Item::ArrayOfTables(ArrayOfTables::new());
+    }
+    doc["rules"]
+        .as_array_of_tables_mut()
+        .expect("array inserted")
+}
+
+fn find_rule(rules: &ArrayOfTables, id: &str) -> Option<usize> {
+    rules
+        .iter()
+        .position(|table| table.get("id").and_then(Item::as_str) == Some(id))
+}
+
+/// Writes known rule keys in place so unknown keys and comments survive.
+fn write_rule(table: &mut Table, rule: &RuleDefinition) {
+    let text = |value: &str| value.to_string();
+    table["id"] = value(text(&rule.id));
+    table["name"] = value(text(&rule.name));
+    table["enabled"] = value(rule.enabled);
+    table["bundle_id"] = value(text(&rule.bundle_id));
+    match &rule.title {
+        Some(title) => {
+            table["title"] = value(text(title));
+            table["title_match"] = value(match rule.title_match {
+                crate::TitleMatch::Exact => "exact",
+                crate::TitleMatch::Contains => "contains",
+                crate::TitleMatch::Regex => "regex",
+            });
+        }
+        None => {
+            table.remove("title");
+            table.remove("title_match");
+        }
+    }
+    match &rule.workspace {
+        Some(workspace) => table["workspace"] = value(text(workspace)),
+        None => {
+            table.remove("workspace");
+        }
+    }
+    match rule.display {
+        Some(display) => table["display"] = value(i64::from(display)),
+        None => {
+            table.remove("display");
+        }
+    }
+    table["mode"] = value(match rule.mode {
+        crate::RuleMode::Unchanged => "unchanged",
+        crate::RuleMode::Tiled => "tiled",
+        crate::RuleMode::Floating => "floating",
+        crate::RuleMode::Unmanaged => "unmanaged",
+    });
+    table["priority"] = value(i64::from(rule.priority));
+    table["apply"] = value(match rule.apply {
+        crate::ApplyPolicy::OnCreate => "on_create",
+        crate::ApplyPolicy::OnFirstSeen => "on_first_seen",
+        crate::ApplyPolicy::OnTitleChange => "on_title_change",
+        crate::ApplyPolicy::Manual => "manual",
+    });
+    table["stop"] = value(rule.stop);
+    match &rule.scratchpad {
+        Some(pad) => table["scratchpad"] = value(text(pad)),
+        None => {
+            table.remove("scratchpad");
+        }
+    }
+}
+
+fn tables<'a>(doc: &'a mut DocumentMut, key: &str) -> &'a mut ArrayOfTables {
+    if !doc
+        .as_table()
+        .get(key)
+        .is_some_and(Item::is_array_of_tables)
+    {
+        doc[key] = Item::ArrayOfTables(ArrayOfTables::new());
+    }
+    doc[key].as_array_of_tables_mut().expect("array inserted")
+}
+
+/// Writes known scratchpad keys in place; unknown keys and comments survive.
+fn write_scratchpad(table: &mut Table, pad: &ScratchpadDefinition) {
+    table["id"] = value(pad.id.clone());
+    table["name"] = value(pad.name.clone());
+    match &pad.hotkey {
+        Some(chord) => table["hotkey"] = value(chord.clone()),
+        None => {
+            table.remove("hotkey");
+        }
+    }
+    table["scope"] = value(match pad.scope {
+        crate::ScratchpadScope::Local => "local",
+        crate::ScratchpadScope::Global => "global",
+    });
+    table["width"] = value(pad.width);
+    table["height"] = value(pad.height);
+    table["alignment"] = value(match pad.alignment {
+        crate::ScratchpadAlignment::Center => "center",
+        crate::ScratchpadAlignment::Top => "top",
+        crate::ScratchpadAlignment::Bottom => "bottom",
+        crate::ScratchpadAlignment::Left => "left",
+        crate::ScratchpadAlignment::Right => "right",
+        crate::ScratchpadAlignment::TopLeft => "top_left",
+        crate::ScratchpadAlignment::TopRight => "top_right",
+        crate::ScratchpadAlignment::BottomLeft => "bottom_left",
+        crate::ScratchpadAlignment::BottomRight => "bottom_right",
+    });
+    table["offset_x"] = value(pad.offset_x);
+    table["offset_y"] = value(pad.offset_y);
+    table["target"] = value(match pad.target {
+        crate::ScratchpadTarget::Pointer => "pointer",
+        crate::ScratchpadTarget::Focused => "focused",
+    });
+    match pad.display {
+        Some(display) => table["display"] = value(i64::from(display)),
+        None => {
+            table.remove("display");
+        }
+    }
+    table["remember_position"] = value(pad.remembers_position());
+    table["remember_size"] = value(pad.remembers_size());
+    // The explicit fields above replace the shorthand.
+    table.remove("remember_geometry");
+    table["hide"] = value(match pad.hide {
+        crate::HideStrategy::Park => "park",
+        crate::HideStrategy::Minimize => "minimize",
+    });
+    match &pad.bundle_id {
+        Some(bundle) => table["bundle_id"] = value(bundle.clone()),
+        None => {
+            table.remove("bundle_id");
+        }
+    }
 }
 
 fn ensure_table<'a>(doc: &'a mut DocumentMut, key: &str) -> &'a mut Table {
@@ -309,6 +480,112 @@ pub fn apply_patch(source: &str, patch: ConfigPatch) -> Result<(String, Config),
             table["focus_auto_scroll"] = value(settings.focus_auto_scroll);
             table["mouse_resize"] = value(settings.mouse_resize);
             table["scroll_sensitivity"] = value(settings.scroll_sensitivity);
+        }
+        ConfigPatch::SetRule { previous_id, rule } => {
+            let rules = rule_tables(&mut doc);
+            let index = match previous_id.as_deref() {
+                Some(previous) => find_rule(rules, previous).ok_or_else(|| {
+                    ConfigError::Invalid(format!("rule {previous:?} no longer exists"))
+                })?,
+                None => {
+                    if find_rule(rules, &rule.id).is_some() {
+                        return Err(ConfigError::Invalid(format!(
+                            "rule {:?} already exists",
+                            rule.id
+                        )));
+                    }
+                    rules.push(Table::new());
+                    rules.len() - 1
+                }
+            };
+            write_rule(rules.get_mut(index).expect("index checked"), &rule);
+        }
+        ConfigPatch::RemoveRule { id } => {
+            let rules = rule_tables(&mut doc);
+            let index = find_rule(rules, &id)
+                .ok_or_else(|| ConfigError::Invalid(format!("rule {id:?} no longer exists")))?;
+            rules.remove(index);
+        }
+        ConfigPatch::SetRulePriorities { priorities } => {
+            let rules = rule_tables(&mut doc);
+            for entry in priorities {
+                let index = find_rule(rules, &entry.id).ok_or_else(|| {
+                    ConfigError::Invalid(format!("rule {:?} no longer exists", entry.id))
+                })?;
+                rules.get_mut(index).expect("index checked")["priority"] =
+                    value(i64::from(entry.priority));
+            }
+        }
+        ConfigPatch::ConvertWindowRule { index, id } => {
+            let legacy = Config::parse(&doc.to_string())?
+                .window_rules
+                .get(index)
+                .cloned()
+                .ok_or_else(|| ConfigError::Invalid("window rule index no longer exists".into()))?;
+            let rule = RuleDefinition {
+                id,
+                name: legacy.application_id.clone(),
+                enabled: legacy.enabled,
+                bundle_id: legacy.application_id.clone(),
+                title: None,
+                title_match: crate::TitleMatch::Exact,
+                workspace: None,
+                display: None,
+                mode: match legacy.mode {
+                    crate::WindowRuleMode::Floating => crate::RuleMode::Floating,
+                    crate::WindowRuleMode::Tiled => crate::RuleMode::Tiled,
+                },
+                priority: legacy.priority,
+                apply: crate::ApplyPolicy::OnFirstSeen,
+                stop: false,
+                scratchpad: None,
+            };
+            if let Some(rules) = doc
+                .as_table_mut()
+                .get_mut("window_rules")
+                .and_then(Item::as_array_of_tables_mut)
+            {
+                rules.remove(index);
+            }
+            let rules = rule_tables(&mut doc);
+            if find_rule(rules, &rule.id).is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "rule {:?} already exists",
+                    rule.id
+                )));
+            }
+            rules.push(Table::new());
+            let last = rules.len() - 1;
+            write_rule(rules.get_mut(last).expect("pushed"), &rule);
+        }
+        ConfigPatch::SetScratchpad {
+            previous_id,
+            scratchpad,
+        } => {
+            let pads = tables(&mut doc, "scratchpads");
+            let index = match previous_id.as_deref() {
+                Some(previous) => find_rule(pads, previous).ok_or_else(|| {
+                    ConfigError::Invalid(format!("scratchpad {previous:?} no longer exists"))
+                })?,
+                None => {
+                    if find_rule(pads, &scratchpad.id).is_some() {
+                        return Err(ConfigError::Invalid(format!(
+                            "scratchpad {:?} already exists",
+                            scratchpad.id
+                        )));
+                    }
+                    pads.push(Table::new());
+                    pads.len() - 1
+                }
+            };
+            write_scratchpad(pads.get_mut(index).expect("index checked"), &scratchpad);
+        }
+        ConfigPatch::RemoveScratchpad { id } => {
+            let pads = tables(&mut doc, "scratchpads");
+            let index = find_rule(pads, &id).ok_or_else(|| {
+                ConfigError::Invalid(format!("scratchpad {id:?} no longer exists"))
+            })?;
+            pads.remove(index);
         }
         ConfigPatch::SetFocus { focus } => {
             if !doc.as_table().get("focus").is_some_and(Item::is_table) {
@@ -638,5 +915,174 @@ mod tests {
         )
         .unwrap();
         assert!(config.workspaces[0].native_space_ids.is_empty());
+    }
+
+    #[test]
+    fn rule_patches_round_trip_and_keep_unknown_keys() {
+        let source = "# mine\nversion = 1\n[[workspaces]]\nid = 2\nname = \"Code\"\nnative_space_id = 4\n[[window_rules]]\napplication_id = \"com.apple.calculator\"\nmode = \"floating\"\n";
+        let rule = RuleDefinition {
+            id: "vscode-code".into(),
+            name: "VS Code to Code".into(),
+            enabled: true,
+            bundle_id: "com.microsoft.VSCode".into(),
+            title: None,
+            title_match: crate::TitleMatch::Exact,
+            workspace: Some("code".into()),
+            display: None,
+            mode: crate::RuleMode::Tiled,
+            priority: 100,
+            apply: crate::ApplyPolicy::OnCreate,
+            stop: true,
+            scratchpad: None,
+        };
+        let (edited, config) = apply_patch(
+            source,
+            ConfigPatch::SetRule {
+                previous_id: None,
+                rule: rule.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(config.rules, vec![rule.clone()]);
+        // Unknown keys in a rule table survive edits.
+        let edited = edited.replace("stop = true", "stop = true\nfuture = \"keep\"");
+        let mut renamed = rule.clone();
+        renamed.id = "vscode".into();
+        renamed.title = Some("Tylora".into());
+        renamed.title_match = crate::TitleMatch::Contains;
+        let (edited, config) = apply_patch(
+            &edited,
+            ConfigPatch::SetRule {
+                previous_id: Some("vscode-code".into()),
+                rule: renamed.clone(),
+            },
+        )
+        .unwrap();
+        assert!(edited.contains("future = \"keep\""));
+        assert!(edited.contains("# mine"));
+        assert_eq!(config.rules, vec![renamed]);
+        assert!(apply_patch(
+            &edited,
+            ConfigPatch::SetRule {
+                previous_id: None,
+                rule: rule.clone()
+            }
+            .clone(),
+        )
+        .is_ok());
+        let (edited, config) = apply_patch(
+            &edited,
+            ConfigPatch::SetRulePriorities {
+                priorities: vec![RulePriority {
+                    id: "vscode".into(),
+                    priority: 5,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(config.rules[0].priority, 5);
+        let (edited, config) = apply_patch(
+            &edited,
+            ConfigPatch::ConvertWindowRule {
+                index: 0,
+                id: "calculator".into(),
+            },
+        )
+        .unwrap();
+        assert!(config.window_rules.is_empty());
+        assert_eq!(config.rules[1].mode, crate::RuleMode::Floating);
+        let (_, config) = apply_patch(
+            &edited,
+            ConfigPatch::RemoveRule {
+                id: "vscode".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(config.rules.len(), 1);
+        // Invalid rules are rejected without touching the source.
+        let mut bad = rule;
+        bad.workspace = Some("Missing".into());
+        assert!(apply_patch(
+            source,
+            ConfigPatch::SetRule {
+                previous_id: None,
+                rule: bad
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn documented_rule_example_parses() {
+        let config = crate::Config::parse(
+            "version = 1\n[[workspaces]]\nid = 2\nname = \"Code\"\n[[rules]]\nid = \"vscode-code\"\nname = \"VS Code to Code\"\nenabled = true\nbundle_id = \"com.microsoft.VSCode\"\nworkspace = \"code\"\nmode = \"tiled\"\npriority = 100\napply = \"on_create\"\n[[rules]]\nid = \"calculator-floating\"\nbundle_id = \"com.apple.calculator\"\nmode = \"floating\"\npriority = 90\n[[rules]]\nid = \"notes\"\nbundle_id = \"com.apple.Notes\"\ntitle = \"^Quick\"\ntitle_match = \"regex\"\nmode = \"floating\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.rules.len(), 3);
+        assert_eq!(config.rules[1].apply, crate::ApplyPolicy::OnCreate);
+        assert!(config.rules[1].stop);
+        assert!(crate::Config::parse(
+            "version = 1\n[[rules]]\nid = \"x\"\nbundle_id = \"a\"\nmode = \"sideways\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn scratchpad_patches_round_trip_and_validate_hotkeys() {
+        let source = "# keep\nversion = 1\n[[hotkeys]]\nchord = \"option+r\"\n[hotkeys.command]\ncommand = \"reconcile_windows\"\n";
+        let mut pad = ScratchpadDefinition::new("terminal");
+        pad.name = "Terminal".into();
+        pad.hotkey = Some("option+t".into());
+        pad.alignment = crate::ScratchpadAlignment::TopRight;
+        let (edited, config) = apply_patch(
+            source,
+            ConfigPatch::SetScratchpad {
+                previous_id: None,
+                scratchpad: pad.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(config.scratchpads, vec![pad.clone()]);
+        assert!(edited.contains("# keep"));
+        assert!(edited.contains("alignment = \"top_right\""));
+        // Unknown keys survive an edit; renaming works.
+        let edited = edited.replace("remember_size = true", "remember_size = true\nfuture = 1");
+        let mut renamed = pad.clone();
+        renamed.id = "term".into();
+        renamed.width = 0.5;
+        let (edited, config) = apply_patch(
+            &edited,
+            ConfigPatch::SetScratchpad {
+                previous_id: Some("terminal".into()),
+                scratchpad: renamed.clone(),
+            },
+        )
+        .unwrap();
+        assert!(edited.contains("future = 1"));
+        assert_eq!(config.scratchpads, vec![renamed.clone()]);
+        assert_eq!(crate::scratchpad_hotkeys(&config).len(), 1);
+        // A hotkey already taken is rejected.
+        let mut clash = renamed.clone();
+        clash.id = "other".into();
+        clash.hotkey = Some("alt+r".into());
+        assert!(apply_patch(
+            &edited,
+            ConfigPatch::SetScratchpad {
+                previous_id: None,
+                scratchpad: clash
+            }
+        )
+        .is_err());
+        let (_, config) =
+            apply_patch(&edited, ConfigPatch::RemoveScratchpad { id: "term".into() }).unwrap();
+        assert!(config.scratchpads.is_empty());
+        // Rules may only name configured scratchpads, and only that action.
+        assert!(crate::Config::parse(
+            "version = 1\n[[rules]]\nid = \"r\"\nbundle_id = \"a\"\nscratchpad = \"none\"\n"
+        )
+        .is_err());
+        assert!(crate::Config::parse("version = 1\n[[scratchpads]]\nid = \"t\"\n[[rules]]\nid = \"r\"\nbundle_id = \"a\"\nscratchpad = \"t\"\nworkspace = \"1\"\n").is_err());
+        let parsed = crate::Config::parse("version = 1\n[[scratchpads]]\nid = \"terminal\"\nname = \"Terminal\"\nhotkey = \"Alt+T\"\nscope = \"global\"\nwidth = 0.7\nheight = 0.65\nalignment = \"center\"\nremember_geometry = true\n[[rules]]\nid = \"r\"\nbundle_id = \"com.apple.Terminal\"\nscratchpad = \"terminal\"\n").unwrap();
+        assert_eq!(parsed.scratchpads[0].hide, crate::HideStrategy::Park);
     }
 }

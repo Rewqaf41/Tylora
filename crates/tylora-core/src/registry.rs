@@ -41,6 +41,9 @@ pub struct WindowSnapshot {
     /// Single native Space membership observed with the snapshot, if known.
     pub native_space_id: Option<u64>,
     pub application_id: Option<String>,
+    /// AX title when the application exposes one; may be empty while a
+    /// window is being created.
+    pub title: Option<String>,
     pub frame: Rect,
     pub display_id: Option<DisplayId>,
     pub lifecycle: WindowLifecycle,

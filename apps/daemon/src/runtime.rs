@@ -18,8 +18,13 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info, warn};
-use tylora_config::{compile_hotkey, Config, FocusMode, Hotkey, WindowRule, WindowRuleMode};
+use tylora_config::{compile_hotkey, Config, FocusMode, Hotkey, WindowRuleMode};
 use tylora_core::layout::{FocusOrigin, LayoutEnvironment, LayoutKind};
+use tylora_core::rules::{RuleEngine, RuleMode, RuleTracker, RuleWindowKey, Trigger, WindowFacts};
+use tylora_core::scratchpad::{
+    plan_scratchpad, scratchpad_frame, ScratchpadAction, ScratchpadContext, ScratchpadDefinition,
+    ScratchpadEntry, ScratchpadError, ScratchpadPlan, ScratchpadRegistry, ScratchpadState,
+};
 use tylora_core::LayoutPolicy;
 use tylora_core::{
     commands::{CommandError, CommandResult, DisplayTransferStatus, StateCommand},
@@ -266,6 +271,9 @@ fn hotkey_supported(command: &StateCommand, config: &Config) -> bool {
             | StateCommand::MoveWindowToDisplay { .. }
             | StateCommand::MoveWindowToNextDisplay { .. }
             | StateCommand::MoveWindowToPreviousDisplay { .. }
+            | StateCommand::ToggleScratchpad { .. }
+            | StateCommand::ShowScratchpad { .. }
+            | StateCommand::HideScratchpad { .. }
     )
 }
 
@@ -409,6 +417,14 @@ fn focus_workspace_space(
 }
 
 /// Records the native Space of a focused managed window.
+fn note_focus_trail(trail: &mut Vec<ManagedWindowId>, id: ManagedWindowId) {
+    trail.retain(|known| *known != id);
+    trail.push(id);
+    if trail.len() > 8 {
+        trail.remove(0);
+    }
+}
+
 fn note_space_focus(state: &DisplayState, id: ManagedWindowId, history: &mut SpaceFocusHistory) {
     if let Some(space) = state
         .coordinators
@@ -489,6 +505,34 @@ enum NativeMoveEvent {
         generation: u64,
         display: DisplayId,
         issued: Instant,
+        response: Option<SyncSender<String>>,
+        result: Result<tylora_macos::spaces::MoveOutcome, String>,
+    },
+    /// A scratchpad's native move finished (or failed).
+    ScratchpadMoved {
+        request: u64,
+        window: tylora_core::scratchpad::ScratchpadWindow,
+        elapsed_ms: u64,
+        result: Result<tylora_macos::spaces::MoveOutcome, String>,
+    },
+    /// A parking Desktop was created (or not) for a hide request.
+    ScratchpadParking {
+        id: String,
+        display_uuid: u128,
+        result: Result<u64, String>,
+        response: Option<SyncSender<String>>,
+    },
+    /// A rule's native move finished (or failed).
+    RuleMoved {
+        operation: u64,
+        key: RuleWindowKey,
+        rule: String,
+        window: ManagedWindowId,
+        generation: u64,
+        target_display: DisplayId,
+        target_space: u64,
+        target_workspace: Option<u8>,
+        started: Instant,
         response: Option<SyncSender<String>>,
         result: Result<tylora_macos::spaces::MoveOutcome, String>,
     },
@@ -628,6 +672,8 @@ struct PendingDisplayMove {
 
 fn effective_hotkeys(config: &Config) -> Vec<Hotkey> {
     let mut hotkeys = config.hotkeys.clone();
+    // Validation already rejected scratchpad chords that clash with these.
+    hotkeys.extend(tylora_config::scratchpad_hotkeys(config));
     for default in [
         Hotkey {
             chord: "option+shift+f".into(),
@@ -707,8 +753,30 @@ struct DisplayState {
     primary: DisplayId,
     moving: HashMap<ManagedWindowId, (DisplayId, Instant)>,
     dropped_stale: u64,
-    window_rules: Vec<WindowRule>,
-    rule_applied: HashSet<ManagedWindowId>,
+    rule_engine: RuleEngine,
+    rule_tracker: RuleTracker,
+    scratchpads: ScratchpadRegistry,
+    scratchpad_definitions: Vec<ScratchpadDefinition>,
+    scratchpad_requests: HashMap<u64, PendingScratchpad>,
+    scratchpad_request_counter: u64,
+    scratchpad_metrics: ScratchpadMetrics,
+    /// Windows a rule wants in a scratchpad: (scratchpad, CGWindowID).
+    scratchpad_rule_queue: Vec<(String, u32)>,
+    /// Scratchpads whose application was launched to get a window:
+    /// id -> (bundle ID, launched at).
+    scratchpad_launches: HashMap<String, (String, Instant)>,
+    /// Windows adopted for a launched scratchpad; assigned and shown by the
+    /// main loop.
+    scratchpad_adopted: Vec<(String, u32)>,
+    /// Floating/tiled chosen by the user, keyed by process and CGWindowID.
+    /// A window that leaves the observed Spaces (Space switch, other
+    /// display) returns under a new AX token; this restores its mode.
+    window_modes: HashMap<(ProcessInstance, u32), tylora_core::registry::ManagementMode>,
+    rule_queue: VecDeque<RuleOperation>,
+    rule_metrics: RuleMetrics,
+    rule_log: VecDeque<serde_json::Value>,
+    rule_evaluations: HashMap<RuleWindowKey, tylora_core::rules::Evaluation>,
+    next_rule_operation: u64,
     /// Layouts of native Spaces that no workspace is bound to.
     space_layouts: HashMap<(DisplayId, u64), TilingLayout>,
     /// Layout kind last taken from the configuration per workspace copy, so a
@@ -982,6 +1050,1695 @@ fn apply_space_rebinds(config: &Config, rebinds: &[(u8, u64, u64)]) -> Option<Co
         }
     }
     latest
+}
+
+/// Counters reported by `rules diagnostics`.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+struct RuleMetrics {
+    evaluations: u64,
+    evaluation_total_us: u64,
+    evaluation_max_us: u64,
+    operations: u64,
+    operation_total_ms: u64,
+    operation_max_ms: u64,
+    moves_applied: u64,
+    modes_applied: u64,
+    errors: u64,
+}
+
+/// A native move requested by a rule; executed outside window callbacks.
+struct RuleOperation {
+    id: u64,
+    key: RuleWindowKey,
+    window: ManagedWindowId,
+    trigger: Trigger,
+    rule: String,
+    workspace: Option<String>,
+    display: Option<u32>,
+    response: Option<SyncSender<String>>,
+}
+
+/// Rules from both `[[rules]]` and legacy `[[window_rules]]`.
+fn compile_rule_engine(config: &Config) -> Result<RuleEngine, String> {
+    let legacy: Vec<_> = config
+        .window_rules
+        .iter()
+        .map(|rule| {
+            (
+                rule.application_id.clone(),
+                match rule.mode {
+                    WindowRuleMode::Floating => RuleMode::Floating,
+                    WindowRuleMode::Tiled => RuleMode::Tiled,
+                },
+                rule.priority,
+                rule.enabled,
+            )
+        })
+        .collect();
+    RuleEngine::compile(&config.rules, &legacy)
+}
+
+fn rule_key(window: &WindowSnapshot) -> RuleWindowKey {
+    RuleWindowKey {
+        process: window.id.process,
+        cg_window_id: window.cg_window_id,
+        token: window.id.token,
+    }
+}
+
+fn management_mode(mode: RuleMode) -> Option<tylora_core::registry::ManagementMode> {
+    use tylora_core::registry::ManagementMode;
+    match mode {
+        RuleMode::Unchanged => None,
+        RuleMode::Tiled => Some(ManagementMode::Tiled),
+        RuleMode::Floating => Some(ManagementMode::Floating),
+        RuleMode::Unmanaged => Some(ManagementMode::Unmanaged),
+    }
+}
+
+/// Target native Space for a rule move. `Ok(None)` means the window is
+/// already there. A workspace with a display must have a Space on that
+/// display; otherwise the rule is a configuration error, never a guess.
+#[allow(clippy::too_many_arguments)]
+fn resolve_rule_target(
+    config: &Config,
+    spaces: &[NativeSpace],
+    current_space: Option<u64>,
+    current_display: Option<DisplayId>,
+    workspace: Option<&str>,
+    display: Option<u32>,
+    history: &SpaceFocusHistory,
+) -> Result<Option<(DisplayId, u64, Option<u8>)>, String> {
+    let target = match workspace {
+        Some(selector) => {
+            let definition = config
+                .workspace(selector)
+                .ok_or_else(|| format!("workspace {selector:?} is not configured"))?;
+            let existing: Vec<_> = definition
+                .space_ids()
+                .into_iter()
+                .filter_map(|id| spaces.iter().find(|space| space.id.0 == id))
+                .collect();
+            if existing.is_empty() {
+                return Err(format!(
+                    "workspace {:?} has no existing native Space",
+                    definition.name
+                ));
+            }
+            let chosen = match display {
+                Some(display) => existing
+                    .iter()
+                    .find(|space| space.display.0 == display)
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "workspace {:?} has no native Space on display {display}",
+                            definition.name
+                        )
+                    })?,
+                None => existing
+                    .iter()
+                    .find(|space| Some(space.display) == current_display)
+                    .or_else(|| {
+                        existing
+                            .iter()
+                            .filter_map(|space| history.get(&space.id.0).map(|at| (space, *at)))
+                            .max_by_key(|(_, at)| *at)
+                            .map(|(space, _)| space)
+                    })
+                    .or_else(|| existing.first())
+                    .copied()
+                    .expect("nonempty"),
+            };
+            (chosen.display, chosen.id.0, Some(definition.id))
+        }
+        None => {
+            let display = display.ok_or("rule has neither workspace nor display")?;
+            let space = spaces
+                .iter()
+                .find(|space| space.display.0 == display && space.active)
+                .ok_or_else(|| format!("display {display} has no active native Space"))?;
+            if current_display == Some(space.display) {
+                return Ok(None);
+            }
+            (space.display, space.id.0, None)
+        }
+    };
+    Ok((current_space != Some(target.1)).then_some(target))
+}
+
+impl DisplayState {
+    /// Evaluates rules for one observed window and decides its mode. Moves
+    /// are only queued here; they run from the main loop.
+    fn apply_rules(&mut self, window: &mut WindowSnapshot, now: Instant) {
+        use tylora_core::registry::ManagementMode;
+        let key = rule_key(window);
+        let bundle = window.application_id.as_deref();
+        if self.rule_tracker.get(key).is_none() && !self.rule_engine.concerns(bundle) {
+            return;
+        }
+        let classified_unmanaged = window.mode == ManagementMode::Unmanaged;
+        let current_mode = self
+            .coordinators
+            .values()
+            .find_map(|coordinator| coordinator.registry.get(window.id))
+            .map(|record| record.observed.mode);
+        let trigger = self.rule_tracker.observe(
+            key,
+            window.title.as_deref(),
+            window.native_space_id,
+            self.rule_engine.wants_title(bundle),
+            now,
+        );
+        if let Some(trigger) = trigger {
+            let started = Instant::now();
+            let evaluation = self.rule_engine.evaluate(
+                WindowFacts {
+                    bundle_id: bundle,
+                    title: window.title.as_deref(),
+                },
+                trigger,
+            );
+            let elapsed = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            self.rule_metrics.evaluations += 1;
+            self.rule_metrics.evaluation_total_us += elapsed;
+            self.rule_metrics.evaluation_max_us = self.rule_metrics.evaluation_max_us.max(elapsed);
+            if let Some((mode, rule)) = evaluation.plan.mode.clone() {
+                if !classified_unmanaged || mode == RuleMode::Unmanaged {
+                    self.rule_tracker.set_mode(key, &rule, mode);
+                    if let Some(mode) = management_mode(mode) {
+                        window.mode = mode;
+                    }
+                    self.rule_metrics.modes_applied += 1;
+                    self.log_rule(key, &rule, "mode", format!("{mode:?}"));
+                }
+            }
+            if let (Some((pad, rule)), Some(cg)) =
+                (evaluation.plan.scratchpad.clone(), window.cg_window_id)
+            {
+                if !classified_unmanaged {
+                    self.scratchpad_rule_queue.push((pad.clone(), cg));
+                    self.log_rule(key, &rule, "scratchpad", pad);
+                }
+            }
+            if evaluation.plan.moves()
+                && !classified_unmanaged
+                && self.rule_tracker.may_move(key, trigger)
+            {
+                let (workspace, rule) = match &evaluation.plan.workspace {
+                    Some((workspace, rule)) => (Some(workspace.clone()), rule.clone()),
+                    None => (
+                        None,
+                        evaluation
+                            .plan
+                            .display
+                            .as_ref()
+                            .map(|(_, rule)| rule.clone())
+                            .unwrap_or_default(),
+                    ),
+                };
+                self.next_rule_operation += 1;
+                self.rule_queue.push_back(RuleOperation {
+                    id: self.next_rule_operation,
+                    key,
+                    window: window.id,
+                    trigger,
+                    rule,
+                    workspace,
+                    display: evaluation
+                        .plan
+                        .display
+                        .as_ref()
+                        .map(|(display, _)| *display),
+                    response: None,
+                });
+            }
+            if self.rule_evaluations.len() >= 256 {
+                self.rule_evaluations.clear();
+            }
+            self.rule_evaluations.insert(key, evaluation);
+            return;
+        }
+        // Later observations keep the rule's mode, but a mode the user chose
+        // afterwards (floating toggle) wins.
+        if let Some(mode) = self.rule_tracker.mode(key).and_then(management_mode) {
+            if !classified_unmanaged || mode == ManagementMode::Unmanaged {
+                window.mode = current_mode.unwrap_or(mode);
+            }
+        }
+    }
+
+    fn log_rule(&mut self, key: RuleWindowKey, rule: &str, action: &str, detail: String) {
+        if self.rule_log.len() >= 50 {
+            self.rule_log.pop_front();
+        }
+        self.rule_log.push_back(serde_json::json!({
+            "pid": key.process.pid,
+            "cg_window_id": key.cg_window_id,
+            "rule": rule,
+            "action": action,
+            "detail": detail,
+        }));
+        info!(pid = key.process.pid, cg_window_id = ?key.cg_window_id, rule, action, %detail, "window rule");
+    }
+
+    /// Managed window and current location for a CGWindowID.
+    fn find_window_by_cg(&self, cg: u32) -> Option<(DisplayId, &WindowSnapshot)> {
+        self.coordinators.iter().find_map(|(display, coordinator)| {
+            coordinator
+                .registry
+                .iter()
+                .find(|(_, record)| record.observed.cg_window_id == Some(cg))
+                .map(|(_, record)| (*display, &record.observed))
+        })
+    }
+}
+
+/// Starts a queued rule move: validates it against current state, resolves
+/// the target Space and runs the verified native move on a worker thread.
+fn start_rule_operation(
+    state: &mut DisplayState,
+    config: &Config,
+    operation: RuleOperation,
+    sender: &SyncSender<NativeMoveEvent>,
+    history: &SpaceFocusHistory,
+) {
+    let located = state
+        .coordinators
+        .iter()
+        .find_map(|(display, coordinator)| {
+            coordinator
+                .registry
+                .get(operation.window)
+                .map(|record| (*display, record.observed.clone(), record.generation))
+        })
+        .or_else(|| {
+            let cg = operation.key.cg_window_id?;
+            state
+                .coordinators
+                .iter()
+                .find_map(|(display, coordinator)| {
+                    coordinator.registry.iter().find_map(|(_, record)| {
+                        (record.observed.cg_window_id == Some(cg)
+                            && record.observed.id.process == operation.key.process)
+                            .then(|| (*display, record.observed.clone(), record.generation))
+                    })
+                })
+        });
+    let fail = |state: &mut DisplayState, operation: RuleOperation, error: String| {
+        state
+            .rule_tracker
+            .begin(operation.key, operation.id, operation.trigger);
+        state.rule_tracker.finish(
+            operation.key,
+            operation.id,
+            &operation.rule,
+            Err(error.clone()),
+        );
+        state.rule_metrics.errors += 1;
+        state.log_rule(operation.key, &operation.rule, "error", error.clone());
+        if let Some(response) = operation.response {
+            let _ = response.try_send(command_json(CommandResult::failure(
+                CommandError::Unsupported,
+                error,
+            )));
+        }
+    };
+    let Some((display, observed, generation)) = located else {
+        return fail(state, operation, "window is no longer managed".into());
+    };
+    let Some(cg) = observed.cg_window_id else {
+        return fail(state, operation, "window has no verified CGWindowID".into());
+    };
+    let target = resolve_rule_target(
+        config,
+        &state.native_spaces,
+        observed.native_space_id,
+        Some(display),
+        operation.workspace.as_deref(),
+        operation.display,
+        history,
+    );
+    match target {
+        Err(error) => fail(state, operation, error),
+        Ok(None) => {
+            let space = observed.native_space_id.unwrap_or_default();
+            state
+                .rule_tracker
+                .begin(operation.key, operation.id, operation.trigger);
+            state
+                .rule_tracker
+                .finish(operation.key, operation.id, &operation.rule, Ok(space));
+            state.log_rule(
+                operation.key,
+                &operation.rule,
+                "move",
+                "already in place".into(),
+            );
+            if let Some(response) = operation.response {
+                let _ = response.try_send(command_json(CommandResult::success(
+                    "window already matches the rule",
+                )));
+            }
+        }
+        Ok(Some((target_display, space, workspace))) => {
+            state
+                .rule_tracker
+                .begin(operation.key, operation.id, operation.trigger);
+            let sender = sender.clone();
+            let window = observed.id;
+            thread::spawn(move || {
+                let started = Instant::now();
+                let result = tylora_macos::spaces::NativeWindowSpaceMover::move_window_to_space(
+                    cg,
+                    tylora_macos::spaces::NativeSpaceId(space),
+                )
+                .map_err(|error| error.to_string());
+                let _ = sender.send(NativeMoveEvent::RuleMoved {
+                    operation: operation.id,
+                    key: operation.key,
+                    rule: operation.rule,
+                    window,
+                    generation,
+                    target_display,
+                    target_space: space,
+                    target_workspace: workspace,
+                    started,
+                    response: operation.response,
+                    result,
+                });
+            });
+        }
+    }
+}
+
+/// `rules …` IPC commands. Returns false for other commands.
+#[allow(clippy::too_many_arguments)]
+fn handle_rules_request(
+    command: &str,
+    response: &SyncSender<String>,
+    state: &mut DisplayState,
+    config: &Config,
+    history: &SpaceFocusHistory,
+    pending_config: &mut Option<Config>,
+    adapter: &ManagedAdapter,
+) -> bool {
+    let (command, json) = match command.strip_suffix(" --json") {
+        Some(command) => (command, true),
+        None => (command, false),
+    };
+    let reply = |value: serde_json::Value, text: String| {
+        let _ = response.try_send(if json { format!("{value}\n") } else { text });
+    };
+    let window_arg = |rest: &str| -> Result<u32, String> {
+        rest.strip_prefix("--window ")
+            .and_then(|id| id.trim().parse().ok())
+            .ok_or_else(|| "expected --window <CGWindowID>".to_string())
+    };
+    match command {
+        "apps list" => {
+            let apps = tylora_macos::running_applications();
+            let text = apps
+                .iter()
+                .map(|app| format!("{}\t{}\n", app.bundle_id, app.name.as_deref().unwrap_or("")))
+                .collect();
+            reply(serde_json::json!({"version": 1, "apps": apps}), text);
+        }
+        "rules list" => {
+            let rules: Vec<_> = state
+                .rule_engine
+                .definitions()
+                .map(|(rule, legacy)| {
+                    let mut value = serde_json::to_value(rule).unwrap_or_default();
+                    value["legacy"] = serde_json::Value::Bool(legacy);
+                    value
+                })
+                .collect();
+            let text = state
+                .rule_engine
+                .definitions()
+                .map(|(rule, legacy)| {
+                    format!(
+                        "{:>5} {} {}{} {} workspace={} display={} mode={:?} apply={:?}{}\n",
+                        rule.priority,
+                        if rule.enabled { "on " } else { "off" },
+                        rule.id,
+                        if legacy { " (legacy)" } else { "" },
+                        rule.bundle_id,
+                        rule.workspace.as_deref().unwrap_or("-"),
+                        rule.display
+                            .map_or("-".into(), |display| display.to_string()),
+                        rule.mode,
+                        rule.apply,
+                        rule.title
+                            .as_ref()
+                            .map(|title| format!(" title({:?})={title:?}", rule.title_match))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect();
+            reply(serde_json::json!({"version": 1, "rules": rules}), text);
+        }
+        "rules validate" => {
+            let mut problems = Vec::new();
+            let candidate = match Config::load(&config_path()) {
+                Ok(candidate) => Some(candidate),
+                Err(error) => {
+                    problems.push(error.to_string());
+                    None
+                }
+            };
+            let checked = candidate.as_ref().unwrap_or(config);
+            for rule in &checked.rules {
+                if !rule.enabled || (rule.workspace.is_none() && rule.display.is_none()) {
+                    continue;
+                }
+                if let Some(display) = rule.display {
+                    if !state.active.iter().any(|active| active.0 == display) {
+                        problems.push(format!(
+                            "rule {:?}: display {display} is not connected",
+                            rule.id
+                        ));
+                        continue;
+                    }
+                }
+                if let Err(error) = resolve_rule_target(
+                    checked,
+                    &state.native_spaces,
+                    None,
+                    None,
+                    rule.workspace.as_deref(),
+                    rule.display,
+                    history,
+                ) {
+                    problems.push(format!("rule {:?}: {error}", rule.id));
+                }
+            }
+            let ok = problems.is_empty();
+            let text = if ok {
+                format!("{} rules valid\n", checked.rules.len())
+            } else {
+                problems
+                    .iter()
+                    .map(|problem| format!("{problem}\n"))
+                    .collect()
+            };
+            reply(
+                serde_json::json!({"version": 1, "ok": ok, "rules": checked.rules.len(), "problems": problems}),
+                text,
+            );
+        }
+        "rules reload" => match Config::load(&config_path()) {
+            Ok(updated) => {
+                let count = updated.rules.len() + updated.window_rules.len();
+                *pending_config = Some(updated);
+                reply(
+                    serde_json::json!({"version": 1, "ok": true, "rules": count}),
+                    format!("reloading {count} rules\n"),
+                );
+            }
+            Err(error) => reply(
+                serde_json::json!({"version": 1, "ok": false, "error": error.to_string()}),
+                format!("{error}\n"),
+            ),
+        },
+        "rules diagnostics" => {
+            let windows: Vec<_> = state
+                .rule_tracker
+                .iter()
+                .map(|(key, entry)| serde_json::json!({"window": key, "state": entry}))
+                .collect();
+            let metrics = state.rule_metrics;
+            let value = serde_json::json!({
+                "version": 1,
+                "rules": state.rule_engine.len(),
+                "tracked_windows": state.rule_tracker.len(),
+                "queued_operations": state.rule_queue.len(),
+                "manual_overrides": state.rule_tracker.iter().filter(|(_, entry)| entry.manual_override).count(),
+                "overrides_detected": state.rule_tracker.overrides_detected,
+                "metrics": metrics,
+                "recent": state.rule_log,
+                "windows": windows,
+            });
+            let text = format!(
+                "rules={} tracked={} overrides={} evaluations={} avg_match_us={} moves={} modes={} errors={} avg_move_ms={}\n",
+                state.rule_engine.len(),
+                state.rule_tracker.len(),
+                value["manual_overrides"],
+                metrics.evaluations,
+                metrics.evaluation_total_us.checked_div(metrics.evaluations).unwrap_or(0),
+                metrics.moves_applied,
+                metrics.modes_applied,
+                metrics.errors,
+                metrics.operation_total_ms.checked_div(metrics.operations).unwrap_or(0),
+            );
+            reply(value, text);
+        }
+        _ => {
+            let (apply, rest) = if let Some(rest) = command.strip_prefix("rules test ") {
+                (false, rest)
+            } else if let Some(rest) = command.strip_prefix("rules apply ") {
+                (true, rest)
+            } else {
+                return false;
+            };
+            let cg = match window_arg(rest) {
+                Ok(cg) => cg,
+                Err(error) => {
+                    reply(
+                        serde_json::json!({"version": 1, "ok": false, "error": error}),
+                        format!("{error}\n"),
+                    );
+                    return true;
+                }
+            };
+            let Some((display, observed)) = state
+                .find_window_by_cg(cg)
+                .map(|(display, observed)| (display, observed.clone()))
+            else {
+                let error = format!("window {cg} is not managed on an active Space");
+                reply(
+                    serde_json::json!({"version": 1, "ok": false, "error": error}),
+                    format!("{error}\n"),
+                );
+                return true;
+            };
+            let key = rule_key(&observed);
+            let facts = WindowFacts {
+                bundle_id: observed.application_id.as_deref(),
+                title: observed.title.as_deref(),
+            };
+            let tracked = state.rule_tracker.get(key).cloned();
+            let automatic_trigger = if tracked.as_ref().is_some_and(|entry| entry.created) {
+                Trigger::Created
+            } else {
+                Trigger::FirstSeen
+            };
+            let automatic = state.rule_engine.evaluate(facts, automatic_trigger);
+            let manual = state.rule_engine.evaluate(facts, Trigger::Manual);
+            let target = if manual.plan.moves() {
+                Some(resolve_rule_target(
+                    config,
+                    &state.native_spaces,
+                    observed.native_space_id,
+                    Some(display),
+                    manual
+                        .plan
+                        .workspace
+                        .as_ref()
+                        .map(|(workspace, _)| workspace.as_str()),
+                    manual.plan.display.as_ref().map(|(display, _)| *display),
+                    history,
+                ))
+            } else {
+                None
+            };
+            let target_json = match &target {
+                Some(Ok(Some((display, space, workspace)))) => {
+                    serde_json::json!({"display": display, "native_space_id": space, "workspace": workspace})
+                }
+                Some(Ok(None)) => serde_json::json!("already in place"),
+                Some(Err(error)) => serde_json::json!({"error": error}),
+                None => serde_json::Value::Null,
+            };
+            if !apply {
+                let value = serde_json::json!({
+                    "version": 1,
+                    "ok": true,
+                    "window": {
+                        "cg_window_id": cg,
+                        "pid": observed.id.process.pid,
+                        "application_id": observed.application_id,
+                        "title": observed.title,
+                        "display": display,
+                        "native_space_id": observed.native_space_id,
+                        "mode": format!("{:?}", observed.mode),
+                    },
+                    "tracker": tracked,
+                    "manual_override": tracked.as_ref().is_some_and(|entry| entry.manual_override),
+                    "automatic": automatic,
+                    "manual": manual,
+                    "target": target_json,
+                });
+                let text = format!(
+                    "window {cg} {} {:?}\nautomatic ({:?}): winner={:?} plan={:?}\nmanual: winner={:?} plan={:?}\ntarget={target_json}\nmanual_override={}\n",
+                    observed.application_id.as_deref().unwrap_or("?"),
+                    observed.title.as_deref().unwrap_or(""),
+                    automatic.trigger,
+                    automatic.winner,
+                    automatic.plan,
+                    manual.winner,
+                    manual.plan,
+                    value["manual_override"],
+                );
+                reply(value, text);
+                return true;
+            }
+            // Apply now: explicit user request, so a manual override is cleared.
+            if manual.winner.is_none() {
+                reply(
+                    serde_json::json!({"version": 1, "ok": false, "error": "no rule matches this window"}),
+                    "no rule matches this window\n".into(),
+                );
+                return true;
+            }
+            state.rule_tracker.observe(
+                key,
+                observed.title.as_deref(),
+                observed.native_space_id,
+                false,
+                Instant::now(),
+            );
+            state.rule_tracker.clear_override(key);
+            if let Some((mode, rule)) = manual.plan.mode.clone() {
+                state.rule_tracker.set_mode(key, &rule, mode);
+                // An explicit rule application replaces an earlier manual choice.
+                state.window_modes.remove(&(observed.id.process, cg));
+                use tylora_core::registry::ManagementMode;
+                let wants_floating = mode == RuleMode::Floating;
+                let toggles = (wants_floating && observed.mode == ManagementMode::Tiled)
+                    || (mode == RuleMode::Tiled && observed.mode == ManagementMode::Floating);
+                if toggles {
+                    if let Some(coordinator) = state.coordinators.get_mut(&display) {
+                        let _ = coordinator.execute(
+                            &StateCommand::ToggleFloating {
+                                window: Some(observed.id),
+                            },
+                            None,
+                        );
+                    }
+                }
+                state.rule_metrics.modes_applied += 1;
+                state.log_rule(key, &rule, "mode", format!("{mode:?} (manual)"));
+            }
+            let _ = adapter.commands.try_send(ManagedCommand::Reconcile);
+            if manual.plan.moves() {
+                let (workspace, rule) = match &manual.plan.workspace {
+                    Some((workspace, rule)) => (Some(workspace.clone()), rule.clone()),
+                    None => (
+                        None,
+                        manual
+                            .plan
+                            .display
+                            .as_ref()
+                            .map(|(_, rule)| rule.clone())
+                            .unwrap_or_default(),
+                    ),
+                };
+                state.next_rule_operation += 1;
+                state.rule_queue.push_back(RuleOperation {
+                    id: state.next_rule_operation,
+                    key,
+                    window: observed.id,
+                    trigger: Trigger::Manual,
+                    rule,
+                    workspace,
+                    display: manual.plan.display.as_ref().map(|(display, _)| *display),
+                    response: Some(response.clone()),
+                });
+            } else {
+                let _ =
+                    response.try_send(command_json(CommandResult::success("rule mode applied")));
+            }
+        }
+    }
+    true
+}
+
+/// Request IDs of scratchpad AX operations; disjoint from other requests.
+const SCRATCHPAD_REQUEST: u64 = 1 << 61;
+
+/// Timing and error counters reported by `scratchpad list --json`.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+struct ScratchpadMetrics {
+    toggles: u64,
+    toggle_total_ms: u64,
+    moves: u64,
+    move_total_ms: u64,
+    presents: u64,
+    present_total_ms: u64,
+    errors: u64,
+}
+
+/// A scratchpad step waiting for the AX worker or a native move.
+struct PendingScratchpad {
+    id: String,
+    generation: u64,
+    started: Instant,
+    /// Showing: final Space/display; hiding: the parking Space.
+    space: u64,
+    display: DisplayId,
+    showing: bool,
+    response: Option<SyncSender<String>>,
+}
+
+fn scratchpad_state_path() -> PathBuf {
+    workspace_state_path().with_file_name("scratchpads.json")
+}
+
+fn load_scratchpads() -> ScratchpadRegistry {
+    fs::read(scratchpad_state_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_scratchpads(registry: &ScratchpadRegistry) {
+    if cfg!(test) {
+        return;
+    }
+    let path = scratchpad_state_path();
+    let result = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec_pretty(registry).map_err(std::io::Error::other)?;
+        let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+        let _ = fs::remove_file(&temp);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, &path)
+    })();
+    if let Err(error) = result {
+        warn!(%error, "cannot persist scratchpads");
+    }
+}
+
+fn scratchpad_reply(
+    id: &str,
+    entry: Option<&ScratchpadEntry>,
+    backend: &str,
+    result: Result<&str, String>,
+) -> String {
+    let ok = result.is_ok();
+    serde_json::json!({
+        "version": 1,
+        "ok": ok,
+        "scratchpad": id,
+        "window": entry.and_then(|entry| entry.window.as_ref().map(|window| window.cg_window_id)),
+        "native_space_id": entry.and_then(|entry| entry.current_space),
+        "state": entry.map(|entry| entry.state),
+        "backend": backend,
+        "result": result.as_ref().ok(),
+        "error": result.err(),
+    })
+    .to_string()
+}
+
+/// Brings every hidden, parked scratchpad window back to its home Space or
+/// the active Space of its display. Used on stop, by `recover-windows`
+/// (also without a running daemon) and by `scratchpad recover`.
+fn recover_parked_scratchpads(registry: &mut ScratchpadRegistry) -> Vec<String> {
+    use tylora_macos::spaces::{
+        ExperimentalSkyLightBackend, NativeSpaceBackend, NativeSpaceId, NativeWindowSpaceMover,
+    };
+    let backend = ExperimentalSkyLightBackend::new();
+    let Ok(spaces) = backend.list_spaces() else {
+        return vec!["native Spaces unavailable".into()];
+    };
+    let parking: HashSet<u64> = registry.parking.values().copied().collect();
+    let mut problems = Vec::new();
+    for entry in registry.entries.values_mut() {
+        let Some(window) = entry.window.clone() else {
+            continue;
+        };
+        let Ok(memberships) = backend.get_window_spaces(window.cg_window_id) else {
+            continue;
+        };
+        let Some(current) = memberships.first().map(|space| space.0) else {
+            continue;
+        };
+        if !parking.contains(&current) {
+            continue;
+        }
+        let display = spaces
+            .iter()
+            .find(|space| space.id.0 == current)
+            .map(|space| space.display);
+        let target = entry
+            .home_space
+            .filter(|home| *home != current && spaces.iter().any(|space| space.id.0 == *home))
+            .or_else(|| {
+                spaces
+                    .iter()
+                    .find(|space| {
+                        Some(space.display) == display && space.active && space.id.0 != current
+                    })
+                    .map(|space| space.id.0)
+            });
+        let Some(target) = target else {
+            problems.push(format!("{}: no Space to return to", entry.id));
+            continue;
+        };
+        match NativeWindowSpaceMover::move_window_to_space(
+            window.cg_window_id,
+            NativeSpaceId(target),
+        ) {
+            Ok(outcome) if outcome.confirmed => {
+                entry.state = ScratchpadState::Visible;
+                entry.current_space = Some(target);
+                info!(scratchpad = %entry.id, space = target, "scratchpad window recovered");
+            }
+            Ok(_) => problems.push(format!("{}: move not confirmed", entry.id)),
+            Err(error) => problems.push(format!("{}: {error}", entry.id)),
+        }
+    }
+    problems
+}
+
+impl DisplayState {
+    fn next_scratchpad_request(&mut self) -> u64 {
+        self.scratchpad_request_counter =
+            self.scratchpad_request_counter.wrapping_add(1) & ((1 << 40) - 1);
+        SCRATCHPAD_REQUEST | self.scratchpad_request_counter
+    }
+
+    fn scratchpad_definition(&self, id: &str) -> Option<&ScratchpadDefinition> {
+        self.scratchpad_definitions.iter().find(|pad| pad.id == id)
+    }
+
+    /// Keeps scratchpad windows out of every tiled layout and records where
+    /// they are. Called for each window on an active Space.
+    fn apply_scratchpad_observation(&mut self, window: &mut WindowSnapshot) {
+        let Some(cg) = window.cg_window_id else {
+            return;
+        };
+        self.scratchpad_launches
+            .retain(|_, (_, launched)| launched.elapsed() < Duration::from_secs(20));
+        if window.mode != tylora_core::registry::ManagementMode::Unmanaged
+            && self.scratchpads.owner_of(window.id.process, cg).is_none()
+        {
+            let launched = self
+                .scratchpad_launches
+                .iter()
+                .find_map(|(id, (bundle, _))| {
+                    (window.application_id.as_deref() == Some(bundle.as_str())).then(|| id.clone())
+                });
+            if let Some(id) = launched {
+                self.scratchpad_launches.remove(&id);
+                self.scratchpad_adopted.push((id, cg));
+            }
+        }
+        if self.scratchpads.owner_of(window.id.process, cg).is_none() {
+            return;
+        }
+        if window.mode != tylora_core::registry::ManagementMode::Unmanaged {
+            window.mode = tylora_core::registry::ManagementMode::Floating;
+        }
+        if let Some(display) = window.display_id {
+            if window.lifecycle != tylora_core::registry::WindowLifecycle::Minimized {
+                self.scratchpads.observed_visible(
+                    window.id.process,
+                    cg,
+                    window.native_space_id,
+                    display,
+                    window.frame,
+                    window.title.as_deref(),
+                );
+            }
+        }
+    }
+
+    fn parking_space(&self, display: DisplayId) -> Option<u64> {
+        let uuid = self.areas.get(&display)?.stable_uuid?;
+        let space = *self.scratchpads.parking.get(&format!("{uuid:032x}"))?;
+        self.native_spaces
+            .iter()
+            .any(|native| native.id.0 == space && native.display == display)
+            .then_some(space)
+    }
+
+    fn managed_by_cg(
+        &self,
+        process: ProcessInstance,
+        cg: u32,
+    ) -> Option<(DisplayId, WindowSnapshot)> {
+        self.coordinators.iter().find_map(|(display, coordinator)| {
+            coordinator.registry.iter().find_map(|(_, record)| {
+                (record.observed.id.process == process && record.observed.cg_window_id == Some(cg))
+                    .then(|| (*display, record.observed.clone()))
+            })
+        })
+    }
+}
+
+/// Everything the main loop owns that scratchpad operations touch.
+struct ScratchpadIo<'a> {
+    adapter: &'a ManagedAdapter,
+    native: &'a SyncSender<NativeMoveEvent>,
+    focused: Option<ManagedWindowId>,
+    /// Recently focused windows, newest last.
+    trail: &'a [ManagedWindowId],
+}
+
+/// A scratchpad without a (live) window takes one of its application's
+/// windows: the most recently focused, else any on an active Space. With
+/// none open, the application is launched and its first new window adopted.
+fn adopt_scratchpad_window(
+    state: &mut DisplayState,
+    io: &ScratchpadIo<'_>,
+    definition: &ScratchpadDefinition,
+    response: Option<SyncSender<String>>,
+) -> Result<(), String> {
+    let Some(bundle) = definition
+        .bundle_id
+        .clone()
+        .filter(|bundle| !bundle.is_empty())
+    else {
+        return Err(
+            "no window assigned: assign one, or choose the scratchpad's application so it can be opened"
+                .into(),
+        );
+    };
+    let candidates: Vec<(ManagedWindowId, u32)> = state
+        .coordinators
+        .values()
+        .flat_map(|coordinator| coordinator.registry.iter())
+        .filter(|(_, record)| {
+            record.observed.application_id.as_deref() == Some(bundle.as_str())
+                && record.observed.mode != tylora_core::registry::ManagementMode::Unmanaged
+        })
+        .filter_map(|(id, record)| record.observed.cg_window_id.map(|cg| (*id, cg)))
+        .filter(|(id, cg)| state.scratchpads.owner_of(id.process, *cg).is_none())
+        .collect();
+    let chosen = io
+        .trail
+        .iter()
+        .rev()
+        .find_map(|focused| candidates.iter().find(|(id, _)| id == focused))
+        .or_else(|| candidates.first())
+        .map(|(_, cg)| *cg);
+    if let Some(cg) = chosen {
+        assign_scratchpad(state, io, &definition.id, cg, false, false)?;
+        info!(scratchpad = %definition.id, cg, "open window adopted");
+        return scratchpad_action(state, io, &definition.id, ScratchpadAction::Show, response);
+    }
+    std::process::Command::new("/usr/bin/open")
+        .args(["-b", &bundle])
+        .spawn()
+        .map_err(|error| format!("cannot open {bundle}: {error}"))?;
+    info!(scratchpad = %definition.id, %bundle, "application launched for scratchpad");
+    state
+        .scratchpad_launches
+        .insert(definition.id.clone(), (bundle, Instant::now()));
+    let _ = io.adapter.commands.try_send(ManagedCommand::Reconcile);
+    if let Some(response) = response {
+        let _ = response.try_send(scratchpad_reply(
+            &definition.id,
+            state.scratchpads.get(&definition.id),
+            "launch",
+            Ok("launching"),
+        ));
+    }
+    Ok(())
+}
+
+/// Toggle, show or hide: plans with live state and starts the first step.
+fn scratchpad_action(
+    state: &mut DisplayState,
+    io: &ScratchpadIo<'_>,
+    id: &str,
+    action: ScratchpadAction,
+    response: Option<SyncSender<String>>,
+) -> Result<(), String> {
+    use tylora_macos::spaces::{ExperimentalSkyLightBackend, NativeSpaceBackend};
+    let definition = state
+        .scratchpad_definition(id)
+        .cloned()
+        .ok_or_else(|| format!("scratchpad {id:?} is not configured"))?;
+    let entry = state
+        .scratchpads
+        .get(id)
+        .cloned()
+        .ok_or_else(|| format!("scratchpad {id:?} is not configured"))?;
+    if (entry.window.is_none() || entry.state == ScratchpadState::Unavailable)
+        && action != ScratchpadAction::Hide
+    {
+        return adopt_scratchpad_window(state, io, &definition, response);
+    }
+    let window = entry
+        .window
+        .clone()
+        .ok_or_else(|| ScratchpadError::NotAssigned.to_string())?;
+    // Where the window is right now, straight from WindowServer.
+    let memberships = ExperimentalSkyLightBackend::new()
+        .get_window_spaces(window.cg_window_id)
+        .map_err(|error| error.to_string())?;
+    let Some(window_space) = memberships.first().map(|space| space.0) else {
+        state
+            .scratchpads
+            .window_gone(|w| w.cg_window_id == window.cg_window_id);
+        save_scratchpads(&state.scratchpads);
+        return Err("scratchpad window no longer exists".into());
+    };
+    let window_native = state
+        .native_spaces
+        .iter()
+        .find(|space| space.id.0 == window_space);
+    let window_display = window_native.map(|space| space.display);
+    let managed = state.managed_by_cg(window.process, window.cg_window_id);
+    let minimized = managed.as_ref().is_some_and(|(_, observed)| {
+        observed.lifecycle == tylora_core::registry::WindowLifecycle::Minimized
+    });
+    let pointer =
+        tylora_macos::spaces::cursor_display().filter(|display| state.active.contains(display));
+    let focused_display = io.focused.and_then(|focused| {
+        state
+            .coordinators
+            .iter()
+            .find(|(_, c)| c.registry.get(focused).is_some())
+            .map(|(display, _)| *display)
+    });
+    let target_display = definition
+        .display
+        .map(DisplayId)
+        .filter(|display| state.active.contains(display))
+        .or(match definition.target {
+            tylora_core::scratchpad::ScratchpadTarget::Focused => focused_display.or(pointer),
+            tylora_core::scratchpad::ScratchpadTarget::Pointer => pointer.or(focused_display),
+        })
+        .or(window_display)
+        .unwrap_or(state.primary);
+    let target_space = state
+        .native_spaces
+        .iter()
+        .find(|space| space.display == target_display && space.active)
+        .map(|space| space.id.0)
+        .ok_or("target display has no active native Space")?;
+    let context = ScratchpadContext {
+        target_display,
+        target_space,
+        window_space: Some(window_space),
+        window_display,
+        window_space_active: window_native.is_some_and(|space| space.active),
+        minimized,
+        parking_space: window_display.and_then(|display| state.parking_space(display)),
+        home_active: entry.home_space.is_some_and(|home| {
+            state
+                .native_spaces
+                .iter()
+                .any(|space| space.id.0 == home && space.active)
+        }),
+    };
+    let plan =
+        plan_scratchpad(&definition, &entry, action, context).map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    state.scratchpad_metrics.toggles += 1;
+    match plan {
+        ScratchpadPlan::Nothing => {
+            let entry = state.scratchpads.get(id);
+            if let Some(response) = response {
+                let _ =
+                    response.try_send(scratchpad_reply(id, entry, "none", Ok("already hidden")));
+            }
+            Ok(())
+        }
+        ScratchpadPlan::NeedsParking(display) => {
+            // Create the display's parking Desktop once, then hide again.
+            let uuid = state
+                .areas
+                .get(&display)
+                .and_then(|area| area.stable_uuid)
+                .ok_or("display has no stable identity for a parking Desktop")?;
+            let sender = io.native.clone();
+            let known: HashSet<u64> = state.native_spaces.iter().map(|space| space.id.0).collect();
+            let id = id.to_string();
+            thread::spawn(move || {
+                let result = (|| {
+                    use tylora_macos::spaces::{ExperimentalSkyLightBackend, NativeSpaceBackend};
+                    tylora_macos::add_desktops(display, 1)?;
+                    let backend = ExperimentalSkyLightBackend::new();
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    loop {
+                        if let Ok(spaces) = backend.list_spaces() {
+                            if let Some(space) = spaces
+                                .iter()
+                                .filter(|space| {
+                                    space.display == display && !known.contains(&space.id.0)
+                                })
+                                .max_by_key(|space| space.desktop.0)
+                            {
+                                return Ok(space.id.0);
+                            }
+                        }
+                        if Instant::now() >= deadline {
+                            return Err("parking Desktop did not appear".to_string());
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                })();
+                let _ = sender.send(NativeMoveEvent::ScratchpadParking {
+                    id,
+                    display_uuid: uuid,
+                    result,
+                    response,
+                });
+            });
+            Ok(())
+        }
+        ScratchpadPlan::Show {
+            display,
+            space,
+            move_from,
+            unminimize,
+        } => {
+            let generation = state
+                .scratchpads
+                .begin(id, true)
+                .map_err(|error| error.to_string())?;
+            if let Some(entry) = state.scratchpads.get_mut(id) {
+                entry.previous_focus = io.focused.and_then(|focused| {
+                    state.coordinators.values().find_map(|c| {
+                        c.registry.get(focused).and_then(|record| {
+                            record
+                                .observed
+                                .cg_window_id
+                                .map(|cg| (focused.process.pid, cg))
+                        })
+                    })
+                });
+            }
+            let pending = PendingScratchpad {
+                id: id.to_string(),
+                generation,
+                started,
+                space,
+                display,
+                showing: true,
+                response,
+            };
+            if move_from.is_some() {
+                start_scratchpad_move(state, io, window, pending);
+            } else {
+                if unminimize {
+                    if let Some((_, observed)) = &managed {
+                        state.hidden_by_tylora.remove(&observed.id);
+                        let _ = io.adapter.commands.try_send(ManagedCommand::Visibility {
+                            request: SCRATCHPAD_REQUEST,
+                            hide: Vec::new(),
+                            show: vec![observed.id],
+                        });
+                    }
+                }
+                present_scratchpad(state, io, &window, pending);
+            }
+            Ok(())
+        }
+        ScratchpadPlan::Hide { park, minimize } => {
+            let generation = state
+                .scratchpads
+                .begin(id, false)
+                .map_err(|error| error.to_string())?;
+            let display = window_display.unwrap_or(target_display);
+            let pending = PendingScratchpad {
+                id: id.to_string(),
+                generation,
+                started,
+                space: park.unwrap_or(window_space),
+                display,
+                showing: false,
+                response,
+            };
+            if minimize {
+                let Some((_, observed)) = managed else {
+                    let _ = state.scratchpads.finish(
+                        id,
+                        generation,
+                        Err("window is not observable".into()),
+                    );
+                    return Err("window is not observable for minimizing".into());
+                };
+                state.hidden_by_tylora.insert(observed.id);
+                let request = state.next_scratchpad_request();
+                state.scratchpad_requests.insert(request, pending);
+                let _ = io.adapter.commands.try_send(ManagedCommand::Visibility {
+                    request,
+                    hide: vec![observed.id],
+                    show: Vec::new(),
+                });
+            } else if park.is_some() {
+                start_scratchpad_move(state, io, window, pending);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Native move for a scratchpad (show: to the target Space; hide: to the
+/// parking Desktop). The result returns as `NativeMoveEvent::ScratchpadMoved`.
+fn start_scratchpad_move(
+    state: &mut DisplayState,
+    io: &ScratchpadIo<'_>,
+    window: tylora_core::scratchpad::ScratchpadWindow,
+    pending: PendingScratchpad,
+) {
+    let target = pending.space;
+    let sender = io.native.clone();
+    let key = state.next_scratchpad_request();
+    state.scratchpad_requests.insert(key, pending);
+    thread::spawn(move || {
+        let started = Instant::now();
+        let result = tylora_macos::spaces::NativeWindowSpaceMover::move_window_to_space(
+            window.cg_window_id,
+            tylora_macos::spaces::NativeSpaceId(target),
+        )
+        .map_err(|error| error.to_string());
+        let _ = sender.send(NativeMoveEvent::ScratchpadMoved {
+            request: key,
+            window,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            result,
+        });
+    });
+}
+
+/// Asks the AX worker to place, raise and focus the scratchpad window.
+fn present_scratchpad(
+    state: &mut DisplayState,
+    io: &ScratchpadIo<'_>,
+    window: &tylora_core::scratchpad::ScratchpadWindow,
+    pending: PendingScratchpad,
+) {
+    let definition = state.scratchpad_definition(&pending.id).cloned();
+    let remembered = state
+        .scratchpads
+        .get(&pending.id)
+        .and_then(|entry| entry.geometry);
+    let frame = match (definition, state.areas.get(&pending.display)) {
+        (Some(definition), Some(area)) => {
+            Some(scratchpad_frame(&definition, area.frame, remembered))
+        }
+        _ => None,
+    };
+    let request = state.next_scratchpad_request();
+    state.scratchpad_requests.insert(request, pending);
+    let _ = io.adapter.commands.try_send(ManagedCommand::Present {
+        request,
+        pid: window.process.pid,
+        cg_window_id: window.cg_window_id,
+        frame,
+        focus: true,
+    });
+}
+
+/// Finishes a scratchpad operation and answers the caller.
+fn finish_scratchpad(
+    state: &mut DisplayState,
+    pending: PendingScratchpad,
+    result: Result<ScratchpadState, String>,
+    backend: &str,
+) {
+    let elapsed = pending.started.elapsed().as_millis() as u64;
+    state.scratchpad_metrics.toggle_total_ms += elapsed;
+    if result.is_err() {
+        state.scratchpad_metrics.errors += 1;
+    }
+    let outcome = result
+        .clone()
+        .map(|done| (done, Some(pending.space), Some(pending.display)));
+    let _ = state
+        .scratchpads
+        .finish(&pending.id, pending.generation, outcome);
+    save_scratchpads(&state.scratchpads);
+    let entry = state.scratchpads.get(&pending.id);
+    match &result {
+        Ok(done) => {
+            info!(scratchpad = %pending.id, ?done, elapsed_ms = elapsed, backend, "scratchpad operation verified")
+        }
+        Err(error) => {
+            warn!(scratchpad = %pending.id, %error, backend, "scratchpad operation failed")
+        }
+    }
+    if let Some(response) = pending.response {
+        let _ = response.try_send(scratchpad_reply(
+            &pending.id,
+            entry,
+            backend,
+            result.map(|done| {
+                if done == ScratchpadState::Visible {
+                    "shown"
+                } else {
+                    "hidden"
+                }
+            }),
+        ));
+    }
+}
+
+/// Assigns a managed window (by CGWindowID) to a scratchpad.
+fn assign_scratchpad(
+    state: &mut DisplayState,
+    io: &ScratchpadIo<'_>,
+    id: &str,
+    cg: u32,
+    manual: bool,
+    force: bool,
+) -> Result<(), String> {
+    let (display, observed) = state
+        .coordinators
+        .iter()
+        .find_map(|(display, coordinator)| {
+            coordinator
+                .registry
+                .iter()
+                .find(|(_, record)| record.observed.cg_window_id == Some(cg))
+                .map(|(_, record)| (*display, record.observed.clone()))
+        })
+        .ok_or_else(|| format!("window {cg} is not managed on an active Space"))?;
+    if observed.mode == tylora_core::registry::ManagementMode::Unmanaged {
+        return Err("this window cannot be managed (dialog or system panel)".into());
+    }
+    if state.scratchpad_definition(id).is_none() {
+        return Err(format!("scratchpad {id:?} is not configured"));
+    }
+    let was_tiled = observed.mode == tylora_core::registry::ManagementMode::Tiled;
+    let prior = state.scratchpads.get(id).cloned();
+    let previous = state
+        .scratchpads
+        .assign(
+            id,
+            tylora_core::scratchpad::ScratchpadWindow {
+                process: observed.id.process,
+                cg_window_id: cg,
+                bundle_id: observed.application_id.clone(),
+                title: observed.title.clone(),
+            },
+            observed.native_space_id,
+            Some(display),
+            was_tiled,
+            manual,
+            force,
+        )
+        .map_err(|error| error.to_string())?;
+    if let (Some(previous), Some(prior)) = (previous, prior) {
+        info!(
+            scratchpad = id,
+            cg = previous.cg_window_id,
+            "previous scratchpad window released"
+        );
+        release_scratchpad_window(state, id, prior, previous);
+    }
+    // Float it now: it leaves the tiled layout and the rest reflows.
+    if was_tiled {
+        if let Some(coordinator) = state.coordinators.get_mut(&display) {
+            let _ = coordinator.execute(
+                &StateCommand::ToggleFloating {
+                    window: Some(observed.id),
+                },
+                None,
+            );
+        }
+    }
+    save_scratchpads(&state.scratchpads);
+    let _ = io.adapter.commands.try_send(ManagedCommand::Reconcile);
+    Ok(())
+}
+
+/// Releases a scratchpad's window and restores normal management.
+fn unassign_scratchpad(
+    state: &mut DisplayState,
+    io: &ScratchpadIo<'_>,
+    id: &str,
+) -> Result<(), String> {
+    let (entry, window) = state
+        .scratchpads
+        .unassign(id)
+        .map_err(|error| error.to_string())?;
+    release_scratchpad_window(state, id, entry, window);
+    save_scratchpads(&state.scratchpads);
+    let _ = io.adapter.commands.try_send(ManagedCommand::Reconcile);
+    Ok(())
+}
+
+/// Gives a window that left a scratchpad back to normal management: tiled
+/// again if it was tiled, or returned from the parking Desktop.
+fn release_scratchpad_window(
+    state: &mut DisplayState,
+    id: &str,
+    entry: ScratchpadEntry,
+    window: tylora_core::scratchpad::ScratchpadWindow,
+) {
+    let parked = state
+        .scratchpads
+        .parking
+        .values()
+        .any(|space| Some(*space) == entry.current_space)
+        && entry.state == ScratchpadState::Hidden;
+    if let Some((display, observed)) = state.managed_by_cg(window.process, window.cg_window_id) {
+        if entry.was_tiled && observed.mode == tylora_core::registry::ManagementMode::Floating {
+            if let Some(coordinator) = state.coordinators.get_mut(&display) {
+                let _ = coordinator.execute(
+                    &StateCommand::ToggleFloating {
+                        window: Some(observed.id),
+                    },
+                    None,
+                );
+            }
+        }
+    } else if parked {
+        // Hidden on the parking Desktop: bring it back where it belongs.
+        let mut single = ScratchpadRegistry::default();
+        single.entries.insert(
+            id.to_string(),
+            ScratchpadEntry {
+                window: Some(window),
+                ..entry
+            },
+        );
+        single.parking = state.scratchpads.parking.clone();
+        thread::spawn(move || {
+            let problems = recover_parked_scratchpads(&mut single);
+            if !problems.is_empty() {
+                warn!(?problems, "unassigned scratchpad window not recovered");
+            }
+        });
+    }
+}
+
+/// Native move finished for a scratchpad step.
+fn scratchpad_moved(
+    state: &mut DisplayState,
+    io: &ScratchpadIo<'_>,
+    request: u64,
+    window: tylora_core::scratchpad::ScratchpadWindow,
+    elapsed_ms: u64,
+    result: Result<tylora_macos::spaces::MoveOutcome, String>,
+) {
+    let Some(pending) = state.scratchpad_requests.remove(&request) else {
+        return;
+    };
+    state.scratchpad_metrics.moves += 1;
+    state.scratchpad_metrics.move_total_ms += elapsed_ms;
+    let outcome = match result {
+        Ok(outcome) if outcome.confirmed && outcome.target.0 == pending.space => outcome,
+        Ok(_) => {
+            return finish_scratchpad(
+                state,
+                pending,
+                Err("native move not confirmed".into()),
+                "park",
+            )
+        }
+        Err(error) => return finish_scratchpad(state, pending, Err(error), "park"),
+    };
+    if pending.showing {
+        present_scratchpad(state, io, &window, pending);
+        return;
+    }
+    // Hidden: drop it from the active Space's registry and give focus back.
+    if let Some((_, observed)) = state.managed_by_cg(window.process, window.cg_window_id) {
+        let generation = state
+            .coordinators
+            .values()
+            .find_map(|c| c.registry.get(observed.id).map(|record| record.generation))
+            .unwrap_or_default();
+        state.commit_native_move(observed.id, generation, &outcome, None);
+    }
+    let previous = state
+        .scratchpads
+        .get(&pending.id)
+        .and_then(|entry| entry.previous_focus)
+        .and_then(|(pid, cg)| {
+            state.coordinators.values().find_map(|c| {
+                c.registry.iter().find_map(|(id, record)| {
+                    (id.process.pid == pid && record.observed.cg_window_id == Some(cg))
+                        .then_some(*id)
+                })
+            })
+        });
+    match previous {
+        Some(id) => {
+            let _ = io.adapter.commands.try_send(ManagedCommand::Focus(id));
+        }
+        None => {
+            let _ = focus_display(state, io.adapter, pending.display);
+        }
+    }
+    let _ = io.adapter.commands.try_send(ManagedCommand::Reconcile);
+    finish_scratchpad(state, pending, Ok(ScratchpadState::Hidden), "park");
+}
+
+/// AX worker placed and focused (or failed to place) a scratchpad window.
+fn scratchpad_presented(
+    state: &mut DisplayState,
+    request: u64,
+    result: Result<tylora_core::Rect, i32>,
+) -> bool {
+    let Some(pending) = state.scratchpad_requests.remove(&request) else {
+        return false;
+    };
+    let elapsed = pending.started.elapsed().as_millis() as u64;
+    state.scratchpad_metrics.presents += 1;
+    state.scratchpad_metrics.present_total_ms += elapsed;
+    let verified = match result {
+        Ok(actual) => {
+            // Some apps constrain size; it only has to be on the display.
+            let area = state
+                .areas
+                .get(&pending.display)
+                .map(|area| area.full_frame);
+            if area.is_none_or(|area| {
+                actual.x < area.x + area.width
+                    && actual.x + actual.width > area.x
+                    && actual.y < area.y + area.height
+                    && actual.y + actual.height > area.y
+            }) {
+                Ok(ScratchpadState::Visible)
+            } else {
+                Err(format!(
+                    "window frame {actual:?} is not on the target display"
+                ))
+            }
+        }
+        Err(code) => Err(format!("cannot place or focus the window (AX {code})")),
+    };
+    finish_scratchpad(state, pending, verified, "park");
+    true
+}
+
+/// `scratchpad …` IPC commands. Returns false for other commands.
+fn handle_scratchpad_request(
+    command: &str,
+    response: &SyncSender<String>,
+    state: &mut DisplayState,
+    io: &ScratchpadIo<'_>,
+) -> bool {
+    let Some(rest) = command.strip_prefix("scratchpad ") else {
+        return false;
+    };
+    let rest = rest.strip_suffix(" --json").unwrap_or(rest);
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let reply = |text: String| {
+        let _ = response.try_send(format!("{text}\n"));
+    };
+    match words.as_slice() {
+        ["list"] => {
+            let pads: Vec<_> = state
+                .scratchpad_definitions
+                .iter()
+                .map(|definition| {
+                    let entry = state.scratchpads.get(&definition.id);
+                    serde_json::json!({
+                        "id": definition.id,
+                        "name": definition.display_name(),
+                        "hotkey": definition.hotkey,
+                        "scope": definition.scope,
+                        "hide": definition.hide,
+                        "state": entry.map(|entry| entry.state),
+                        "window": entry.and_then(|entry| entry.window.clone()),
+                        "home_space": entry.and_then(|entry| entry.home_space),
+                        "native_space_id": entry.and_then(|entry| entry.current_space),
+                        "display": entry.and_then(|entry| entry.current_display),
+                        "geometry": entry.and_then(|entry| entry.geometry),
+                        "manual": entry.is_some_and(|entry| entry.manual),
+                        "last_error": entry.and_then(|entry| entry.last_error.clone()),
+                    })
+                })
+                .collect();
+            reply(serde_json::json!({
+                "version": 1,
+                "scratchpads": pads,
+                "parking": state.scratchpads.parking,
+                "metrics": state.scratchpad_metrics,
+            }).to_string());
+        }
+        ["capabilities"] => {
+            use tylora_macos::spaces::{ExperimentalSkyLightBackend, NativeSpaceBackend};
+            let capabilities = ExperimentalSkyLightBackend::new().capabilities();
+            reply(serde_json::json!({
+                "version": 1,
+                "park": {
+                    "available": capabilities.can_move_window_between_spaces,
+                    "mechanism": "verified native move to a parking Desktop per display",
+                    "parking_desktops": state.scratchpads.parking,
+                },
+                "global": {
+                    "available": capabilities.can_move_window_between_spaces,
+                    "target": "configured display, else pointer (or focused) display",
+                },
+                "minimize": {"available": true, "mechanism": "AXMinimized, journaled for recovery; opt-in"},
+                "sticky": {"available": false, "reason": "requires SIP changes; not used"},
+                "create_parking_desktop": {"mechanism": "Mission Control add-desktop button through Accessibility"},
+                "reasons": capabilities.reasons,
+            }).to_string());
+        }
+        ["recover"] => {
+            let problems = recover_parked_scratchpads(&mut state.scratchpads);
+            save_scratchpads(&state.scratchpads);
+            let _ = io.adapter.commands.try_send(ManagedCommand::RestoreVisibility { request: state.next_scratchpad_request() });
+            reply(serde_json::json!({"version": 1, "ok": problems.is_empty(), "problems": problems}).to_string());
+        }
+        ["assign", id, args @ ..] => {
+            let force = args.contains(&"--force");
+            let value = |flag: &str| {
+                args.iter()
+                    .position(|word| *word == flag)
+                    .and_then(|index| args.get(index + 1))
+                    .and_then(|value| value.parse::<u32>().ok())
+            };
+            // The Settings app asks with its own pid excluded: the focused
+            // window is then the one used just before switching to it.
+            let excluded = value("--exclude-pid").map(|pid| pid as i32);
+            let window = match value("--window") {
+                Some(cg) => Some(cg),
+                None => io.trail.iter().rev().find_map(|focused| {
+                    if excluded == Some(focused.process.pid) {
+                        return None;
+                    }
+                    state.coordinators.values().find_map(|c| {
+                        c.registry.get(*focused).and_then(|record| record.observed.cg_window_id)
+                    })
+                }),
+            };
+            let result = match window {
+                Some(cg) => assign_scratchpad(state, io, id, cg, true, force),
+                None => Err("no window: pass --window <CGWindowID> or focus a window first".into()),
+            };
+            let entry = state.scratchpads.get(id);
+            reply(scratchpad_reply(id, entry, "none", result.map(|()| "assigned")));
+        }
+        ["unassign", id] => {
+            let result = unassign_scratchpad(state, io, id);
+            reply(scratchpad_reply(id, state.scratchpads.get(id), "none", result.map(|()| "unassigned")));
+        }
+        [action @ ("toggle" | "show" | "hide"), id] => {
+            let action = match *action {
+                "toggle" => ScratchpadAction::Toggle,
+                "show" => ScratchpadAction::Show,
+                _ => ScratchpadAction::Hide,
+            };
+            if let Err(error) = scratchpad_action(state, io, id, action, Some(response.clone())) {
+                reply(scratchpad_reply(id, state.scratchpads.get(id), "park", Err(error)));
+            }
+        }
+        _ => reply(serde_json::json!({"version": 1, "ok": false, "error": "usage: scratchpad list|capabilities|recover | assign ID [--window CG] [--force] | unassign ID | toggle|show|hide ID"}).to_string()),
+    }
+    true
 }
 
 struct ConfirmedVisibility;
@@ -1343,10 +3100,40 @@ impl DisplayState {
     }
 
     fn apply_live_config(&mut self, config: &Config) {
-        self.window_rules = config.window_rules.clone();
+        // Existing windows keep their rule state: a reload never re-applies
+        // rules to windows that are already open.
+        match compile_rule_engine(config) {
+            Ok(engine) => self.rule_engine = engine,
+            Err(error) => warn!(%error, "rules not reloaded"),
+        }
+        self.scratchpad_definitions = config.scratchpads.clone();
+        let removed = self.scratchpads.sync_definitions(&config.scratchpads);
+        if removed.iter().any(|entry| entry.window.is_some()) {
+            // A deleted scratchpad must not leave its window parked.
+            let mut released = ScratchpadRegistry {
+                entries: removed
+                    .into_iter()
+                    .map(|entry| (entry.id.clone(), entry))
+                    .collect(),
+                parking: self.scratchpads.parking.clone(),
+            };
+            thread::spawn(move || {
+                let _ = recover_parked_scratchpads(&mut released);
+            });
+        }
+        save_scratchpads(&self.scratchpads);
+        let now = Instant::now();
+        let open: Vec<_> = self
+            .coordinators
+            .values()
+            .flat_map(|coordinator| coordinator.registry.iter())
+            .map(|(_, record)| rule_key(&record.observed))
+            .collect();
+        for key in open {
+            self.rule_tracker.mark_seen(key, now);
+        }
         self.zoom_outer_gap = config.gaps.outer;
         self.zoom_respect_outer_gaps = config.zoom.respect_outer_gaps;
-        self.rule_applied.clear();
         for coordinator in self.coordinators.values_mut() {
             let _ = coordinator
                 .layout
@@ -1398,8 +3185,30 @@ impl DisplayState {
             primary,
             moving: HashMap::new(),
             dropped_stale: 0,
-            window_rules: config.window_rules.clone(),
-            rule_applied: HashSet::new(),
+            rule_engine: compile_rule_engine(config).unwrap_or_default(),
+            scratchpads: {
+                let mut registry = if cfg!(test) {
+                    ScratchpadRegistry::default()
+                } else {
+                    load_scratchpads()
+                };
+                registry.sync_definitions(&config.scratchpads);
+                registry
+            },
+            scratchpad_definitions: config.scratchpads.clone(),
+            scratchpad_requests: HashMap::new(),
+            scratchpad_request_counter: 0,
+            scratchpad_metrics: ScratchpadMetrics::default(),
+            scratchpad_rule_queue: Vec::new(),
+            scratchpad_launches: HashMap::new(),
+            scratchpad_adopted: Vec::new(),
+            window_modes: HashMap::new(),
+            rule_tracker: RuleTracker::default(),
+            rule_queue: VecDeque::new(),
+            rule_metrics: RuleMetrics::default(),
+            rule_log: VecDeque::new(),
+            rule_evaluations: HashMap::new(),
+            next_rule_operation: 0,
             space_layouts: HashMap::new(),
             applied_layouts: HashMap::new(),
             applied_default_layout: None,
@@ -1647,35 +3456,20 @@ impl DisplayState {
                 })
             })
             .collect();
-        self.rule_applied
-            .retain(|id| id.process != process || windows.iter().any(|window| window.id == *id));
+        let now = Instant::now();
         for window in &mut windows {
-            if self.rule_applied.contains(&window.id) {
-                if let Some(mode) = self.coordinators.values().find_map(|coordinator| {
-                    coordinator
-                        .registry
-                        .get(window.id)
-                        .map(|record| record.observed.mode)
-                }) {
-                    window.mode = mode;
+            self.apply_rules(window, now);
+            // The user's explicit choice outlives AX tokens and wins over rules.
+            let chosen = window
+                .cg_window_id
+                .and_then(|cg| self.window_modes.get(&(window.id.process, cg)));
+            if let Some(mode) = chosen {
+                if window.mode != tylora_core::registry::ManagementMode::Unmanaged {
+                    window.mode = *mode;
                 }
-                continue;
             }
-            let Some(application_id) = window.application_id.as_deref() else {
-                continue;
-            };
-            if let Some(rule) = self
-                .window_rules
-                .iter()
-                .filter(|rule| rule.enabled && rule.application_id == application_id)
-                .max_by_key(|rule| rule.priority)
-            {
-                window.mode = match rule.mode {
-                    WindowRuleMode::Floating => tylora_core::registry::ManagementMode::Floating,
-                    WindowRuleMode::Tiled => tylora_core::registry::ManagementMode::Tiled,
-                };
-                self.rule_applied.insert(window.id);
-            }
+            // Scratchpad windows never tile, whatever else applies.
+            self.apply_scratchpad_observation(window);
         }
         for window in &windows {
             let resolved: Vec<_> = self
@@ -2022,7 +3816,36 @@ impl DisplayState {
         }
         false
     }
+    /// Remembers the mode the user gave a window with ToggleFloating.
+    fn remember_window_mode(&mut self, id: ManagedWindowId) {
+        let Some(record) = self
+            .coordinators
+            .values()
+            .find_map(|coordinator| coordinator.registry.get(id))
+        else {
+            return;
+        };
+        if let Some(cg) = record.observed.cg_window_id {
+            if self.window_modes.len() >= 1024 {
+                self.window_modes.clear();
+            }
+            self.window_modes
+                .insert((id.process, cg), record.observed.mode);
+        }
+    }
+
     fn handle_process_exited(&mut self, process: ProcessInstance) {
+        if !self
+            .scratchpads
+            .window_gone(|window| window.process == process)
+            .is_empty()
+        {
+            save_scratchpads(&self.scratchpads);
+        }
+        self.window_modes.retain(|(owner, _), _| *owner != process);
+        self.rule_tracker.process_exited(process);
+        self.rule_evaluations
+            .retain(|key, _| key.process != process);
         self.in_flight_display.retain(|id| id.process != process);
         self.pending_display
             .retain(|_, pending| pending.prepared.id.process != process);
@@ -2239,6 +4062,11 @@ pub fn request(command: &str) -> ExitCode {
             // Opens the WindowServer connection on the main thread, as the
             // daemon does; display queries in the AX worker require it.
             let _ = work_areas();
+            let mut scratchpads = load_scratchpads();
+            for problem in recover_parked_scratchpads(&mut scratchpads) {
+                eprintln!("scratchpad: {problem}");
+            }
+            save_scratchpads(&scratchpads);
             let adapter = ManagedAdapter::start();
             let _ = adapter
                 .commands
@@ -2438,6 +4266,14 @@ fn run_coordinator(
     }
     let adapter = ManagedAdapter::start();
     let mut state = DisplayState::new(areas, primary, &config);
+    // Windows open before the daemon started never count as "created", so
+    // on_create rules leave them alone.
+    if let Ok(windows) = tylora_macos::discover_all_cg_windows() {
+        state
+            .rule_tracker
+            .set_preexisting(windows.iter().map(|window| (window.owner_pid, window.id.0)));
+    }
+    let mut last_rule_prune = Instant::now();
     let space_observer = SpaceObserver::start();
     let config_watcher = ConfigWatcher::start(config_path());
     let bindings = active_bindings(&config);
@@ -2472,6 +4308,8 @@ fn run_coordinator(
         load_space_slots()
     };
     let mut space_focus: SpaceFocusHistory = HashMap::new();
+    // Recently focused windows, newest last; scratchpads return focus to them.
+    let mut focus_trail: Vec<ManagedWindowId> = Vec::new();
     let mut passive_focus: Option<(u64, Instant)> = None;
     let mut passive_focus_dirty = false;
     let mut passive_focus_counter = 0u64;
@@ -2479,7 +4317,47 @@ fn run_coordinator(
     let mut stopping = false;
     let mut pending_config = None;
     let mut bindings_dirty = false;
+    // While Settings records a shortcut, global hotkeys are released so the
+    // pressed combination reaches it; resumes on its own after a while.
+    let mut hotkeys_paused_until: Option<Instant> = None;
     while !stopping {
+        let scratchpads_assigned = state
+            .scratchpads
+            .entries
+            .values()
+            .any(|entry| entry.window.is_some());
+        if (!state.rule_tracker.is_empty() || scratchpads_assigned)
+            && last_rule_prune.elapsed() >= Duration::from_secs(60)
+        {
+            last_rule_prune = Instant::now();
+            if let Ok(windows) = tylora_macos::discover_all_cg_windows() {
+                let existing: HashSet<_> = windows
+                    .iter()
+                    .map(|window| (window.owner_pid, window.id.0))
+                    .collect();
+                state.rule_tracker.retain_existing(&existing);
+                let gone = state.scratchpads.window_gone(|window| {
+                    !existing.contains(&(window.process.pid, window.cg_window_id))
+                });
+                if !gone.is_empty() {
+                    info!(?gone, "scratchpad windows closed");
+                    save_scratchpads(&state.scratchpads);
+                }
+            }
+        }
+        let stale: Vec<u64> = state
+            .scratchpad_requests
+            .iter()
+            .filter(|(_, pending)| pending.started.elapsed() > Duration::from_secs(12))
+            .map(|(request, _)| *request)
+            .collect();
+        for request in stale {
+            if let Some(pending) = state.scratchpad_requests.remove(&request) {
+                warn!(scratchpad = %pending.id, "scratchpad operation timed out");
+                finish_scratchpad(&mut state, pending, Err("timed out".into()), "timeout");
+                pointer_focus_pause_until = Some(Instant::now() + WORKSPACE_SWITCH_POINTER_SETTLE);
+            }
+        }
         if passive_focus.is_some_and(|(_, issued)| issued.elapsed() > Duration::from_secs(2)) {
             passive_focus = None;
         }
@@ -2861,6 +4739,137 @@ fn run_coordinator(
                         }
                     }
                 },
+                NativeMoveEvent::ScratchpadMoved {
+                    request,
+                    window,
+                    elapsed_ms,
+                    result,
+                } => {
+                    let io = ScratchpadIo {
+                        adapter: &adapter,
+                        native: &native_move_tx,
+                        focused: focus_trail.last().copied(),
+                        trail: &focus_trail,
+                    };
+                    scratchpad_moved(&mut state, &io, request, window, elapsed_ms, result);
+                    if state.scratchpad_requests.is_empty() {
+                        pointer_focus_pause_until =
+                            Some(Instant::now() + WORKSPACE_SWITCH_POINTER_SETTLE);
+                    }
+                }
+                NativeMoveEvent::ScratchpadParking {
+                    id,
+                    display_uuid,
+                    result,
+                    response,
+                } => match result {
+                    Ok(space) => {
+                        info!(space, "scratchpad parking Desktop created");
+                        state
+                            .scratchpads
+                            .parking
+                            .insert(format!("{display_uuid:032x}"), space);
+                        save_scratchpads(&state.scratchpads);
+                        let io = ScratchpadIo {
+                            adapter: &adapter,
+                            native: &native_move_tx,
+                            focused: focus_trail.last().copied(),
+                            trail: &focus_trail,
+                        };
+                        if let Err(error) = scratchpad_action(
+                            &mut state,
+                            &io,
+                            &id,
+                            ScratchpadAction::Hide,
+                            response.clone(),
+                        ) {
+                            if let Some(response) = response {
+                                let _ = response.try_send(scratchpad_reply(
+                                    &id,
+                                    state.scratchpads.get(&id),
+                                    "park",
+                                    Err(error),
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, "cannot create a parking Desktop; scratchpad stays visible");
+                        state.scratchpad_metrics.errors += 1;
+                        if let Some(response) = response {
+                            let _ = response.try_send(scratchpad_reply(
+                                &id,
+                                state.scratchpads.get(&id),
+                                "park",
+                                Err(format!("cannot hide: {error}")),
+                            ));
+                        }
+                    }
+                },
+                NativeMoveEvent::RuleMoved {
+                    operation,
+                    key,
+                    rule,
+                    window,
+                    generation,
+                    target_display,
+                    target_space,
+                    target_workspace,
+                    started,
+                    response,
+                    result,
+                } => {
+                    let elapsed = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    state.rule_metrics.operations += 1;
+                    state.rule_metrics.operation_total_ms += elapsed;
+                    state.rule_metrics.operation_max_ms =
+                        state.rule_metrics.operation_max_ms.max(elapsed);
+                    let outcome = match result {
+                        Ok(outcome) if outcome.confirmed && outcome.target.0 == target_space => {
+                            // WindowServer confirmed the move; only now update state.
+                            let committed = outcome.no_op
+                                || state.commit_native_move(
+                                    window,
+                                    generation,
+                                    &outcome,
+                                    target_workspace,
+                                );
+                            let _ = adapter.commands.try_send(ManagedCommand::Reconcile);
+                            Ok(committed)
+                        }
+                        Ok(_) => Err("native move was not confirmed".to_string()),
+                        Err(error) => Err(error),
+                    };
+                    let fresh = state.rule_tracker.finish(
+                        key,
+                        operation,
+                        &rule,
+                        outcome.as_ref().map(|_| target_space).map_err(Clone::clone),
+                    );
+                    let reply = match &outcome {
+                        Ok(_) => {
+                            state.rule_metrics.moves_applied += 1;
+                            state.log_rule(
+                                key,
+                                &rule,
+                                "move",
+                                format!("Space {target_space} on display {}", target_display.0),
+                            );
+                            CommandResult::success(format!("moved to native Space {target_space}"))
+                        }
+                        Err(error) => {
+                            state.rule_metrics.errors += 1;
+                            state.log_rule(key, &rule, "error", error.clone());
+                            CommandResult::failure(CommandError::Unsupported, error.clone())
+                        }
+                    };
+                    if !fresh {
+                        debug!(operation, "late rule result ignored");
+                    }
+                    if let Some(response) = response {
+                        let _ = response.try_send(command_json(reply));
+                    }
+                }
                 NativeMoveEvent::Switched {
                     request,
                     target,
@@ -2942,6 +4951,10 @@ fn run_coordinator(
                     .iter()
                     .any(|native| native.display == *display && native.id.0 == *space)
             });
+            state
+                .scratchpads
+                .parking
+                .retain(|_, parked| spaces.iter().any(|native| native.id.0 == *parked));
             state.space_layouts.retain(|(display, space), _| {
                 spaces
                     .iter()
@@ -2966,6 +4979,11 @@ fn run_coordinator(
                 }
             }
         }
+        if hotkeys_paused_until.is_some_and(|until| Instant::now() >= until) {
+            hotkeys_paused_until = None;
+            bindings_dirty = true;
+            info!("hotkey recording pause expired; hotkeys restored");
+        }
         if drag.is_none() && (pending_config.is_some() || bindings_dirty) {
             if let Some(updated) = pending_config.take() {
                 suppress_pointer_focus(true);
@@ -2980,7 +4998,11 @@ fn run_coordinator(
             }
             input.stop();
             input = HotkeyManager::start(
-                active_bindings(&config),
+                if hotkeys_paused_until.is_some() {
+                    Vec::new()
+                } else {
+                    active_bindings(&config)
+                },
                 config.mouse.clone(),
                 config.focus.follows_mouse && config.focus.mode != FocusMode::Disabled,
             );
@@ -3095,6 +5117,7 @@ fn run_coordinator(
                         passive_focus = None;
                         if let Some(id) = window {
                             note_space_focus(&state, id, &mut space_focus);
+                            note_focus_trail(&mut focus_trail, id);
                             let origin = if follow_mouse
                                 .requested
                                 .is_some_and(|(requested, _)| requested == id)
@@ -3170,6 +5193,7 @@ fn run_coordinator(
                     if let Some((command, response, issued)) = pending_commands.remove(&request) {
                         if let Some(id) = window {
                             note_space_focus(&state, id, &mut space_focus);
+                            note_focus_trail(&mut focus_trail, id);
                             for engine in state.workspaces.values_mut() {
                                 engine.set_focused(id);
                             }
@@ -3403,6 +5427,7 @@ fn run_coordinator(
                 }
                 Ok(ManagedEvent::FocusApplied(window)) => {
                     note_space_focus(&state, window, &mut space_focus);
+                    note_focus_trail(&mut focus_trail, window);
                     if let Some(issued) = pending_move_focus.remove(&window) {
                         next_command_id = next_command_id.wrapping_add(1);
                         if adapter
@@ -3463,6 +5488,25 @@ fn run_coordinator(
                             );
                             session.finished = true;
                         }
+                    }
+                }
+                Ok(ManagedEvent::Presented { request, result }) => {
+                    if scratchpad_presented(&mut state, request, result)
+                        && state.scratchpad_requests.is_empty()
+                    {
+                        pointer_focus_pause_until =
+                            Some(Instant::now() + WORKSPACE_SWITCH_POINTER_SETTLE);
+                    }
+                }
+                Ok(ManagedEvent::VisibilityDone { request, result })
+                    if request & SCRATCHPAD_REQUEST != 0 && request != u64::MAX =>
+                {
+                    // Scratchpad minimize; never a workspace transition.
+                    if let Some(pending) = state.scratchpad_requests.remove(&request) {
+                        let outcome = result
+                            .map(|()| ScratchpadState::Hidden)
+                            .map_err(|code| format!("minimize failed (AX {code})"));
+                        finish_scratchpad(&mut state, pending, outcome, "minimize");
                     }
                 }
                 Ok(ManagedEvent::VisibilityDone { request, result }) => {
@@ -3564,6 +5608,31 @@ fn run_coordinator(
                     suppress_pointer_focus(
                         !config.focus.follows_mouse || config.focus.mode == FocusMode::Disabled,
                     );
+                    if let StateCommand::ToggleScratchpad { id }
+                    | StateCommand::ShowScratchpad { id }
+                    | StateCommand::HideScratchpad { id } = &command
+                    {
+                        // Pointer focus must not steal focus while the window moves.
+                        follow_mouse.cancel();
+                        suppress_pointer_focus(true);
+                        pointer_focus_pause_until = Some(Instant::now() + Duration::from_secs(6));
+                        let action = match command {
+                            StateCommand::ShowScratchpad { .. } => ScratchpadAction::Show,
+                            StateCommand::HideScratchpad { .. } => ScratchpadAction::Hide,
+                            _ => ScratchpadAction::Toggle,
+                        };
+                        let io = ScratchpadIo {
+                            adapter: &adapter,
+                            native: &native_move_tx,
+                            focused: focus_trail.last().copied(),
+                            trail: &focus_trail,
+                        };
+                        if let Err(error) = scratchpad_action(&mut state, &io, id, action, None) {
+                            warn!(scratchpad = %id, %error, "scratchpad hotkey");
+                            pointer_focus_pause_until = None;
+                        }
+                        continue;
+                    }
                     if matches!(
                         command,
                         StateCommand::FocusWorkspace { .. }
@@ -3930,6 +5999,51 @@ fn run_coordinator(
             elapsed_us = start.elapsed().as_micros(),
             "layout calculated"
         );
+        for (pad, cg) in std::mem::take(&mut state.scratchpad_adopted) {
+            let io = ScratchpadIo {
+                adapter: &adapter,
+                native: &native_move_tx,
+                focused: focus_trail.last().copied(),
+                trail: &focus_trail,
+            };
+            let result =
+                assign_scratchpad(&mut state, &io, &pad, cg, false, false).and_then(|()| {
+                    follow_mouse.cancel();
+                    suppress_pointer_focus(true);
+                    pointer_focus_pause_until = Some(Instant::now() + Duration::from_secs(6));
+                    scratchpad_action(&mut state, &io, &pad, ScratchpadAction::Show, None)
+                });
+            match result {
+                Ok(()) => info!(scratchpad = %pad, cg, "launched window adopted"),
+                Err(error) => warn!(scratchpad = %pad, cg, %error, "launched window not adopted"),
+            }
+        }
+        for (pad, cg) in std::mem::take(&mut state.scratchpad_rule_queue) {
+            let io = ScratchpadIo {
+                adapter: &adapter,
+                native: &native_move_tx,
+                focused: focus_trail.last().copied(),
+                trail: &focus_trail,
+            };
+            // Rules only fill an empty scratchpad: the first window wins and a
+            // manual assignment is never replaced.
+            match assign_scratchpad(&mut state, &io, &pad, cg, false, false) {
+                Ok(()) => info!(scratchpad = %pad, cg, "window assigned by rule"),
+                Err(error) => debug!(scratchpad = %pad, cg, %error, "rule assignment skipped"),
+            }
+        }
+        for _ in 0..8 {
+            let Some(operation) = state.rule_queue.pop_front() else {
+                break;
+            };
+            start_rule_operation(
+                &mut state,
+                &config,
+                operation,
+                &native_move_tx,
+                &space_focus,
+            );
+        }
         for _ in 0..64 {
             let Some(command) = deferred.pop_front() else {
                 break;
@@ -3961,6 +6075,36 @@ fn run_coordinator(
             let Ok(request) = ipc_rx.try_recv() else {
                 break;
             };
+            let scratchpad_io = ScratchpadIo {
+                adapter: &adapter,
+                native: &native_move_tx,
+                focused: focus_trail.last().copied(),
+                trail: &focus_trail,
+            };
+            if handle_scratchpad_request(
+                &request.command,
+                &request.response,
+                &mut state,
+                &scratchpad_io,
+            ) {
+                if !state.scratchpad_requests.is_empty() {
+                    follow_mouse.cancel();
+                    suppress_pointer_focus(true);
+                    pointer_focus_pause_until = Some(Instant::now() + Duration::from_secs(6));
+                }
+                continue;
+            }
+            if handle_rules_request(
+                &request.command,
+                &request.response,
+                &mut state,
+                &config,
+                &space_focus,
+                &mut pending_config,
+                &adapter,
+            ) {
+                continue;
+            }
             if request.command == "config get --json" {
                 let reply = match crate::config_manager::read(&config_path()) {
                     Ok(snapshot) => serde_json::json!({"version":1,"ok":true,"data":snapshot}),
@@ -3999,7 +6143,11 @@ fn run_coordinator(
                         input.stop();
                         follow_mouse.cancel();
                         input = HotkeyManager::start(
-                            active_bindings(&config),
+                            if hotkeys_paused_until.is_some() {
+                                Vec::new()
+                            } else {
+                                active_bindings(&config)
+                            },
                             config.mouse.clone(),
                             config.focus.follows_mouse && config.focus.mode != FocusMode::Disabled,
                         );
@@ -4025,6 +6173,11 @@ fn run_coordinator(
                 continue;
             }
             if request.command == "recover-windows" {
+                let problems = recover_parked_scratchpads(&mut state.scratchpads);
+                save_scratchpads(&state.scratchpads);
+                if !problems.is_empty() {
+                    warn!(?problems, "scratchpad recovery incomplete");
+                }
                 if pending_workspace.is_some() {
                     let _ = request
                         .response
@@ -4076,6 +6229,33 @@ fn run_coordinator(
             }
             if let Some(payload) = request.command.strip_prefix("v1 ") {
                 match serde_json::from_str::<StateCommand>(payload) {
+                    Ok(
+                        command @ (StateCommand::ToggleScratchpad { .. }
+                        | StateCommand::ShowScratchpad { .. }
+                        | StateCommand::HideScratchpad { .. }),
+                    ) => {
+                        let (verb, id) = match command {
+                            StateCommand::ShowScratchpad { id } => ("show", id),
+                            StateCommand::HideScratchpad { id } => ("hide", id),
+                            StateCommand::ToggleScratchpad { id } => ("toggle", id),
+                            _ => unreachable!(),
+                        };
+                        follow_mouse.cancel();
+                        suppress_pointer_focus(true);
+                        pointer_focus_pause_until = Some(Instant::now() + Duration::from_secs(6));
+                        let io = ScratchpadIo {
+                            adapter: &adapter,
+                            native: &native_move_tx,
+                            focused: focus_trail.last().copied(),
+                            trail: &focus_trail,
+                        };
+                        handle_scratchpad_request(
+                            &format!("scratchpad {verb} {id}"),
+                            &request.response,
+                            &mut state,
+                            &io,
+                        );
+                    }
                     Ok(
                         command @ (StateCommand::FocusWorkspace { .. }
                         | StateCommand::FocusNamedWorkspace { .. }
@@ -4158,6 +6338,21 @@ fn run_coordinator(
                             )));
                     }
                 }
+                continue;
+            }
+            if let Some(action) = request
+                .command
+                .strip_prefix("hotkeys ")
+                .and_then(|rest| matches!(rest, "pause" | "resume").then_some(rest))
+            {
+                hotkeys_paused_until =
+                    (action == "pause").then(|| Instant::now() + Duration::from_secs(20));
+                bindings_dirty = true;
+                info!(action, "global hotkeys for shortcut recording");
+                let _ = request.response.try_send(format!(
+                    "{}\n",
+                    serde_json::json!({"version": 1, "ok": true, "paused": action == "pause"})
+                ));
                 continue;
             }
             let reply = if request.command == "hotkeys list" {
@@ -4256,6 +6451,12 @@ fn run_coordinator(
     }
     input.stop();
     suppress_pointer_focus(false);
+    // Hidden scratchpads must not stay parked once nothing can show them.
+    let problems = recover_parked_scratchpads(&mut state.scratchpads);
+    if !problems.is_empty() {
+        warn!(?problems, "scratchpad recovery on stop incomplete");
+    }
+    save_scratchpads(&state.scratchpads);
     if adapter
         .commands
         .try_send(ManagedCommand::RestoreVisibility { request: u64::MAX })
@@ -4792,6 +6993,7 @@ fn execute_state_command(
     let outcome = coordinator.execute(command, focused);
     if let (StateCommand::ToggleFloating { .. }, Some(id)) = (command, command_window) {
         if outcome.is_ok() {
+            state.remember_window_mode(id);
             let is_floating = state.coordinators.values().any(|coordinator| {
                 coordinator.registry.get(id).is_some_and(|record| {
                     record.observed.mode == tylora_core::registry::ManagementMode::Floating
@@ -5386,7 +7588,7 @@ fn handle_request(
                     let workspace = state.workspaces.get(display).and_then(|engine| engine.owner(*id));
                     serde_json::json!({
                         "pid":id.process.pid,"token":id.token,"cg_window_id":record.observed.cg_window_id,
-                        "application_id":record.observed.application_id,"native_space_id":record.observed.native_space_id,
+                        "application_id":record.observed.application_id,"title":record.observed.title,"mode":format!("{:?}", record.observed.mode).to_lowercase(),"native_space_id":record.observed.native_space_id,
                         "display":display,"workspace":workspace,
                         "floating":record.observed.mode == tylora_core::registry::ManagementMode::Floating,
                     })
@@ -5593,6 +7795,7 @@ mod tests {
             cg_window_id: None,
             native_space_id: None,
             application_id: Some("test.app".into()),
+            title: None,
             frame: Rect::new((display - 1) as f64 * 1000.0 + 10.0, 10.0, 300.0, 200.0).unwrap(),
             display_id: Some(DisplayId(display)),
             lifecycle: WindowLifecycle::Active,
@@ -5602,7 +7805,7 @@ mod tests {
     #[test]
     fn window_rule_applies_to_new_window_and_survives_reconciliation() {
         let mut config = Config::default();
-        config.window_rules.push(WindowRule {
+        config.window_rules.push(tylora_config::WindowRule {
             application_id: "test.app".into(),
             mode: WindowRuleMode::Floating,
             priority: 10,
@@ -5632,7 +7835,8 @@ mod tests {
             tylora_core::registry::ManagementMode::Floating
         );
         state.handle_reconciled(window.id.process, Vec::new());
-        assert!(!state.rule_applied.contains(&window.id));
+        state.handle_process_exited(window.id.process);
+        assert!(state.rule_tracker.is_empty());
     }
     #[test]
     fn confirmed_native_move_reflows_source_and_rebinds_target_without_ghost() {
@@ -6978,6 +9182,7 @@ mod tests {
         );
         assert_eq!(choose_workspace_instance(&[], &history, None), None);
     }
+
     // ------------------------------------------- display move keeps the Desktop
 
     #[test]
@@ -7043,4 +9248,518 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------ rules (stage 7)
+
+    fn ruled_window(token: u64, cg: u32, bundle: &str, title: &str) -> WindowSnapshot {
+        let mut window = snapshot(token, 1);
+        window.cg_window_id = Some(cg);
+        window.application_id = Some(bundle.into());
+        window.title = Some(title.into());
+        window
+    }
+    fn rule(id: &str, bundle: &str) -> tylora_config::RuleDefinition {
+        tylora_config::RuleDefinition {
+            id: id.into(),
+            name: String::new(),
+            enabled: true,
+            bundle_id: bundle.into(),
+            title: None,
+            title_match: tylora_config::TitleMatch::Exact,
+            workspace: None,
+            display: None,
+            mode: RuleMode::Unchanged,
+            priority: 0,
+            apply: tylora_config::ApplyPolicy::OnCreate,
+            stop: true,
+            scratchpad: None,
+        }
+    }
+    fn rules_config() -> Config {
+        let mut config = Config::default();
+        config.workspaces[0].name = "Browser".into();
+        config.workspaces[0].native_space_id = Some(7);
+        config.workspaces[0].native_space_ids = vec![4678];
+        config.workspaces[1].name = "Code".into();
+        config.workspaces[1].native_space_id = Some(4);
+        let mut vscode = rule("vscode", "com.microsoft.VSCode");
+        vscode.workspace = Some("code".into());
+        vscode.mode = RuleMode::Tiled;
+        vscode.priority = 100;
+        let mut calculator = rule("calculator", "com.apple.calculator");
+        calculator.mode = RuleMode::Floating;
+        config.rules = vec![vscode, calculator];
+        config
+    }
+
+    #[test]
+    fn rules_move_only_created_windows_and_queue_one_operation() {
+        let config = rules_config();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        state.rule_tracker.set_preexisting([(100, 500)]);
+        let old = ruled_window(1, 500, "com.microsoft.VSCode", "old");
+        let new = ruled_window(2, 501, "com.microsoft.VSCode", "new");
+        state.handle_reconciled(old.id.process, vec![old.clone(), new.clone()]);
+        // The pre-existing window is left alone (on_create).
+        assert_eq!(state.rule_queue.len(), 1);
+        assert_eq!(state.rule_queue[0].window, new.id);
+        assert_eq!(state.rule_queue[0].workspace.as_deref(), Some("code"));
+        // Repeated window events never queue the move again.
+        state.handle_reconciled(old.id.process, vec![old.clone(), new.clone()]);
+        state.handle_reconciled(old.id.process, vec![old, new]);
+        assert_eq!(state.rule_queue.len(), 1);
+    }
+
+    #[test]
+    fn rule_mode_applies_and_user_toggle_survives_rescans() {
+        let config = rules_config();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        state.rule_tracker.set_preexisting([]);
+        let calculator = ruled_window(1, 600, "com.apple.calculator", "Calculator");
+        state.handle_reconciled(calculator.id.process, vec![calculator.clone()]);
+        let mode = |state: &DisplayState| {
+            state.coordinators[&DisplayId(1)]
+                .registry
+                .get(calculator.id)
+                .unwrap()
+                .observed
+                .mode
+        };
+        assert_eq!(mode(&state), ManagementMode::Floating);
+        assert!(state.rule_queue.is_empty(), "mode-only rule never moves");
+        state.handle_reconciled(calculator.id.process, vec![calculator.clone()]);
+        assert_eq!(mode(&state), ManagementMode::Floating);
+        // The user tiles it; later scans keep the user's choice.
+        state
+            .coordinators
+            .get_mut(&DisplayId(1))
+            .unwrap()
+            .execute(
+                &StateCommand::ToggleFloating {
+                    window: Some(calculator.id),
+                },
+                None,
+            )
+            .unwrap();
+        state.handle_reconciled(calculator.id.process, vec![calculator.clone()]);
+        assert_eq!(mode(&state), ManagementMode::Tiled);
+    }
+
+    #[test]
+    fn service_windows_are_never_tiled_or_moved_by_rules() {
+        let config = rules_config();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        state.rule_tracker.set_preexisting([]);
+        let mut dialog = ruled_window(1, 700, "com.microsoft.VSCode", "Open File");
+        dialog.mode = ManagementMode::Unmanaged;
+        state.handle_reconciled(dialog.id.process, vec![dialog.clone()]);
+        assert!(state.rule_queue.is_empty());
+        assert_eq!(
+            state.coordinators[&DisplayId(1)]
+                .registry
+                .get(dialog.id)
+                .unwrap()
+                .observed
+                .mode,
+            ManagementMode::Unmanaged
+        );
+    }
+
+    #[test]
+    fn rule_targets_resolve_bound_spaces_and_reject_conflicts() {
+        let config = rules_config();
+        let spaces = spaces_on(&[(7, 1, 1), (4, 1, 2), (4678, 2, 1)]);
+        let history = SpaceFocusHistory::new();
+        let resolve =
+            |current: Option<u64>, display: Option<DisplayId>, ws: Option<&str>, d: Option<u32>| {
+                resolve_rule_target(&config, &spaces, current, display, ws, d, &history)
+            };
+        assert_eq!(
+            resolve(Some(7), Some(DisplayId(1)), Some("code"), None),
+            Ok(Some((DisplayId(1), 4, Some(2))))
+        );
+        // Already there: nothing to do.
+        assert_eq!(
+            resolve(Some(4), Some(DisplayId(1)), Some("code"), None),
+            Ok(None)
+        );
+        // A multi-display workspace keeps the window's display.
+        assert_eq!(
+            resolve(Some(4), Some(DisplayId(2)), Some("Browser"), None),
+            Ok(Some((DisplayId(2), 4678, Some(1))))
+        );
+        // Workspace + display picks that display's instance ...
+        assert_eq!(
+            resolve(Some(4), Some(DisplayId(1)), Some("Browser"), Some(2)),
+            Ok(Some((DisplayId(2), 4678, Some(1))))
+        );
+        // ... and a workspace without a Space there is a configuration error.
+        assert!(resolve(Some(7), Some(DisplayId(1)), Some("code"), Some(2)).is_err());
+        // Display only: the active Space of that display.
+        let active = spaces_on(&[(7, 1, 1), (4678, 2, 1)]);
+        assert_eq!(
+            resolve_rule_target(
+                &config,
+                &active,
+                Some(7),
+                Some(DisplayId(1)),
+                None,
+                Some(2),
+                &history
+            ),
+            Ok(Some((DisplayId(2), 4678, None)))
+        );
+        // An unavailable native Space is an error, never a guess.
+        let missing = spaces_on(&[(7, 1, 1)]);
+        assert!(resolve_rule_target(
+            &config,
+            &missing,
+            Some(7),
+            Some(DisplayId(1)),
+            Some("code"),
+            None,
+            &history
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn closed_window_fails_the_operation_safely() {
+        let config = rules_config();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        state.rule_tracker.set_preexisting([]);
+        let window = ruled_window(1, 800, "com.microsoft.VSCode", "x");
+        state.handle_reconciled(window.id.process, vec![window.clone()]);
+        let operation = state.rule_queue.pop_front().unwrap();
+        // The window closes before the main loop runs the operation.
+        state.handle_process_exited(window.id.process);
+        let (sender, receiver) = mpsc::sync_channel(4);
+        start_rule_operation(
+            &mut state,
+            &config,
+            operation,
+            &sender,
+            &SpaceFocusHistory::new(),
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "no native move for a closed window"
+        );
+        assert_eq!(state.rule_metrics.errors, 1);
+    }
+
+    #[test]
+    fn reload_does_not_reapply_rules_to_open_windows() {
+        let mut config = rules_config();
+        config.rules.truncate(1);
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        state.rule_tracker.set_preexisting([]);
+        let calculator = ruled_window(1, 900, "com.apple.calculator", "Calculator");
+        state.handle_reconciled(calculator.id.process, vec![calculator.clone()]);
+        // A rule for an already open window arrives by hot reload.
+        let reloaded = rules_config();
+        state.apply_live_config(&reloaded);
+        assert_eq!(state.rule_engine.len(), 2);
+        state.handle_reconciled(calculator.id.process, vec![calculator.clone()]);
+        assert_eq!(
+            state.coordinators[&DisplayId(1)]
+                .registry
+                .get(calculator.id)
+                .unwrap()
+                .observed
+                .mode,
+            ManagementMode::Tiled
+        );
+        // A new Calculator window gets it.
+        let second = ruled_window(2, 901, "com.apple.calculator", "Calculator");
+        state.handle_reconciled(calculator.id.process, vec![calculator, second.clone()]);
+        assert_eq!(
+            state.coordinators[&DisplayId(1)]
+                .registry
+                .get(second.id)
+                .unwrap()
+                .observed
+                .mode,
+            ManagementMode::Floating
+        );
+    }
+
+    #[test]
+    fn title_rules_wait_for_titles_and_follow_title_changes() {
+        let mut config = rules_config();
+        let mut notes = rule("quick-note", "com.apple.Notes");
+        notes.title = Some("^Quick".into());
+        notes.title_match = tylora_config::TitleMatch::Regex;
+        notes.mode = RuleMode::Floating;
+        notes.apply = tylora_config::ApplyPolicy::OnTitleChange;
+        config.rules.push(notes);
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        state.rule_tracker.set_preexisting([]);
+        let mut window = ruled_window(1, 1000, "com.apple.Notes", "");
+        state.handle_reconciled(window.id.process, vec![window.clone()]);
+        assert_eq!(state.rule_metrics.evaluations, 0, "waits for a title");
+        window.title = Some("Notes".into());
+        state.handle_reconciled(window.id.process, vec![window.clone()]);
+        assert_eq!(state.rule_metrics.evaluations, 1);
+        window.title = Some("Quick Note".into());
+        state.handle_reconciled(window.id.process, vec![window.clone()]);
+        assert_eq!(state.rule_metrics.evaluations, 2);
+        assert_eq!(
+            state.coordinators[&DisplayId(1)]
+                .registry
+                .get(window.id)
+                .unwrap()
+                .observed
+                .mode,
+            ManagementMode::Floating
+        );
+        // Unchanged titles do not re-run matching.
+        state.handle_reconciled(window.id.process, vec![window]);
+        assert_eq!(state.rule_metrics.evaluations, 2);
+    }
+
+    #[test]
+    fn manual_move_after_rule_is_respected() {
+        let config = rules_config();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        state.native_spaces = spaces_on(&[(7, 1, 1), (4, 1, 2)]);
+        for space in &mut state.native_spaces {
+            space.active = true;
+        }
+        state.rule_tracker.set_preexisting([]);
+        let mut window = ruled_window(1, 1100, "com.microsoft.VSCode", "x");
+        window.native_space_id = Some(7);
+        state.handle_reconciled(window.id.process, vec![window.clone()]);
+        let operation = state.rule_queue.pop_front().unwrap();
+        let key = operation.key;
+        state
+            .rule_tracker
+            .begin(key, operation.id, operation.trigger);
+        // A Tylora event for the moving window must not count as manual.
+        window.native_space_id = Some(5);
+        state.handle_reconciled(window.id.process, vec![window.clone()]);
+        assert!(state
+            .rule_tracker
+            .finish(key, operation.id, "vscode", Ok(4)));
+        // Later the user moves it to Browser: an override, no move back.
+        window.native_space_id = Some(7);
+        state.handle_reconciled(window.id.process, vec![window.clone()]);
+        assert!(state.rule_tracker.get(key).unwrap().manual_override);
+        state.handle_reconciled(window.id.process, vec![window]);
+        assert!(state.rule_queue.is_empty());
+    }
+
+    #[test]
+    fn floating_choice_survives_a_space_round_trip() {
+        let config = Config::default();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        let mut window = snapshot(1, 1);
+        window.cg_window_id = Some(4242);
+        let (adapter, _received) = mock_adapter();
+        state.handle_reconciled(window.id.process, vec![window.clone()]);
+        let result = execute_state_command(
+            &mut state,
+            &adapter,
+            &config,
+            &StateCommand::ToggleFloating { window: None },
+            Some(window.id),
+        );
+        assert!(result.ok, "{}", result.message);
+        // Leaving Space 1 drops the window; it returns under a new AX token.
+        state.handle_reconciled(window.id.process, Vec::new());
+        let mut returned = window.clone();
+        returned.id.token = 2;
+        state.handle_reconciled(window.id.process, vec![returned.clone()]);
+        let coordinator = &state.coordinators[&DisplayId(1)];
+        assert_eq!(
+            coordinator.registry.get(returned.id).unwrap().observed.mode,
+            ManagementMode::Floating
+        );
+        assert!(
+            !coordinator.layout.windows().contains(&returned.id),
+            "not tiled again"
+        );
+        // Tiling it again is remembered the same way.
+        execute_state_command(
+            &mut state,
+            &adapter,
+            &config,
+            &StateCommand::ToggleFloating { window: None },
+            Some(returned.id),
+        );
+        state.handle_reconciled(window.id.process, Vec::new());
+        let mut again = returned;
+        again.id.token = 3;
+        state.handle_reconciled(window.id.process, vec![again.clone()]);
+        assert!(state.coordinators[&DisplayId(1)]
+            .layout
+            .windows()
+            .contains(&again.id));
+    }
+
+    fn scratchpad_config() -> Config {
+        let mut config = Config::default();
+        let mut term = tylora_core::scratchpad::ScratchpadDefinition::new("term");
+        term.hotkey = Some("option+grave".into());
+        config.scratchpads = vec![term];
+        let mut rule = rule("terminal", "com.apple.Terminal");
+        rule.scratchpad = Some("term".into());
+        config.rules = vec![rule];
+        config
+    }
+
+    fn with_io<T>(f: impl FnOnce(&ScratchpadIo<'_>) -> T) -> T {
+        let (adapter, _received) = mock_adapter();
+        let (native, _native_rx) = mpsc::sync_channel(8);
+        let io = ScratchpadIo {
+            adapter: &adapter,
+            native: &native,
+            focused: None,
+            trail: &[],
+        };
+        f(&io)
+    }
+
+    #[test]
+    fn assigned_scratchpad_leaves_the_layout_and_unassign_tiles_it_again() {
+        let config = scratchpad_config();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        state.rule_tracker.set_preexisting([(100, 900), (100, 901)]);
+        let term = ruled_window(1, 900, "com.apple.Terminal", "zsh");
+        let other = ruled_window(2, 901, "test.app", "editor");
+        state.handle_reconciled(term.id.process, vec![term.clone(), other.clone()]);
+        let tiled = |state: &DisplayState| state.coordinators[&DisplayId(1)].layout.windows();
+        assert_eq!(tiled(&state).len(), 2);
+        with_io(|io| assign_scratchpad(&mut state, io, "term", 900, true, false)).unwrap();
+        assert_eq!(tiled(&state), vec![other.id], "the rest reflows");
+        let entry = state.scratchpads.get("term").unwrap();
+        assert_eq!(entry.state, ScratchpadState::Visible);
+        assert!(entry.was_tiled && entry.manual);
+        // Rescans keep it out of the layout, even under a new AX token after
+        // a Space round trip, and leave no ghost slot behind.
+        state.handle_reconciled(term.id.process, vec![other.clone()]);
+        let mut returned = term.clone();
+        returned.id.token = 7;
+        state.handle_reconciled(term.id.process, vec![returned.clone(), other.clone()]);
+        assert_eq!(tiled(&state), vec![other.id]);
+        assert_eq!(
+            state.coordinators[&DisplayId(1)]
+                .registry
+                .get(returned.id)
+                .unwrap()
+                .observed
+                .mode,
+            ManagementMode::Floating
+        );
+        with_io(|io| unassign_scratchpad(&mut state, io, "term")).unwrap();
+        assert_eq!(tiled(&state).len(), 2, "tiled again after unassign");
+        state.handle_reconciled(term.id.process, vec![returned.clone(), other]);
+        assert_eq!(tiled(&state).len(), 2);
+        assert_eq!(
+            state.scratchpads.get("term").unwrap().state,
+            ScratchpadState::Unassigned
+        );
+    }
+
+    #[test]
+    fn scratchpad_rule_assigns_only_the_first_new_window_and_never_replaces_manual() {
+        let config = scratchpad_config();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        state.rule_tracker.set_preexisting([]);
+        let first = ruled_window(1, 910, "com.apple.Terminal", "one");
+        let second = ruled_window(2, 911, "com.apple.Terminal", "two");
+        state.handle_reconciled(first.id.process, vec![first.clone(), second.clone()]);
+        assert!(state.rule_queue.is_empty(), "scratchpad rules never move");
+        let queued = std::mem::take(&mut state.scratchpad_rule_queue);
+        assert_eq!(queued.len(), 2);
+        let results: Vec<_> = queued
+            .iter()
+            .map(|(pad, cg)| {
+                with_io(|io| assign_scratchpad(&mut state, io, pad, *cg, false, false))
+            })
+            .collect();
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err(), "first window wins");
+        // Rescans do not queue it again (no loop).
+        state.handle_reconciled(first.id.process, vec![first.clone(), second.clone()]);
+        assert!(state.scratchpad_rule_queue.is_empty());
+        // A manual choice wins over rules and is never replaced by them.
+        with_io(|io| assign_scratchpad(&mut state, io, "term", 911, true, true)).unwrap();
+        assert!(
+            with_io(|io| assign_scratchpad(&mut state, io, "term", 910, false, false)).is_err()
+        );
+        let entry = state.scratchpads.get("term").unwrap();
+        assert_eq!(entry.window.as_ref().unwrap().cg_window_id, 911);
+        assert!(entry.manual);
+        // The released first window is tiled again; the new one is not.
+        let tiled = state.coordinators[&DisplayId(1)].layout.windows();
+        assert_eq!(tiled, vec![first.id]);
+    }
+
+    #[test]
+    fn scratchpad_window_close_and_config_reload() {
+        let config = scratchpad_config();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        state.rule_tracker.set_preexisting([(100, 920)]);
+        let term = ruled_window(1, 920, "com.apple.Terminal", "zsh");
+        state.handle_reconciled(term.id.process, vec![term.clone()]);
+        with_io(|io| assign_scratchpad(&mut state, io, "term", 920, true, false)).unwrap();
+        state.handle_process_exited(term.id.process);
+        assert_eq!(
+            state.scratchpads.get("term").unwrap().state,
+            ScratchpadState::Unavailable
+        );
+        // Hot reload: removing the definition removes the entry and its hotkey.
+        let mut updated = config.clone();
+        updated.scratchpads.clear();
+        updated.rules.clear();
+        state.apply_live_config(&updated);
+        assert!(state.scratchpads.get("term").is_none());
+        assert!(!effective_hotkeys(&updated)
+            .iter()
+            .any(|hotkey| matches!(hotkey.command, StateCommand::ToggleScratchpad { .. })));
+        assert!(effective_hotkeys(&config)
+            .iter()
+            .any(|hotkey| hotkey.chord == "option+grave"
+                && hotkey.command == StateCommand::ToggleScratchpad { id: "term".into() }));
+    }
+
+    #[test]
+    fn unknown_or_unmanaged_windows_cannot_be_assigned() {
+        let config = scratchpad_config();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        assert!(with_io(|io| assign_scratchpad(&mut state, io, "term", 999, true, false)).is_err());
+        let window = ruled_window(1, 930, "test.app", "x");
+        state.rule_tracker.set_preexisting([(100, 930)]);
+        state.handle_reconciled(window.id.process, vec![window]);
+        assert!(with_io(|io| assign_scratchpad(&mut state, io, "nope", 930, true, false)).is_err());
+        assert_eq!(state.coordinators[&DisplayId(1)].layout.windows().len(), 1);
+    }
+
+    #[test]
+    fn launched_scratchpad_app_window_is_adopted_once_and_hotkey_is_installed() {
+        let mut config = scratchpad_config();
+        config.rules.clear();
+        config.scratchpads[0].bundle_id = Some("com.github.wez.wezterm".into());
+        assert!(hotkey_supported(
+            &StateCommand::ToggleScratchpad { id: "term".into() },
+            &config
+        ));
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        state.scratchpad_launches.insert(
+            "term".into(),
+            ("com.github.wez.wezterm".into(), Instant::now()),
+        );
+        let other = ruled_window(1, 940, "test.app", "x");
+        let wez = ruled_window(2, 941, "com.github.wez.wezterm", "zsh");
+        state.handle_reconciled(other.id.process, vec![other.clone()]);
+        assert!(
+            state.scratchpad_adopted.is_empty(),
+            "other apps are ignored"
+        );
+        state.handle_reconciled(other.id.process, vec![other.clone(), wez.clone()]);
+        assert_eq!(state.scratchpad_adopted, vec![("term".to_string(), 941)]);
+        assert!(state.scratchpad_launches.is_empty());
+        state.handle_reconciled(other.id.process, vec![other, wez]);
+        assert_eq!(state.scratchpad_adopted.len(), 1, "adopted once");
+    }
 }
