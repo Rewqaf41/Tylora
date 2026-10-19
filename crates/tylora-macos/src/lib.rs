@@ -128,6 +128,21 @@ pub fn frontmost_application_pid() -> Option<i32> {
     }
 }
 
+/// Adds `count` Desktops to `display` by pressing Mission Control's
+/// add-desktop button through Accessibility (briefly showing Mission
+/// Control). Returns the number of presses; verify through WindowServer.
+pub fn add_desktops(display: tylora_core::DisplayId, count: u8) -> Result<u8, String> {
+    #[cfg(target_os = "macos")]
+    {
+        native::mission_control::add_desktops(display, count).map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (display, count);
+        Err("macOS only".into())
+    }
+}
+
 pub fn current_pointer() -> Option<(f64, f64)> {
     #[cfg(target_os = "macos")]
     {

@@ -373,6 +373,18 @@ pub fn cursor_display() -> Option<DisplayId> {
     let error = unsafe { CGGetDisplaysWithPoint(point, 1, &mut display, &mut count) };
     (error == 0 && count == 1).then_some(DisplayId(display))
 }
+/// Puts the pointer back where it was, e.g. after switching another display.
+pub fn warp_cursor_to(point: (f64, f64)) {
+    if unsafe {
+        CGWarpMouseCursorPosition(Point {
+            x: point.0,
+            y: point.1,
+        })
+    } == 0
+    {
+        unsafe { CGAssociateMouseAndMouseCursorPosition(1) };
+    }
+}
 /// Moves the pointer to the centre of `display` so Dock gestures target it.
 pub fn warp_cursor_to_display(display: DisplayId) -> Result<(), SpaceError> {
     if cursor_display() == Some(display) {

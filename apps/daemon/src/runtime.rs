@@ -521,6 +521,102 @@ struct PreparedDisplayMove {
     mode: tylora_core::registry::ManagementMode,
     target_frame: tylora_core::Rect,
     focus_after_move: bool,
+    /// Desktop number to create on the target display, and how many Desktops
+    /// must be added to reach it. `target_space` is resolved after creation.
+    create: Option<(u8, u8)>,
+    /// Workspace that gains the created Space as another instance.
+    bind_workspace: Option<u8>,
+}
+
+/// Where a window moved to another display lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayTarget {
+    Existing(u64),
+    /// Desktop `desktop` does not exist yet; `missing` Desktops are needed.
+    Create {
+        desktop: u8,
+        missing: u8,
+    },
+}
+
+/// At most this many Desktops are created for one move.
+const MAX_CREATED_DESKTOPS: u8 = 8;
+
+/// The source Space's workspace instance on the target display if it has
+/// one, else the target Desktop with the same number, else that Desktop must
+/// be created. Returns the workspace to bind a created Space to.
+fn choose_display_target(
+    config: &Config,
+    spaces: &[NativeSpace],
+    source_space: u64,
+    target_display: DisplayId,
+) -> Option<(DisplayTarget, Option<u8>)> {
+    let source = spaces.iter().find(|space| space.id.0 == source_space)?;
+    let workspace = config.workspaces.iter().find(|ws| ws.binds(source_space));
+    let on_target = |id: u64| {
+        spaces
+            .iter()
+            .any(|space| space.id.0 == id && space.display == target_display)
+    };
+    if let Some(id) = workspace.and_then(|ws| ws.space_ids().into_iter().find(|id| on_target(*id)))
+    {
+        return Some((DisplayTarget::Existing(id), None));
+    }
+    let desktop = source.desktop.0;
+    if let Some(space) = spaces
+        .iter()
+        .find(|space| space.display == target_display && space.desktop.0 == desktop)
+    {
+        return Some((DisplayTarget::Existing(space.id.0), None));
+    }
+    let existing = spaces
+        .iter()
+        .filter(|space| space.display == target_display)
+        .map(|space| space.desktop.0)
+        .max()
+        .unwrap_or(0);
+    let missing = desktop.saturating_sub(existing);
+    (missing > 0 && missing <= MAX_CREATED_DESKTOPS).then(|| {
+        (
+            DisplayTarget::Create { desktop, missing },
+            workspace.map(|ws| ws.id),
+        )
+    })
+}
+
+/// Adds Desktops through Mission Control and waits for WindowServer to list
+/// Desktop `desktop` on `display`. Returns its Space ID.
+fn create_target_desktop(display: DisplayId, desktop: u8, missing: u8) -> Result<u64, String> {
+    use tylora_macos::spaces::{ExperimentalSkyLightBackend, NativeSpaceBackend};
+    let started = Instant::now();
+    tylora_macos::add_desktops(display, missing)?;
+    let backend = ExperimentalSkyLightBackend::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Ok(spaces) = backend.list_spaces() {
+            if let Some(space) = spaces
+                .iter()
+                .find(|space| space.display == display && space.desktop.0 == desktop)
+            {
+                let display_id = display.0;
+                info!(
+                    display_id,
+                    desktop,
+                    space_id = space.id.0,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "Desktop created through Mission Control"
+                );
+                return Ok(space.id.0);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Desktop {desktop} did not appear on display {}",
+                display.0
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -799,6 +895,39 @@ fn plan_space_rebinds(
         }
     }
     rebinds
+}
+
+/// Adds `space` to a workspace's extra native Spaces through the config
+/// manager and returns the resulting configuration.
+fn bind_space_to_workspace(config: &Config, workspace: u8, space: u64) -> Option<Config> {
+    let definition = config.workspaces.iter().find(|ws| ws.id == workspace)?;
+    if definition.binds(space) {
+        return None;
+    }
+    let snapshot = crate::config_manager::read(&config_path()).ok()?;
+    let mut extras = definition.native_space_ids.clone();
+    extras.push(space);
+    let request = crate::config_manager::PatchRequest {
+        version: 1,
+        revision: snapshot.revision,
+        patch: tylora_config::mutation::ConfigPatch::SetWorkspace {
+            id: workspace,
+            name: definition.name.clone(),
+            display: definition.display,
+            native_space_id: definition.native_space_id,
+            native_space_ids: Some(extras),
+        },
+    };
+    match crate::config_manager::patch(&config_path(), request) {
+        Ok(snapshot) => {
+            info!(workspace = %definition.name, space, "created Desktop bound to workspace");
+            Some(snapshot.config)
+        }
+        Err(error) => {
+            warn!(%error, workspace = %definition.name, "cannot bind created Desktop");
+            None
+        }
+    }
 }
 
 /// Persists rebinds through the config manager (revision-checked, comment
@@ -2391,6 +2520,25 @@ fn run_coordinator(
                     result,
                 } => {
                     state.in_flight_display.remove(&prepared.id);
+                    let mut prepared = prepared;
+                    if prepared.create.is_some() {
+                        // Opening Mission Control triggers rescans that can
+                        // re-register the window; follow it by CGWindowID.
+                        if let Some((id, generation)) = state
+                            .coordinators
+                            .get(&prepared.source_display)
+                            .into_iter()
+                            .flat_map(|coordinator| coordinator.registry.iter())
+                            .find(|(id, record)| {
+                                id.process.pid == prepared.id.process.pid
+                                    && record.observed.cg_window_id == Some(prepared.cg_window_id)
+                            })
+                            .map(|(id, record)| (*id, record.generation))
+                        {
+                            prepared.id = id;
+                            prepared.generation = generation;
+                        }
+                    }
                     let mut reply = match result {
                         Ok(outcome)
                             if outcome.confirmed
@@ -2399,12 +2547,102 @@ fn run_coordinator(
                                 && outcome.source.0 == prepared.source_space
                                 && outcome.target.0 == prepared.target_space =>
                         {
+                            // A Desktop created for this move may not have reached
+                            // the Space observer yet; ask WindowServer directly.
+                            let target_known = state.native_spaces.iter().any(|space| {
+                                space.display == prepared.target_display
+                                    && space.id.0 == prepared.target_space
+                            }) || {
+                                use tylora_macos::spaces::{
+                                    ExperimentalSkyLightBackend, NativeSpaceBackend,
+                                };
+                                ExperimentalSkyLightBackend::new().list_spaces().is_ok_and(
+                                    |spaces| {
+                                        spaces.iter().any(|space| {
+                                            space.display == prepared.target_display
+                                                && space.id.0 == prepared.target_space
+                                        })
+                                    },
+                                )
+                            };
                             let committed = state.active.contains(&prepared.target_display)
-                                && state.native_spaces.iter().any(|space| {
-                                    space.display == prepared.target_display
-                                        && space.id.0 == prepared.target_space
-                                })
+                                && target_known
                                 && state.commit_display_move(prepared);
+                            // WindowServer verified the move; bookkeeping that
+                            // missed it is repaired by reconciliation.
+                            if prepared.create.is_some() {
+                                if let Some(workspace) = prepared.bind_workspace {
+                                    let current = pending_config.as_ref().unwrap_or(&config);
+                                    if let Some(updated) = bind_space_to_workspace(
+                                        current,
+                                        workspace,
+                                        prepared.target_space,
+                                    ) {
+                                        pending_config = Some(updated);
+                                    }
+                                }
+                            }
+                            let target_inactive = !state.native_spaces.iter().any(|space| {
+                                space.display == prepared.target_display
+                                    && space.id.0 == prepared.target_space
+                                    && space.active
+                            });
+                            if target_inactive {
+                                // Show the window: switch the target display to its
+                                // Desktop, then return the pointer unless focus follows.
+                                workspace_switch = workspace_switch.wrapping_add(1).max(1);
+                                let switch = workspace_switch;
+                                follow_mouse.cancel();
+                                suppress_pointer_focus(true);
+                                pointer_focus_pause_until =
+                                    Some(Instant::now() + Duration::from_secs(13));
+                                let reconcile = adapter.commands.clone();
+                                let focus_sender = native_move_tx.clone();
+                                thread::spawn(move || {
+                                    let pointer = tylora_macos::current_pointer();
+                                    let target =
+                                        tylora_macos::spaces::NativeSpaceId(prepared.target_space);
+                                    // Right after Mission Control created the Desktop the
+                                    // Dock may still ignore the swipe; let it settle and retry.
+                                    if prepared.create.is_some() {
+                                        thread::sleep(Duration::from_millis(400));
+                                    }
+                                    let mut result =
+                                        focus_workspace_space(prepared.target_display, target);
+                                    for _ in 0..2 {
+                                        if result.is_ok() {
+                                            break;
+                                        }
+                                        thread::sleep(Duration::from_millis(400));
+                                        result =
+                                            focus_workspace_space(prepared.target_display, target);
+                                    }
+                                    if !prepared.focus_after_move {
+                                        if let Some(point) = pointer {
+                                            tylora_macos::spaces::warp_cursor_to(point);
+                                        }
+                                    }
+                                    match result {
+                                        Ok(_) => {
+                                            info!(
+                                                space_id = prepared.target_space,
+                                                "target Desktop shown after display move"
+                                            );
+                                            let _ = reconcile.try_send(ManagedCommand::Reconcile);
+                                        }
+                                        Err(error) => {
+                                            warn!(%error, "cannot show target Desktop after display move")
+                                        }
+                                    }
+                                    let _ = focus_sender.send(NativeMoveEvent::WorkspaceSwitched {
+                                        switch,
+                                        focus: None,
+                                        space: prepared
+                                            .focus_after_move
+                                            .then_some(prepared.target_space),
+                                    });
+                                });
+                            }
                             if committed {
                                 let mut focus = "skipped".to_string();
                                 if !prepared.focus_after_move
@@ -2963,6 +3201,22 @@ fn run_coordinator(
                                     state.in_flight_display.insert(prepared.id);
                                     let sender = native_move_tx.clone();
                                     thread::spawn(move || {
+                                        let mut prepared = prepared;
+                                        if let Some((desktop, missing)) = prepared.create {
+                                            match create_target_desktop(
+                                                prepared.target_display,
+                                                desktop,
+                                                missing,
+                                            ) {
+                                                Ok(space) => prepared.target_space = space,
+                                                Err(error) => {
+                                                    // Fall back to the active Space chosen at prepare time.
+                                                    warn!(%error, "cannot create Desktop; moving to the active Space");
+                                                    prepared.create = None;
+                                                    prepared.bind_workspace = None;
+                                                }
+                                            }
+                                        }
                                         let result = tylora_macos::spaces::NativeWindowSpaceMover::move_window_to_space(
                                             prepared.cg_window_id,
                                             tylora_macos::spaces::NativeSpaceId(prepared.target_space),
@@ -4794,7 +5048,7 @@ fn prepare_display_move(
             "source Space is no longer active",
         ));
     }
-    let target_space = state
+    let active_target = state
         .native_spaces
         .iter()
         .find(|space| space.display == target_display && space.active)
@@ -4805,6 +5059,16 @@ fn prepare_display_move(
                 "target display has no active native Space",
             )
         })?;
+    // Keep the Desktop: the same workspace or Desktop number on the target
+    // display, created when missing; otherwise the active Space as before.
+    let (target_space, create, bind_workspace) =
+        match choose_display_target(config, &state.native_spaces, source_space, target_display) {
+            Some((DisplayTarget::Existing(id), _)) => (id, None, None),
+            Some((DisplayTarget::Create { desktop, missing }, workspace)) => {
+                (active_target, Some((desktop, missing)), workspace)
+            }
+            None => (active_target, None, None),
+        };
     let cg_window_id = record.observed.cg_window_id.ok_or_else(|| {
         CommandResult::failure(
             CommandError::Unsupported,
@@ -4841,6 +5105,8 @@ fn prepare_display_move(
         mode: record.observed.mode,
         target_frame,
         focus_after_move: config.window_movement.focus_after_move,
+        create,
+        bind_workspace,
     })
 }
 fn focus_display(
@@ -6712,4 +6978,69 @@ mod tests {
         );
         assert_eq!(choose_workspace_instance(&[], &history, None), None);
     }
+    // ------------------------------------------- display move keeps the Desktop
+
+    #[test]
+    fn display_move_keeps_desktop_number_and_workspace() {
+        let mut config = Config::default();
+        config.workspaces[0].native_space_id = Some(7);
+        config.workspaces[0].native_space_ids = vec![4678];
+        config.workspaces[1].native_space_id = Some(4);
+        // Mac: Desktops 1..3 (7, 4, 5); second display: Desktop 1 only.
+        let spaces = spaces_on(&[(7, 1, 1), (4, 1, 2), (5, 1, 3), (4678, 2, 1)]);
+        // Browser has its own instance on the second display.
+        assert_eq!(
+            choose_display_target(&config, &spaces, 7, DisplayId(2)),
+            Some((DisplayTarget::Existing(4678), None))
+        );
+        // Code (Desktop 2) has none and display 2 lacks Desktop 2: create it
+        // and bind it to Code.
+        assert_eq!(
+            choose_display_target(&config, &spaces, 4, DisplayId(2)),
+            Some((
+                DisplayTarget::Create {
+                    desktop: 2,
+                    missing: 1
+                },
+                Some(2)
+            ))
+        );
+        // Desktop 3 needs two more Desktops; an unbound Space binds nothing.
+        assert_eq!(
+            choose_display_target(&config, &spaces, 5, DisplayId(2)),
+            Some((
+                DisplayTarget::Create {
+                    desktop: 3,
+                    missing: 2
+                },
+                None
+            ))
+        );
+        // Once display 2 has Desktop 2 it is reused, also in reverse.
+        let more = spaces_on(&[(7, 1, 1), (4, 1, 2), (4678, 2, 1), (4700, 2, 2)]);
+        assert_eq!(
+            choose_display_target(&config, &more, 4, DisplayId(2)),
+            Some((DisplayTarget::Existing(4700), None))
+        );
+        assert_eq!(
+            choose_display_target(&config, &more, 4700, DisplayId(1)),
+            Some((DisplayTarget::Existing(4), None))
+        );
+        // Unknown source Space: fall back to the caller's active Space.
+        assert_eq!(
+            choose_display_target(&config, &more, 999, DisplayId(2)),
+            None
+        );
+    }
+
+    #[test]
+    fn display_move_never_creates_unbounded_desktops() {
+        let config = Config::default();
+        let spaces = spaces_on(&[(1, 1, 12), (2, 2, 1)]);
+        assert_eq!(
+            choose_display_target(&config, &spaces, 1, DisplayId(2)),
+            None
+        );
+    }
+
 }
