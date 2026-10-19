@@ -43,7 +43,7 @@ describe('Layouts page', () => {
   it('shows the live layout and switches the current workspace through the daemon', () => {
     act(() => root.render(<Layouts />))
     expect(host.textContent).toContain('Display 1 · Code')
-    expect(host.textContent).toContain('1 parked column(s)')
+    expect(host.textContent).toContain('1 parked column')
     const group = host.querySelector('[aria-label="Layout for display 1"]')!
     const active = group.querySelector('[aria-pressed="true"]')!
     expect(active.textContent).toBe('Scrolling')

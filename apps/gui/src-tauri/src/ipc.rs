@@ -40,6 +40,12 @@ pub enum QueryKind {
     Config,
     Capabilities,
     Diagnostics,
+    Rules,
+    RuleDiagnostics,
+    RuleValidation,
+    Apps,
+    Scratchpads,
+    ScratchpadCapabilities,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +60,70 @@ pub enum Mutation {
     },
     Reconcile,
     RecoverWindows,
+    /// Rule Preview: evaluates rules for one window without moving it.
+    TestRule {
+        window: u32,
+    },
+    /// Applies the matching rule to one window now (clears a manual override).
+    ApplyRule {
+        window: u32,
+    },
+    ReloadRules,
+    /// Assigns a window to a scratchpad; without `window`, the window focused
+    /// before this app.
+    AssignScratchpad {
+        id: String,
+        window: Option<u32>,
+        #[serde(default)]
+        force: bool,
+    },
+    UnassignScratchpad {
+        id: String,
+    },
+    ScratchpadAction {
+        id: String,
+        action: ScratchpadVerb,
+    },
+    RecoverScratchpads,
+    /// Releases global hotkeys while a shortcut is being recorded.
+    PauseHotkeys,
+    ResumeHotkeys,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScratchpadVerb {
+    Toggle,
+    Show,
+    Hide,
+}
+
+fn scratchpad_id(id: &str) -> Result<&str, BridgeError> {
+    let valid = !id.is_empty()
+        && id.len() <= 32
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if valid {
+        Ok(id)
+    } else {
+        Err(BridgeError::new("invalid_request", "invalid scratchpad id"))
+    }
+}
+
+fn scratchpad_result(reply: &str) -> Result<Value, BridgeError> {
+    let value: Value = serde_json::from_str(reply)
+        .map_err(|_| BridgeError::new("protocol", "invalid scratchpad response"))?;
+    if value.get("ok") != Some(&Value::Bool(true)) {
+        return Err(BridgeError::new(
+            "daemon_error",
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("scratchpad request failed"),
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,6 +256,12 @@ pub fn query(kind: QueryKind) -> Result<Value, BridgeError> {
         QueryKind::Config => "config get --json",
         QueryKind::Capabilities => "space capabilities --json",
         QueryKind::Diagnostics => "diagnostics --json",
+        QueryKind::Rules => "rules list --json",
+        QueryKind::RuleDiagnostics => "rules diagnostics --json",
+        QueryKind::RuleValidation => "rules validate --json",
+        QueryKind::Apps => "apps list --json",
+        QueryKind::Scratchpads => "scratchpad list --json",
+        QueryKind::ScratchpadCapabilities => "scratchpad capabilities --json",
     };
     let value = json_reply(request)?;
     if value.get("ok") == Some(&Value::Bool(false)) {
@@ -239,6 +315,71 @@ pub fn mutate(action: Mutation) -> Result<Value, BridgeError> {
                 ));
             }
             Ok(result)
+        }
+        Mutation::TestRule { window } => {
+            let value = json_reply(&format!("rules test --window {window} --json"))?;
+            if value.get("ok") != Some(&Value::Bool(true)) {
+                return Err(BridgeError::new(
+                    "daemon_error",
+                    value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("rule test failed"),
+                ));
+            }
+            Ok(value)
+        }
+        Mutation::ApplyRule { window } => {
+            let reply = send(&format!("rules apply --window {window} --json"))?;
+            let value: Value = serde_json::from_str(&reply)
+                .map_err(|_| BridgeError::new("protocol", "invalid rule response"))?;
+            if value.get("ok") != Some(&Value::Bool(true)) {
+                return Err(BridgeError::new(
+                    "daemon_error",
+                    value
+                        .get("message")
+                        .or_else(|| value.get("error"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("rule was not applied"),
+                ));
+            }
+            Ok(value)
+        }
+        Mutation::AssignScratchpad { id, window, force } => {
+            let id = scratchpad_id(&id)?;
+            let target = match window {
+                Some(window) => format!("--window {window}"),
+                None => format!("--exclude-pid {}", std::process::id()),
+            };
+            let force = if force { " --force" } else { "" };
+            scratchpad_result(&send(&format!(
+                "scratchpad assign {id} {target}{force} --json"
+            ))?)
+        }
+        Mutation::UnassignScratchpad { id } => scratchpad_result(&send(&format!(
+            "scratchpad unassign {} --json",
+            scratchpad_id(&id)?
+        ))?),
+        Mutation::ScratchpadAction { id, action } => {
+            let verb = match action {
+                ScratchpadVerb::Toggle => "toggle",
+                ScratchpadVerb::Show => "show",
+                ScratchpadVerb::Hide => "hide",
+            };
+            scratchpad_result(&send(&format!(
+                "scratchpad {verb} {} --json",
+                scratchpad_id(&id)?
+            ))?)
+        }
+        Mutation::PauseHotkeys => scratchpad_result(&send("hotkeys pause")?),
+        Mutation::ResumeHotkeys => scratchpad_result(&send("hotkeys resume")?),
+        Mutation::RecoverScratchpads => scratchpad_result(&send("scratchpad recover --json")?),
+        Mutation::ReloadRules => {
+            let value = json_reply("rules reload --json")?;
+            if value.get("ok") != Some(&Value::Bool(true)) {
+                return Err(envelope_error(&value));
+            }
+            Ok(value)
         }
         Mutation::Reconcile => {
             let reply = send("reconcile")?;

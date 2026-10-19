@@ -1,5 +1,6 @@
 import type { ButtonHTMLAttributes, PropsWithChildren, ReactNode } from 'react'
 import { AlertCircle, Inbox, LoaderCircle, ShieldAlert } from 'lucide-react'
+import { useT } from '../i18n'
 
 export function Button({ children, variant = 'secondary', ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'secondary' | 'danger' | 'ghost' }) {
   return <button className={`button button-${variant}`} {...props}>{children}</button>
@@ -20,9 +21,10 @@ export function Notice({ children, tone = 'info' }: PropsWithChildren<{ tone?: '
 export function Empty({ title, children }: PropsWithChildren<{ title: string }>) {
   return <div className="empty"><Inbox size={25} /><strong>{title}</strong><span>{children}</span></div>
 }
-export function Loading() { return <div className="center-state"><LoaderCircle size={22} className="spin" /><span>Loading live data…</span></div> }
+export function Loading() { const t = useT(); return <div className="center-state"><LoaderCircle size={22} className="spin" /><span>{t('common.loading')}</span></div> }
 export function ErrorState({ message, retry }: { message: string; retry?: () => void }) {
-  return <div className="center-state"><AlertCircle size={24} /><strong>Couldn’t load data</strong><span>{message}</span>{retry && <Button onClick={retry}>Try again</Button>}</div>
+  const t = useT()
+  return <div className="center-state"><AlertCircle size={24} /><strong>{t('common.loadFailed')}</strong><span>{message}</span>{retry && <Button onClick={retry}>{t('common.tryAgain')}</Button>}</div>
 }
 export function Metric({ label, value, detail }: { label: string; value: ReactNode; detail?: string }) {
   return <Card className="metric"><span className="metric-label">{label}</span><strong>{value}</strong>{detail && <small>{detail}</small>}</Card>

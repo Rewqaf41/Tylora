@@ -38,6 +38,9 @@ export type StateCommand =
   | { command: 'scroll_layout_right' }
   | { command: 'center_focused_window' }
   | { command: 'resize_scrolling_column'; delta: number | null }
+  | { command: 'toggle_scratchpad'; id: string }
+  | { command: 'show_scratchpad'; id: string }
+  | { command: 'hide_scratchpad'; id: string }
 
 export interface WorkspaceDefinition { id: number; name: string; display: number | null; native_space_id: number | null; native_space_ids?: number[]; layout?: LayoutKind | null }
 export const bindsSpace = (ws: WorkspaceDefinition, space: number) => ws.native_space_id === space || (ws.native_space_ids ?? []).includes(space)
@@ -56,6 +59,35 @@ export function unbindSpacePatch(ws: WorkspaceDefinition, space: number) {
 export type AnyStateCommand = StateCommand | ({ command: string } & Record<string, unknown>)
 export interface Hotkey { chord: string; command: AnyStateCommand; enabled: boolean }
 export interface WindowRule { application_id: string; mode: 'floating' | 'tiled'; priority: number; enabled: boolean }
+export type TitleMatch = 'exact' | 'contains' | 'regex'
+export type RuleModeKind = 'unchanged' | 'tiled' | 'floating' | 'unmanaged'
+export type ApplyPolicy = 'on_create' | 'on_first_seen' | 'on_title_change' | 'manual'
+export interface RuleDefinition {
+  id: string; name: string; enabled: boolean; bundle_id: string
+  title?: string | null; title_match: TitleMatch
+  workspace?: string | null; display?: number | null
+  scratchpad?: string | null
+  mode: RuleModeKind; priority: number; apply: ApplyPolicy; stop: boolean
+}
+export interface ListedRule extends RuleDefinition { legacy: boolean }
+export type RuleCheck =
+  | { result: 'applied'; actions: string[] } | { result: 'overridden' } | { result: 'disabled' }
+  | { result: 'bundle_mismatch' } | { result: 'title_mismatch' }
+  | { result: 'policy_skipped'; policy: ApplyPolicy } | { result: 'stopped'; by: string }
+export interface RuleCandidate { id: string; name: string; priority: number; legacy: boolean; check: RuleCheck }
+export interface RuleEvaluation {
+  trigger: 'created' | 'first_seen' | 'title_changed' | 'manual'
+  candidates: RuleCandidate[]; winner: string | null
+  plan: { workspace: [string, string] | null; display: [number, string] | null; mode: [RuleModeKind, string] | null }
+}
+export interface RuleTest {
+  version: 1; ok: true
+  window: { cg_window_id: number; pid: number; application_id: string | null; title: string | null; display: number; native_space_id: number | null; mode: string }
+  tracker: { created: boolean; applied_rule: string | null; manual_override: boolean; attempts: number; last_error: string | null } | null
+  manual_override: boolean; automatic: RuleEvaluation; manual: RuleEvaluation
+  target: { display: number; native_space_id: number; workspace: number | null } | 'already in place' | { error: string } | null
+}
+export interface RunningApp { pid: number; bundle_id: string; name: string | null; windows: number }
 export interface FocusSettings { follows_mouse: boolean; mode: 'disabled' | 'instant' | 'delayed'; delay_ms: number; raise_behavior: 'focus_and_raise' | 'focus_only'; ignore_apps: { bundle_id: string; enabled: boolean }[]; restore_last_window: boolean }
 export interface Config {
   version: number
@@ -67,6 +99,8 @@ export interface Config {
   scrolling: ScrollingSettings
   hotkeys: Hotkey[]
   window_rules: WindowRule[]
+  rules?: RuleDefinition[]
+  scratchpads?: ScratchpadDefinition[]
   workspaces: WorkspaceDefinition[]
   cross_monitor_navigation: boolean
   focus: FocusSettings
@@ -86,11 +120,17 @@ export type ConfigPatch =
   | { kind: 'set_workspace_layout'; id: number; layout: LayoutKind | null }
   | { kind: 'set_dwindle'; settings: DwindleSettings }
   | { kind: 'set_scrolling'; settings: ScrollingSettings }
+  | { kind: 'set_rule'; previous_id: string | null; rule: RuleDefinition }
+  | { kind: 'remove_rule'; id: string }
+  | { kind: 'set_rule_priorities'; priorities: { id: string; priority: number }[] }
+  | { kind: 'convert_window_rule'; index: number; id: string }
+  | { kind: 'set_scratchpad'; previous_id: string | null; scratchpad: ScratchpadDefinition }
+  | { kind: 'remove_scratchpad'; id: string }
 
 export interface NativeSpace { id: number; desktop: number; display: number; active: boolean }
 export interface Rect { x: number; y: number; width: number; height: number }
 export interface DisplayInfo { id: number; uuid: string | null; full_frame: Rect; work_area: Rect; scale: number; primary: boolean }
-export interface ManagedWindow { pid: number; token: number; cg_window_id: number | null; application_id: string | null; native_space_id: number | null; display: number; workspace: number | null; floating: boolean }
+export interface ManagedWindow { pid: number; token: number; cg_window_id: number | null; application_id: string | null; title?: string | null; mode?: string; native_space_id: number | null; display: number; workspace: number | null; floating: boolean }
 export interface HotkeyState extends Hotkey { active: boolean }
 export interface DaemonStatus {
   version: 1; state: 'running'; displays: number; primary_display: number; windows: number; tiled: number; floating: number
@@ -112,6 +152,33 @@ export interface PreviewFrame { slot: number; rect: Rect; placement?: { state: C
 export interface LayoutPreview { version: 1; layout?: LayoutKind; frames: PreviewFrame[]; scrolling?: ScrollingSummary | null }
 export interface Capabilities { can_list_spaces?: boolean; can_focus_space?: boolean; can_move_window_between_spaces?: boolean; [key: string]: unknown }
 export interface Diagnostics { version: 1; daemon: 'running'; accessibility_trusted: boolean; native_spaces: number; managed_windows: number; stale_results: number; degraded: number; focus_follows_mouse?: { requests: number; applied?: number; confirmed: number; cancelled_delayed: number; failures: number; hit_tests: number; hit_test_total_us: number; mouse_to_request_total_us: number; request_to_applied_total_us?: number; request_to_confirm_total_us: number } }
+export type ScratchpadScope = 'local' | 'global'
+export type ScratchpadAlignment = 'center' | 'top' | 'bottom' | 'left' | 'right' | 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right'
+export type ScratchpadState = 'unassigned' | 'hidden' | 'showing' | 'visible' | 'hiding' | 'unavailable'
+export interface ScratchpadDefinition {
+  id: string; name: string; hotkey?: string | null; scope: ScratchpadScope
+  width: number; height: number; alignment: ScratchpadAlignment; offset_x: number; offset_y: number
+  target: 'pointer' | 'focused'; display?: number | null
+  remember_position: boolean; remember_size: boolean; remember_geometry?: boolean | null
+  hide: 'park' | 'minimize'; bundle_id?: string | null
+}
+export interface ScratchpadWindow { process: { pid: number; epoch: number }; cg_window_id: number; bundle_id: string | null; title: string | null }
+export interface ScratchpadStatus {
+  id: string; name: string; hotkey: string | null; scope: ScratchpadScope; hide: 'park' | 'minimize'
+  state: ScratchpadState | null; window: ScratchpadWindow | null; home_space: number | null; native_space_id: number | null
+  display: number | null; geometry: Rect | null; manual: boolean; last_error: string | null
+}
+export interface ScratchpadCapabilities {
+  version: 1
+  park: { available: boolean; mechanism: string; parking_desktops: Record<string, number> }
+  global: { available: boolean; target: string }
+  minimize: { available: boolean; mechanism: string }
+  sticky: { available: boolean; reason: string }
+  create_parking_desktop: { mechanism: string }
+  reasons: string[]
+}
+export interface ScratchpadResult { version: 1; ok: boolean; scratchpad: string; window: number | null; native_space_id: number | null; state: ScratchpadState | null; backend: string; result: string | null; error: string | null }
+
 export interface CommandResult { ok: true; message: string }
 
 export interface QueryMap {
@@ -124,5 +191,11 @@ export interface QueryMap {
   config: ConfigSnapshot
   capabilities: { version: 1; capabilities: Capabilities }
   diagnostics: Diagnostics
+  rules: { version: 1; rules: ListedRule[] }
+  rule_diagnostics: { version: 1; rules: number; tracked_windows: number; queued_operations: number; manual_overrides: number; overrides_detected: number; metrics: Record<string, number>; recent: { pid: number; cg_window_id: number | null; rule: string; action: string; detail: string }[] }
+  rule_validation: { version: 1; ok: boolean; rules: number; problems: string[] }
+  apps: { version: 1; apps: RunningApp[] }
+  scratchpads: { version: 1; scratchpads: ScratchpadStatus[]; parking: Record<string, number>; metrics: Record<string, number> }
+  scratchpad_capabilities: ScratchpadCapabilities
 }
 export type QueryKind = keyof QueryMap

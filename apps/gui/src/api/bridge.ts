@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { ConfigPatch, ConfigSnapshot, LayoutPreview, PreviewOptions, QueryKind, QueryMap, StateCommand } from './types'
+import type { ConfigPatch, ConfigSnapshot, LayoutPreview, PreviewOptions, QueryKind, QueryMap, RuleTest, ScratchpadResult, StateCommand } from './types'
 
 export class DaemonError extends Error {
   constructor(readonly code: string, message: string) { super(message); this.name = 'DaemonError' }
@@ -50,4 +50,49 @@ export async function previewLayout(inner: number, outer: number, signal?: Abort
     signal?.throwIfAborted()
     return result
   } catch (error) { throw normalize(error) }
+}
+
+export async function testRule(window: number): Promise<RuleTest> {
+  try { return await invoke<RuleTest>('daemon_mutate', { action: { kind: 'test_rule', window } }) }
+  catch (error) { throw normalize(error) }
+}
+
+export async function applyRule(window: number): Promise<{ ok: boolean; message: string }> {
+  try { return await invoke('daemon_mutate', { action: { kind: 'apply_rule', window } }) }
+  catch (error) { throw normalize(error) }
+}
+
+export async function reloadRules(): Promise<{ ok: boolean; rules: number }> {
+  try { return await invoke('daemon_mutate', { action: { kind: 'reload_rules' } }) }
+  catch (error) { throw normalize(error) }
+}
+
+export async function assignScratchpad(id: string, window: number | null, force = false): Promise<ScratchpadResult> {
+  try { return await invoke('daemon_mutate', { action: { kind: 'assign_scratchpad', id, window, force } }) }
+  catch (error) { throw normalize(error) }
+}
+
+export async function unassignScratchpad(id: string): Promise<ScratchpadResult> {
+  try { return await invoke('daemon_mutate', { action: { kind: 'unassign_scratchpad', id } }) }
+  catch (error) { throw normalize(error) }
+}
+
+export async function scratchpadAction(id: string, action: 'toggle' | 'show' | 'hide'): Promise<ScratchpadResult> {
+  try { return await invoke('daemon_mutate', { action: { kind: 'scratchpad_action', id, action } }) }
+  catch (error) { throw normalize(error) }
+}
+
+export async function recoverScratchpads(): Promise<{ ok: boolean; problems: string[] }> {
+  try { return await invoke('daemon_mutate', { action: { kind: 'recover_scratchpads' } }) }
+  catch (error) { throw normalize(error) }
+}
+
+export async function pauseHotkeys(): Promise<unknown> {
+  try { return await invoke('daemon_mutate', { action: { kind: 'pause_hotkeys' } }) }
+  catch (error) { throw normalize(error) }
+}
+
+export async function resumeHotkeys(): Promise<unknown> {
+  try { return await invoke('daemon_mutate', { action: { kind: 'resume_hotkeys' } }) }
+  catch (error) { throw normalize(error) }
 }
