@@ -46,6 +46,7 @@ pub enum QueryKind {
     Apps,
     Scratchpads,
     ScratchpadCapabilities,
+    Animations,
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,6 +263,7 @@ pub fn query(kind: QueryKind) -> Result<Value, BridgeError> {
         QueryKind::Apps => "apps list --json",
         QueryKind::Scratchpads => "scratchpad list --json",
         QueryKind::ScratchpadCapabilities => "scratchpad capabilities --json",
+        QueryKind::Animations => "animations status --json",
     };
     let value = json_reply(request)?;
     if value.get("ok") == Some(&Value::Bool(false)) {

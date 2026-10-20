@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Route, Routes, useLocation } from 'react-router'
-import { Activity, AppWindow, Command, House, LayoutDashboard, Menu, Monitor, Settings2, SlidersHorizontal, Grid2X2, CircleHelp, RefreshCcw, MousePointer2, Layers, Languages } from 'lucide-react'
+import { Activity, AppWindow, Command, House, LayoutDashboard, Menu, Monitor, Settings2, SlidersHorizontal, Grid2X2, CircleHelp, RefreshCcw, MousePointer2, Layers, Languages, Sparkles } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { useDaemon } from '../api/hooks'
 import { useLang, useT, type LanguagePref, type MessageKey } from '../i18n'
@@ -15,6 +15,7 @@ import { Scratchpads } from '../pages/Scratchpads'
 import { Diagnostics } from '../pages/Diagnostics'
 import { General } from '../pages/General'
 import { FocusMouse } from '../pages/FocusMouse'
+import { Animations } from '../pages/Animations'
 
 const navigation: { path: string; title: MessageKey; icon: LucideIcon }[] = [
   { path: '/', title: 'nav.dashboard', icon: House },
@@ -25,6 +26,7 @@ const navigation: { path: string; title: MessageKey; icon: LucideIcon }[] = [
   { path: '/rules', title: 'nav.rules', icon: AppWindow },
   { path: '/scratchpads', title: 'nav.scratchpads', icon: Layers },
   { path: '/focus', title: 'nav.focus', icon: MousePointer2 },
+  { path: '/animations', title: 'nav.animations', icon: Sparkles },
   { path: '/diagnostics', title: 'nav.diagnostics', icon: Activity },
   { path: '/general', title: 'nav.general', icon: Settings2 },
 ]
@@ -77,6 +79,7 @@ export function App() {
         <Route path="/rules" element={<WindowRules />} />
         <Route path="/scratchpads" element={<Scratchpads />} />
         <Route path="/focus" element={<FocusMouse />} />
+        <Route path="/animations" element={<Animations />} />
         <Route path="/diagnostics" element={<Diagnostics />} />
         <Route path="/general" element={<General />} />
       </Routes></main>

@@ -104,7 +104,31 @@ export interface Config {
   workspaces: WorkspaceDefinition[]
   cross_monitor_navigation: boolean
   focus: FocusSettings
+  /** Absent from daemons older than the Animation Engine. */
+  animations?: AnimationConfig
   mouse: { enabled: boolean; modifier: string; drag_threshold: number; resize_sensitivity: number; update_interval_ms: number }
+}
+export type Easing = 'linear' | 'ease_out_cubic' | 'ease_in_out_cubic' | 'ease_out_quart' | 'ease_out_expo'
+export type AnimationBackendChoice = 'auto' | 'instant' | 'accessibility' | 'native_experimental'
+export type SlideDirection = 'down' | 'up' | 'left' | 'right'
+export type AnimationEvent = 'window_open' | 'window_close' | 'layout_change' | 'layout_zoom' | 'scrolling' | 'scratchpad'
+export interface AnimationConfig {
+  enabled: boolean; backend: AnimationBackendChoice; duration_ms: number; easing: Easing; preferred_fps: number
+  respect_reduce_motion: boolean; scratchpad_slide: SlideDirection; events: Record<AnimationEvent, boolean>
+}
+export interface AnimationMetrics {
+  started: number; completed: number; retargeted: number; cancelled: number; failed: number; instant: number
+  steps_written: number; skipped_slots: number; ticks: number; writes: number; active: number
+  final_error_max: number; finals_measured: number
+}
+export interface AnimationsStatus {
+  version: 1
+  config: AnimationConfig
+  reduce_motion: boolean
+  backends: { name: 'instant' | 'accessibility' | 'native_experimental'; available: boolean; reason: string | null }[]
+  worker: { policy_enabled: boolean; backend: 'instant' | 'accessibility'; reduce_motion: boolean; accessibility: boolean; slow_applications: number[]; instant_reasons: Record<string, number> } | null
+  metrics: AnimationMetrics
+  summary: { active: number; mean_write_ms: number | null; max_write_ms: number; mean_tick_interval_ms: number | null; mean_final_error_pt: number | null }
 }
 export interface ConfigSnapshot { version: 1; revision: string; config: Config }
 export type ConfigPatch =
@@ -116,6 +140,7 @@ export type ConfigPatch =
   | { kind: 'set_window_rule'; index: number | null; rule: WindowRule }
   | { kind: 'remove_window_rule'; index: number }
   | { kind: 'set_focus'; focus: FocusSettings }
+  | { kind: 'set_animations'; animations: AnimationConfig }
   | { kind: 'set_default_layout'; layout: LayoutKind }
   | { kind: 'set_workspace_layout'; id: number; layout: LayoutKind | null }
   | { kind: 'set_dwindle'; settings: DwindleSettings }
@@ -197,5 +222,6 @@ export interface QueryMap {
   apps: { version: 1; apps: RunningApp[] }
   scratchpads: { version: 1; scratchpads: ScratchpadStatus[]; parking: Record<string, number>; metrics: Record<string, number> }
   scratchpad_capabilities: ScratchpadCapabilities
+  animations: AnimationsStatus
 }
 export type QueryKind = keyof QueryMap
