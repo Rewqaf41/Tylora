@@ -370,6 +370,12 @@ pub enum ScratchpadPlan {
     },
     /// The display needs a parking Desktop before the window can be hidden.
     NeedsParking(DisplayId),
+    /// A local scratchpad was called from another Space: switch `display`
+    /// to its home `space` first, then show it there.
+    VisitHome {
+        display: DisplayId,
+        space: u64,
+    },
     Nothing,
 }
 
@@ -390,6 +396,8 @@ pub struct ScratchpadContext {
     pub parking_space: Option<u64>,
     /// Whether the home Space is active (local scope).
     pub home_active: bool,
+    /// Display holding the home Space, if it still exists.
+    pub home_display: Option<DisplayId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,7 +442,13 @@ pub fn plan_scratchpad(
             ScratchpadScope::Local => {
                 let home = entry.home_space.ok_or(ScratchpadError::Unavailable)?;
                 if !context.home_active {
-                    return Err(ScratchpadError::NotOnHomeSpace(home));
+                    let display = context
+                        .home_display
+                        .ok_or(ScratchpadError::NotOnHomeSpace(home))?;
+                    return Ok(ScratchpadPlan::VisitHome {
+                        display,
+                        space: home,
+                    });
                 }
                 (
                     context.window_display.unwrap_or(context.target_display),
@@ -773,6 +787,7 @@ mod tests {
             minimized: false,
             parking_space: Some(99),
             home_active: false,
+            home_display: Some(DisplayId(1)),
         }
     }
     fn area() -> Rect {
@@ -993,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn local_scope_shows_only_on_home_space() {
+    fn local_scope_visits_its_home_space() {
         let mut registry = registry();
         registry
             .assign(
@@ -1009,8 +1024,19 @@ mod tests {
         let mut pad = ScratchpadDefinition::new("terminal");
         pad.scope = ScratchpadScope::Local;
         let entry = registry.get("terminal").unwrap().clone();
+        // Called from elsewhere: go to the home Space first.
         assert_eq!(
             plan_scratchpad(&pad, &entry, ScratchpadAction::Show, context(99, false)),
+            Ok(ScratchpadPlan::VisitHome {
+                display: DisplayId(1),
+                space: 4
+            })
+        );
+        // Unless that Space is gone.
+        let mut gone = context(99, false);
+        gone.home_display = None;
+        assert_eq!(
+            plan_scratchpad(&pad, &entry, ScratchpadAction::Show, gone),
             Err(ScratchpadError::NotOnHomeSpace(4))
         );
         let mut home = context(99, false);

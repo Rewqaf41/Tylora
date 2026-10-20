@@ -597,6 +597,12 @@ enum NativeMoveEvent {
         result: Result<u64, String>,
         response: Option<SyncSender<String>>,
     },
+    /// Switched to a local scratchpad's home Space (or failed to).
+    ScratchpadVisited {
+        id: String,
+        result: Result<(), String>,
+        response: Option<SyncSender<String>>,
+    },
     /// A rule's native move finished (or failed).
     RuleMoved {
         operation: u64,
@@ -833,6 +839,9 @@ struct DisplayState {
     scratchpads: ScratchpadRegistry,
     scratchpad_definitions: Vec<ScratchpadDefinition>,
     scratchpad_requests: HashMap<u64, PendingScratchpad>,
+    /// Local scratchpads shown by visiting their home Space: where to go
+    /// back to when they are hidden again.
+    scratchpad_returns: HashMap<String, ScratchpadReturn>,
     scratchpad_request_counter: u64,
     scratchpad_metrics: ScratchpadMetrics,
     /// Windows a rule wants in a scratchpad: (scratchpad, CGWindowID).
@@ -1856,6 +1865,17 @@ struct ScratchpadMetrics {
 }
 
 /// A scratchpad step waiting for the AX worker or a native move.
+/// Where to return after hiding a local scratchpad shown from elsewhere.
+#[derive(Debug, Clone, Copy)]
+struct ScratchpadReturn {
+    /// Display whose Space was switched to the home Space.
+    display: DisplayId,
+    /// Space that display showed before.
+    space: u64,
+    /// Display the pointer was on, to put it back.
+    pointer: Option<DisplayId>,
+}
+
 struct PendingScratchpad {
     id: String,
     generation: u64,
@@ -2228,7 +2248,12 @@ fn scratchpad_action(
         .window
         .clone()
         .ok_or_else(|| ScratchpadError::NotAssigned.to_string())?;
-    // Where the window is right now, straight from WindowServer.
+    // Where the window is and which Spaces are active right now, straight
+    // from WindowServer: the Space observer lags up to a second behind, e.g.
+    // right after visiting a local scratchpad's home Space.
+    let live_spaces = ExperimentalSkyLightBackend::new()
+        .list_spaces()
+        .unwrap_or_else(|_| state.native_spaces.clone());
     let memberships = ExperimentalSkyLightBackend::new()
         .get_window_spaces(window.cg_window_id)
         .map_err(|error| error.to_string())?;
@@ -2239,10 +2264,7 @@ fn scratchpad_action(
         save_scratchpads(&state.scratchpads);
         return Err("scratchpad window no longer exists".into());
     };
-    let window_native = state
-        .native_spaces
-        .iter()
-        .find(|space| space.id.0 == window_space);
+    let window_native = live_spaces.iter().find(|space| space.id.0 == window_space);
     let window_display = window_native.map(|space| space.display);
     let managed = state.managed_by_cg(window.process, window.cg_window_id);
     let minimized = managed.as_ref().is_some_and(|(_, observed)| {
@@ -2267,8 +2289,7 @@ fn scratchpad_action(
         })
         .or(window_display)
         .unwrap_or(state.primary);
-    let target_space = state
-        .native_spaces
+    let target_space = live_spaces
         .iter()
         .find(|space| space.display == target_display && space.active)
         .map(|space| space.id.0)
@@ -2282,10 +2303,15 @@ fn scratchpad_action(
         minimized,
         parking_space: window_display.and_then(|display| state.parking_space(display)),
         home_active: entry.home_space.is_some_and(|home| {
-            state
-                .native_spaces
+            live_spaces
                 .iter()
                 .any(|space| space.id.0 == home && space.active)
+        }),
+        home_display: entry.home_space.and_then(|home| {
+            live_spaces
+                .iter()
+                .find(|space| space.id.0 == home)
+                .map(|space| space.display)
         }),
     };
     let plan =
@@ -2299,6 +2325,39 @@ fn scratchpad_action(
                 let _ =
                     response.try_send(scratchpad_reply(id, entry, "none", Ok("already hidden")));
             }
+            Ok(())
+        }
+        ScratchpadPlan::VisitHome {
+            display,
+            space: home,
+        } => {
+            // Remember where the user was; hiding goes back there.
+            let back = live_spaces
+                .iter()
+                .find(|space| space.display == display && space.active)
+                .map(|space| space.id.0);
+            if let Some(space) = back {
+                state.scratchpad_returns.insert(
+                    id.to_string(),
+                    ScratchpadReturn {
+                        display,
+                        space,
+                        pointer,
+                    },
+                );
+            }
+            let sender = io.native.clone();
+            let id = id.to_string();
+            thread::spawn(move || {
+                let result =
+                    focus_workspace_space(display, tylora_macos::spaces::NativeSpaceId(home))
+                        .map(|_| ());
+                let _ = sender.send(NativeMoveEvent::ScratchpadVisited {
+                    id,
+                    result,
+                    response,
+                });
+            });
             Ok(())
         }
         ScratchpadPlan::NeedsParking(display) => {
@@ -2742,6 +2801,25 @@ fn scratchpad_moved(
             .find_map(|c| c.registry.get(observed.id).map(|record| record.generation))
             .unwrap_or_default();
         state.commit_native_move(observed.id, generation, &outcome, None);
+    }
+    if let Some(back) = state.scratchpad_returns.remove(&pending.id) {
+        // Shown by visiting its home Space: go back where the user was. No
+        // window on the home Space may take focus first, or WindowServer
+        // would switch straight back to it.
+        thread::spawn(move || {
+            let result = focus_workspace_space(
+                back.display,
+                tylora_macos::spaces::NativeSpaceId(back.space),
+            );
+            if let Some(pointer) = back.pointer.filter(|pointer| *pointer != back.display) {
+                let _ = tylora_macos::spaces::warp_cursor_to_display(pointer);
+            }
+            if let Err(error) = result {
+                warn!(%error, "cannot return from local scratchpad home Space");
+            }
+        });
+        let _ = io.adapter.commands.try_send(ManagedCommand::Reconcile);
+        return finish_scratchpad(state, pending, Ok(ScratchpadState::Hidden), "park");
     }
     let previous = state
         .scratchpads
@@ -3391,6 +3469,7 @@ impl DisplayState {
             },
             scratchpad_definitions: config.scratchpads.clone(),
             scratchpad_requests: HashMap::new(),
+            scratchpad_returns: HashMap::new(),
             scratchpad_request_counter: 0,
             scratchpad_metrics: ScratchpadMetrics::default(),
             scratchpad_rule_queue: Vec::new(),
@@ -5070,6 +5149,37 @@ fn run_coordinator(
                     if state.scratchpad_requests.is_empty() {
                         pointer_focus_pause_until =
                             Some(Instant::now() + WORKSPACE_SWITCH_POINTER_SETTLE);
+                    }
+                }
+                NativeMoveEvent::ScratchpadVisited {
+                    id,
+                    result,
+                    response,
+                } => {
+                    let io = ScratchpadIo {
+                        adapter: &adapter,
+                        native: &native_move_tx,
+                        focused: focus_trail.last().copied(),
+                        trail: &focus_trail,
+                    };
+                    let shown = result.and_then(|()| {
+                        scratchpad_action(
+                            &mut state,
+                            &io,
+                            &id,
+                            ScratchpadAction::Show,
+                            response.clone(),
+                        )
+                    });
+                    if let Err(error) = shown {
+                        warn!(scratchpad = %id, %error, "local scratchpad home visit");
+                        state.scratchpad_returns.remove(&id);
+                        if let Some(response) = response {
+                            let _ = response.try_send(command_json(CommandResult::failure(
+                                CommandError::Unsupported,
+                                error,
+                            )));
+                        }
                     }
                 }
                 NativeMoveEvent::ScratchpadParking {
