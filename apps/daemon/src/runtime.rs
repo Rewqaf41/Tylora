@@ -318,17 +318,22 @@ fn resolve_focus_target(
     config: &Config,
     command: &StateCommand,
     history: &SpaceFocusHistory,
+    links: &tylora_macos::spaces::FullscreenLinks,
 ) -> Result<(DisplayId, tylora_macos::spaces::NativeSpaceId), String> {
     use tylora_macos::spaces::{
         cursor_display, ExperimentalSkyLightBackend, NativeSpaceBackend, NativeSpaceId,
     };
     let backend = ExperimentalSkyLightBackend::new();
     let spaces = backend.list_spaces().map_err(|error| error.to_string())?;
+    let orders = backend.display_order().map_err(|error| error.to_string())?;
+    let order_of = |display: DisplayId| orders.iter().find(|order| order.display == display);
     let pointer = cursor_display();
-    let current = spaces
-        .iter()
-        .find(|space| space.active && Some(space.display) == pointer)
-        .map(|space| space.id.0);
+    // Inside a native fullscreen Space the Desktop it was entered from is
+    // the current workspace.
+    let current = pointer
+        .and_then(order_of)
+        .and_then(|order| order.owner(order.active, links))
+        .map(|id| id.0);
     let resolve = |ws: &tylora_config::WorkspaceDefinition| -> Result<_, String> {
         let existing: Vec<_> = ws
             .space_ids()
@@ -346,7 +351,10 @@ fn resolve_focus_target(
             .find(|space| space.id.0 == id)
             .map(|space| space.display)
             .ok_or("bound native Space no longer exists")?;
-        Ok((display, NativeSpaceId(id)))
+        let target = order_of(display)
+            .map(|order| order.workspace_target(NativeSpaceId(id), links))
+            .unwrap_or(NativeSpaceId(id));
+        Ok((display, target))
     };
     match command {
         StateCommand::FocusWorkspace { id } => resolve(
@@ -363,10 +371,9 @@ fn resolve_focus_target(
         ),
         StateCommand::FocusNextWorkspace | StateCommand::FocusPreviousWorkspace => {
             let display = cursor_display().ok_or("pointer display unavailable")?;
-            let current = backend
-                .get_active_space(display)
-                .map_err(|error| error.to_string())?
-                .id;
+            let current = order_of(display)
+                .and_then(|order| order.owner(order.active, links))
+                .ok_or("active native Space unavailable")?;
             // One entry per workspace with a Space on this display.
             let candidates: Vec<u64> = config
                 .workspaces
@@ -1804,15 +1811,42 @@ fn load_scratchpads() -> ScratchpadRegistry {
 }
 
 fn save_scratchpads(registry: &ScratchpadRegistry) {
+    persist_state_json(&scratchpad_state_path(), registry, "scratchpads");
+}
+
+fn fullscreen_links_path() -> PathBuf {
+    workspace_state_path().with_file_name("fullscreen-links.json")
+}
+
+fn load_fullscreen_links() -> tylora_macos::spaces::FullscreenLinks {
+    use tylora_macos::spaces::NativeSpaceId;
+    fs::read(fullscreen_links_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<HashMap<u64, u64>>(&bytes).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(fullscreen, desktop)| (NativeSpaceId(fullscreen), NativeSpaceId(desktop)))
+        .collect()
+}
+
+fn save_fullscreen_links(links: &tylora_macos::spaces::FullscreenLinks) {
+    let plain: HashMap<u64, u64> = links
+        .iter()
+        .map(|(fullscreen, desktop)| (fullscreen.0, desktop.0))
+        .collect();
+    persist_state_json(&fullscreen_links_path(), &plain, "fullscreen links");
+}
+
+/// Writes daemon state through a synced temp file and an atomic rename.
+fn persist_state_json(path: &Path, value: &impl serde::Serialize, what: &str) {
     if cfg!(test) {
         return;
     }
-    let path = scratchpad_state_path();
     let result = (|| -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let bytes = serde_json::to_vec_pretty(registry).map_err(std::io::Error::other)?;
+        let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
         let temp = path.with_extension(format!("tmp-{}", std::process::id()));
         let _ = fs::remove_file(&temp);
         let mut file = OpenOptions::new()
@@ -1822,10 +1856,10 @@ fn save_scratchpads(registry: &ScratchpadRegistry) {
             .open(&temp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::rename(&temp, &path)
+        fs::rename(&temp, path)
     })();
     if let Err(error) = result {
-        warn!(%error, "cannot persist scratchpads");
+        warn!(%error, "cannot persist {what}");
     }
 }
 
@@ -4032,6 +4066,27 @@ pub fn start(display: Option<u32>) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Stops the daemon and waits until it has released the socket, so an
+/// immediate `start` cannot reach a daemon that is still restoring windows.
+pub fn stop() -> ExitCode {
+    let code = request("stop");
+    if code != ExitCode::SUCCESS {
+        return code;
+    }
+    let until = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < until {
+        if UnixStream::connect(socket_path()).is_err() {
+            return ExitCode::SUCCESS;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!(
+        "daemon is still shutting down; inspect {}",
+        log_path().display()
+    );
+    ExitCode::FAILURE
+}
+
 pub fn request(command: &str) -> ExitCode {
     match query(command) {
         Ok(response) => {
@@ -4308,6 +4363,23 @@ fn run_coordinator(
         load_space_slots()
     };
     let mut space_focus: SpaceFocusHistory = HashMap::new();
+    // Fullscreen Space -> Desktop it was entered from, learned from each
+    // observed Space change; workspace hotkeys return into these Spaces.
+    let mut space_orders = tylora_macos::spaces::ExperimentalSkyLightBackend::new()
+        .display_order()
+        .unwrap_or_default();
+    let mut fullscreen_links = if cfg!(test) {
+        Default::default()
+    } else {
+        load_fullscreen_links()
+    };
+    if tylora_macos::spaces::learn_fullscreen_links(
+        &space_orders,
+        &space_orders,
+        &mut fullscreen_links,
+    ) {
+        save_fullscreen_links(&fullscreen_links);
+    }
     // Recently focused windows, newest last; scratchpads return focus to them.
     let mut focus_trail: Vec<ManagedWindowId> = Vec::new();
     let mut passive_focus: Option<(u64, Instant)> = None;
@@ -4922,6 +4994,28 @@ fn run_coordinator(
             pending_config = Some(updated);
         }
         while let Ok(spaces) = space_observer.changes.try_recv() {
+            if let Ok(orders) =
+                tylora_macos::spaces::ExperimentalSkyLightBackend::new().display_order()
+            {
+                let before = fullscreen_links.clone();
+                if tylora_macos::spaces::learn_fullscreen_links(
+                    &space_orders,
+                    &orders,
+                    &mut fullscreen_links,
+                ) {
+                    for (fullscreen, desktop) in &fullscreen_links {
+                        if !before.contains_key(fullscreen) {
+                            info!(
+                                fullscreen = fullscreen.0,
+                                desktop = desktop.0,
+                                "fullscreen Space linked to Desktop"
+                            );
+                        }
+                    }
+                    save_fullscreen_links(&fullscreen_links);
+                }
+                space_orders = orders;
+            }
             let old_ids: Vec<_> = state.native_spaces.iter().map(|space| space.id).collect();
             let new_ids: Vec<_> = spaces.iter().map(|space| space.id).collect();
             bindings_dirty |= old_ids != new_ids;
@@ -5651,10 +5745,11 @@ fn run_coordinator(
                         let focus_sender = native_move_tx.clone();
                         let configured = config.clone();
                         let history = space_focus.clone();
+                        let links = fullscreen_links.clone();
                         thread::spawn(move || {
                             let mut focus = None;
                             let mut space = None;
-                            match resolve_focus_target(&configured, &command, &history) {
+                            match resolve_focus_target(&configured, &command, &history, &links) {
                                 Ok((display, target)) => {
                                     match focus_workspace_space(display, target) {
                                         Ok((outcome, needs_focus)) => {
@@ -6267,12 +6362,14 @@ fn run_coordinator(
                         let reconcile = adapter.commands.clone();
                         let focus_sender = native_move_tx.clone();
                         let history = space_focus.clone();
+                        let links = fullscreen_links.clone();
                         thread::spawn(move || {
-                            let result = resolve_focus_target(&configured, &command, &history)
-                                .and_then(|(display, target)| {
-                                    focus_workspace_space(display, target)
-                                        .map(|(_, needs_focus)| (display, target, needs_focus))
-                                });
+                            let result =
+                                resolve_focus_target(&configured, &command, &history, &links)
+                                    .and_then(|(display, target)| {
+                                        focus_workspace_space(display, target)
+                                            .map(|(_, needs_focus)| (display, target, needs_focus))
+                                    });
                             let reply = match result {
                                 Ok((display, target, needs_focus)) => {
                                     let _ = reconcile.try_send(ManagedCommand::Reconcile);

@@ -2,6 +2,7 @@
 //! and are resolved at runtime; no operation may assume that they exist.
 
 use serde::Serialize;
+use std::collections::HashMap;
 use tylora_core::DisplayId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -135,6 +136,113 @@ impl SpaceRegistry {
     }
 }
 
+/// Every Space of one display in Mission Control order, including native
+/// fullscreen Spaces, which `list_spaces` hides because they are not Desktops.
+/// Dock swipes step through this order, so switching must walk it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DisplaySpaceOrder {
+    pub display: DisplayId,
+    pub active: NativeSpaceId,
+    pub spaces: Vec<OrderedSpace>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct OrderedSpace {
+    pub id: NativeSpaceId,
+    pub fullscreen: bool,
+}
+
+/// Fullscreen Space -> the Desktop it was entered from. macOS may place a
+/// new fullscreen Space anywhere in the strip (often at its end), so the
+/// link is learned from the Space transition, never from position.
+pub type FullscreenLinks = HashMap<NativeSpaceId, NativeSpaceId>;
+
+impl DisplaySpaceOrder {
+    pub fn ids(&self) -> Vec<NativeSpaceId> {
+        self.spaces.iter().map(|space| space.id).collect()
+    }
+
+    fn contains(&self, id: NativeSpaceId, fullscreen: bool) -> bool {
+        self.spaces
+            .iter()
+            .any(|space| space.id == id && space.fullscreen == fullscreen)
+    }
+
+    /// The Desktop a Space belongs to: a Desktop owns itself, a fullscreen
+    /// Space belongs to its linked Desktop while that still exists here.
+    pub fn owner(&self, id: NativeSpaceId, links: &FullscreenLinks) -> Option<NativeSpaceId> {
+        if self.contains(id, false) {
+            return Some(id);
+        }
+        links
+            .get(&id)
+            .copied()
+            .filter(|desktop| self.contains(id, true) && self.contains(*desktop, false))
+    }
+
+    /// Fullscreen Spaces linked to `desktop`, in Mission Control order.
+    pub fn fullscreen_of(
+        &self,
+        desktop: NativeSpaceId,
+        links: &FullscreenLinks,
+    ) -> Vec<NativeSpaceId> {
+        self.spaces
+            .iter()
+            .filter(|space| space.fullscreen && links.get(&space.id) == Some(&desktop))
+            .map(|space| space.id)
+            .collect()
+    }
+
+    /// Where a workspace hotkey for `desktop` should go: into the Desktop's
+    /// fullscreen Spaces first, cycling through them on repeated presses, and
+    /// back to the Desktop itself after the last one.
+    pub fn workspace_target(
+        &self,
+        desktop: NativeSpaceId,
+        links: &FullscreenLinks,
+    ) -> NativeSpaceId {
+        let fullscreen = self.fullscreen_of(desktop, links);
+        match fullscreen.iter().position(|id| *id == self.active) {
+            Some(index) => fullscreen.get(index + 1).copied().unwrap_or(desktop),
+            None => fullscreen.first().copied().unwrap_or(desktop),
+        }
+    }
+}
+
+/// Learns links from one observed change of the Space strips: a fullscreen
+/// Space that did not exist before and is now active on a display whose
+/// previous active Space was a Desktop was entered from that Desktop. Links
+/// of fullscreen Spaces that no longer exist are dropped. Returns whether
+/// `links` changed.
+pub fn learn_fullscreen_links(
+    previous: &[DisplaySpaceOrder],
+    current: &[DisplaySpaceOrder],
+    links: &mut FullscreenLinks,
+) -> bool {
+    let before = links.len();
+    links.retain(|fullscreen, _| {
+        current
+            .iter()
+            .any(|order| order.contains(*fullscreen, true))
+    });
+    let mut changed = links.len() != before;
+    for order in current {
+        let Some(old) = previous.iter().find(|old| old.display == order.display) else {
+            continue;
+        };
+        let entered = order.active;
+        if order.contains(entered, true)
+            && !old.ids().contains(&entered)
+            && old.contains(old.active, false)
+            && !links.contains_key(&entered)
+        {
+            links.insert(entered, old.active);
+            changed = true;
+        }
+    }
+    changed
+}
+
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -159,6 +267,89 @@ pub(crate) use window_mover::ax_cg_window;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn order(active: u64, spaces: &[(u64, bool)]) -> DisplaySpaceOrder {
+        DisplaySpaceOrder {
+            display: DisplayId(1),
+            active: NativeSpaceId(active),
+            spaces: spaces
+                .iter()
+                .map(|(id, fullscreen)| OrderedSpace {
+                    id: NativeSpaceId(*id),
+                    fullscreen: *fullscreen,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn fullscreen_link_is_learned_from_the_desktop_it_was_entered_from() {
+        // macOS appended the video's fullscreen Space after Desktop 6.
+        let before = order(4, &[(2, false), (4, false), (6, false)]);
+        let after = order(90, &[(2, false), (4, false), (6, false), (90, true)]);
+        let mut links = FullscreenLinks::new();
+        assert!(learn_fullscreen_links(
+            &[before],
+            std::slice::from_ref(&after),
+            &mut links
+        ));
+        assert_eq!(links.get(&NativeSpaceId(90)), Some(&NativeSpaceId(4)));
+        assert_eq!(
+            after.owner(NativeSpaceId(90), &links),
+            Some(NativeSpaceId(4))
+        );
+        assert_eq!(
+            after.owner(NativeSpaceId(6), &links),
+            Some(NativeSpaceId(6))
+        );
+        // Switching to an existing fullscreen Space teaches nothing new.
+        let elsewhere = order(
+            2,
+            &after
+                .spaces
+                .iter()
+                .map(|s| (s.id.0, s.fullscreen))
+                .collect::<Vec<_>>(),
+        );
+        let mut fresh = FullscreenLinks::new();
+        assert!(!learn_fullscreen_links(
+            &[elsewhere],
+            std::slice::from_ref(&after),
+            &mut fresh
+        ));
+        assert!(fresh.is_empty());
+        // Leaving fullscreen removes the Space and its link.
+        let closed = order(4, &[(2, false), (4, false), (6, false)]);
+        assert!(learn_fullscreen_links(&[after], &[closed], &mut links));
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn workspace_hotkey_enters_fullscreen_then_returns_to_its_desktop() {
+        let spaces = [(4, false), (5, false), (6, false), (90, true), (91, true)];
+        let links = FullscreenLinks::from([
+            (NativeSpaceId(90), NativeSpaceId(4)),
+            (NativeSpaceId(91), NativeSpaceId(4)),
+        ]);
+        let target = |active, desktop| {
+            order(active, &spaces).workspace_target(NativeSpaceId(desktop), &links)
+        };
+        // From another Desktop, and from the owner Desktop itself: the video.
+        assert_eq!(target(5, 4), NativeSpaceId(90));
+        assert_eq!(target(4, 4), NativeSpaceId(90));
+        // Several fullscreen Spaces are visited in order, then the Desktop.
+        assert_eq!(target(90, 4), NativeSpaceId(91));
+        assert_eq!(target(91, 4), NativeSpaceId(4));
+        // Leaving the video for another workspace is a plain Desktop switch,
+        // and the Desktop the video sits next to does not own it.
+        assert_eq!(target(90, 5), NativeSpaceId(5));
+        assert_eq!(target(5, 6), NativeSpaceId(6));
+        // A fullscreen Space without a learned link belongs to no workspace.
+        assert_eq!(
+            order(91, &spaces).owner(NativeSpaceId(91), &FullscreenLinks::new()),
+            None
+        );
+    }
     use std::cell::RefCell;
 
     struct MockBackend {

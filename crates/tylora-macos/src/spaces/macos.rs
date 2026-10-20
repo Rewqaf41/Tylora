@@ -1,6 +1,6 @@
 use super::{
-    DesktopNumber, NativeSpace, NativeSpaceBackend, NativeSpaceId, SpaceCapabilities, SpaceError,
-    SpaceRegistry,
+    DesktopNumber, DisplaySpaceOrder, NativeSpace, NativeSpaceBackend, NativeSpaceId, OrderedSpace,
+    SpaceCapabilities, SpaceError, SpaceRegistry,
 };
 use serde::Serialize;
 use std::{
@@ -52,10 +52,11 @@ impl NativeSpaceSwitcher {
         let _lock = switch_lock()?;
         let backend = ExperimentalSkyLightBackend::new();
         let started = Instant::now();
-        let initial = backend.get_active_space(display)?;
-        if initial.id == target {
+        // Fullscreen Spaces count: the user may be leaving or entering one.
+        let initial = backend.display_order_for(display)?.active;
+        if initial == target {
             return Ok(SwitchOutcome {
-                source: initial.id,
+                source: initial,
                 target,
                 display,
                 backend: "dock_gesture",
@@ -76,15 +77,11 @@ impl NativeSpaceSwitcher {
             if SWITCH_GENERATION.load(Ordering::Acquire) != generation {
                 return Err(SpaceError::SwitchCancelled);
             }
-            let spaces = backend.list_spaces()?;
-            let ordered: Vec<_> = spaces
-                .into_iter()
-                .filter(|space| space.display == display)
-                .collect();
-            let current = backend.get_active_space(display)?;
-            if current.id == target {
+            let order = backend.display_order_for(display)?;
+            let current = order.active;
+            if current == target {
                 return Ok(SwitchOutcome {
-                    source: initial.id,
+                    source: initial,
                     target,
                     display,
                     backend: "dock_gesture",
@@ -92,18 +89,18 @@ impl NativeSpaceSwitcher {
                     confirmed: true,
                 });
             }
-            let (expected, sign) = gesture_step(&ordered, current.id, target)?;
+            let (expected, sign) = gesture_step(&order.ids(), current, target)?;
             post_gesture(sign)?;
             let step_deadline = Instant::now() + Duration::from_secs(2);
             loop {
                 if SWITCH_GENERATION.load(Ordering::Acquire) != generation {
                     return Err(SpaceError::SwitchCancelled);
                 }
-                if let Ok(active) = backend.get_active_space(display) {
-                    if active.id == expected || active.id == target {
+                if let Ok(order) = backend.display_order_for(display) {
+                    if order.active == expected || order.active == target {
                         break;
                     }
-                    if active.id != current.id {
+                    if order.active != current {
                         return Err(SpaceError::VerificationFailed);
                     }
                 }
@@ -119,17 +116,17 @@ impl NativeSpaceSwitcher {
 }
 
 fn gesture_step(
-    ordered: &[NativeSpace],
+    ordered: &[NativeSpaceId],
     current: NativeSpaceId,
     target: NativeSpaceId,
 ) -> Result<(NativeSpaceId, f64), SpaceError> {
     let from = ordered
         .iter()
-        .position(|space| space.id == current)
+        .position(|id| *id == current)
         .ok_or(SpaceError::VerificationFailed)?;
     let to = ordered
         .iter()
-        .position(|space| space.id == target)
+        .position(|id| *id == target)
         .ok_or(SpaceError::Unsupported(
             "target native Space no longer exists on this display".into(),
         ))?;
@@ -137,22 +134,17 @@ fn gesture_step(
         return Err(SpaceError::VerificationFailed);
     }
     Ok(if from < to {
-        (ordered[from + 1].id, 1.0)
+        (ordered[from + 1], 1.0)
     } else {
-        (ordered[from - 1].id, -1.0)
+        (ordered[from - 1], -1.0)
     })
 }
 
 #[cfg(test)]
 mod gesture_tests {
     use super::*;
-    fn space(id: u64) -> NativeSpace {
-        NativeSpace {
-            id: NativeSpaceId(id),
-            desktop: DesktopNumber(id as u8),
-            display: DisplayId(1),
-            active: false,
-        }
+    fn space(id: u64) -> NativeSpaceId {
+        NativeSpaceId(id)
     }
     #[test]
     fn gesture_direction_tracks_current_order_and_deleted_target_fails() {
@@ -311,6 +303,76 @@ fn symbols() -> &'static Symbols {
 
 #[derive(Default)]
 pub struct ExperimentalSkyLightBackend;
+
+/// SkyLight Space type of a native fullscreen (or split view) Space.
+const FULLSCREEN_SPACE_TYPE: c_int = 4;
+
+impl ExperimentalSkyLightBackend {
+    /// Every user Desktop and fullscreen Space per display, in Mission
+    /// Control order, with the display's active Space.
+    pub fn display_order(&self) -> Result<Vec<DisplaySpaceOrder>, SpaceError> {
+        let syms = symbols();
+        let (Some(connection), Some(copy_displays), Some(current_space), Some(space_type)) = (
+            syms.connection,
+            syms.copy_displays,
+            syms.current_space,
+            syms.space_type,
+        ) else {
+            return Err(SpaceError::Unsupported(
+                "SkyLight discovery symbols are missing".into(),
+            ));
+        };
+        let cid = unsafe { connection() };
+        let displays = OwnedCF(unsafe { copy_displays(cid) });
+        if displays.0.is_null() {
+            return Err(SpaceError::QueryFailed("SLSCopyManagedDisplaySpaces"));
+        }
+        let mut result = Vec::new();
+        for display in array_items(displays.0) {
+            let identifier = dictionary_value(display, "Display Identifier");
+            if identifier.is_null() {
+                continue;
+            }
+            let uuid = OwnedCF(unsafe { CFUUIDCreateFromString(ptr::null(), identifier) });
+            if uuid.0.is_null() {
+                continue;
+            }
+            let display_id = DisplayId(unsafe { CGDisplayGetDisplayIDFromUUID(uuid.0) });
+            if display_id.0 == 0 {
+                continue;
+            }
+            let active = unsafe { current_space(cid, identifier) };
+            let spaces = array_items(dictionary_value(display, "Spaces"))
+                .filter_map(|space| number(dictionary_value(space, "id64")))
+                .filter(|id| *id > 0)
+                .filter_map(|id| {
+                    match unsafe { space_type(cid, id as u64) } {
+                        0 => Some(false),
+                        FULLSCREEN_SPACE_TYPE => Some(true),
+                        _ => None,
+                    }
+                    .map(|fullscreen| OrderedSpace {
+                        id: NativeSpaceId(id as u64),
+                        fullscreen,
+                    })
+                })
+                .collect();
+            result.push(DisplaySpaceOrder {
+                display: display_id,
+                active: NativeSpaceId(active),
+                spaces,
+            });
+        }
+        Ok(result)
+    }
+
+    pub fn display_order_for(&self, display: DisplayId) -> Result<DisplaySpaceOrder, SpaceError> {
+        self.display_order()?
+            .into_iter()
+            .find(|order| order.display == display)
+            .ok_or(SpaceError::QueryFailed("display Spaces"))
+    }
+}
 
 /// Bounded read-only polling for Mission Control, gestures and Desktop edits.
 /// It never calls AX or mutates window geometry.
@@ -491,54 +553,18 @@ impl NativeSpaceBackend for ExperimentalSkyLightBackend {
     }
 
     fn list_spaces(&self) -> Result<Vec<NativeSpace>, SpaceError> {
-        let syms = symbols();
-        let (Some(connection), Some(copy_displays), Some(current_space), Some(space_type)) = (
-            syms.connection,
-            syms.copy_displays,
-            syms.current_space,
-            syms.space_type,
-        ) else {
-            return Err(SpaceError::Unsupported(
-                "SkyLight discovery symbols are missing".into(),
-            ));
-        };
-        let cid = unsafe { connection() };
-        let displays = OwnedCF(unsafe { copy_displays(cid) });
-        if displays.0.is_null() {
-            return Err(SpaceError::QueryFailed("SLSCopyManagedDisplaySpaces"));
-        }
         let mut result = Vec::new();
-        for display in array_items(displays.0) {
-            let identifier = dictionary_value(display, "Display Identifier");
-            if identifier.is_null() {
-                continue;
-            }
-            let uuid = OwnedCF(unsafe { CFUUIDCreateFromString(ptr::null(), identifier) });
-            if uuid.0.is_null() {
-                continue;
-            }
-            let display_id = DisplayId(unsafe { CGDisplayGetDisplayIDFromUUID(uuid.0) });
-            if display_id.0 == 0 {
-                continue;
-            }
-            let active = unsafe { current_space(cid, identifier) };
-            let mut desktop = 0_u8;
-            for space in array_items(dictionary_value(display, "Spaces")) {
-                let Some(id) = number(dictionary_value(space, "id64")) else {
-                    continue;
-                };
-                if id <= 0 || unsafe { space_type(cid, id as u64) } != 0 {
-                    continue;
-                }
-                let Some(next) = desktop.checked_add(1) else {
+        for order in self.display_order()? {
+            let desktops = order.spaces.iter().filter(|space| !space.fullscreen);
+            for (index, space) in desktops.enumerate() {
+                let Ok(desktop) = u8::try_from(index + 1) else {
                     break;
                 };
-                desktop = next;
                 result.push(NativeSpace {
-                    id: NativeSpaceId(id as u64),
+                    id: space.id,
                     desktop: DesktopNumber(desktop),
-                    display: display_id,
-                    active: active == id as u64,
+                    display: order.display,
+                    active: order.active == space.id,
                 });
             }
         }

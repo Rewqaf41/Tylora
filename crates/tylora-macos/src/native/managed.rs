@@ -1337,10 +1337,16 @@ impl Worker {
             let cg_window_id = crate::spaces::ax_cg_window(element);
             let native_space_id = cg_window_id.and_then(|wid| {
                 use crate::spaces::{ExperimentalSkyLightBackend, NativeSpaceBackend};
-                let memberships = ExperimentalSkyLightBackend::new()
+                // Native fullscreen windows can briefly belong to no Space while
+                // macOS animates them into their own Space.
+                match ExperimentalSkyLightBackend::new()
                     .get_window_spaces(wid)
-                    .ok()?;
-                (memberships.len() == 1).then_some(memberships[0].0)
+                    .ok()?
+                    .as_slice()
+                {
+                    [only] => Some(only.0),
+                    _ => None,
+                }
             });
             let title = ax_attribute(element, c"AXTitle")
                 .ok()

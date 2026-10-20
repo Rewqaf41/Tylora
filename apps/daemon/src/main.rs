@@ -65,10 +65,12 @@ fn main() -> ExitCode {
             }
         }
         #[cfg(target_os = "macos")]
+        [command] if command == "stop" => runtime::stop(),
+        #[cfg(target_os = "macos")]
         [command]
             if matches!(
                 command.as_str(),
-                "stop" | "status" | "windows" | "layout" | "reconcile" | "recover-windows"
+                "status" | "windows" | "layout" | "reconcile" | "recover-windows"
             ) =>
         {
             runtime::request(command)
