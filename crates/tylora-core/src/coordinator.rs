@@ -787,12 +787,16 @@ impl<L: LayoutPolicy> Coordinator<L> {
             self.apply_started.retain(|id, _| live.contains(id));
         }
         self.planned = Some((self.version, override_frame));
+        // Only future deadlines wake the planner: a retry that is no longer
+        // needed (the app settled on its own, the frame was accepted) would
+        // otherwise leave a past deadline that replans on every loop.
         self.next_due = self
             .registry
             .iter()
             .filter(|(_, record)| record.failed_target.is_some())
             .filter_map(|(_, record)| record.retry_after)
             .chain(self.awaiting.values().map(|(deadline, _)| *deadline))
+            .filter(|due| *due > now)
             .min();
         effects
     }
