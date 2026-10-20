@@ -2097,7 +2097,10 @@ impl DisplayState {
                     cg,
                     window.native_space_id,
                     display,
-                    window.frame,
+                    (
+                        window.frame,
+                        self.areas.get(&display).map(|area| area.frame),
+                    ),
                     window.title.as_deref(),
                 );
             }
@@ -2486,14 +2489,17 @@ fn present_scratchpad(
         || (tylora_macos::spaces::focus_window(window.process.pid, window.cg_window_id).is_ok()
             && tylora_macos::raise_window(window.process.pid, window.cg_window_id).is_ok());
     let definition = state.scratchpad_definition(&pending.id).cloned();
-    let remembered = state
+    let (remembered, remembered_area) = state
         .scratchpads
         .get(&pending.id)
-        .and_then(|entry| entry.geometry);
+        .map_or((None, None), |entry| (entry.geometry, entry.geometry_area));
     let frame = match (definition, state.areas.get(&pending.display)) {
-        (Some(definition), Some(area)) => {
-            Some(scratchpad_frame(&definition, area.frame, remembered))
-        }
+        (Some(definition), Some(area)) => Some(scratchpad_frame(
+            &definition,
+            area.frame,
+            remembered,
+            remembered_area,
+        )),
         _ => None,
     };
     if focused {
@@ -3283,6 +3289,16 @@ impl DisplayState {
         match compile_rule_engine(config) {
             Ok(engine) => self.rule_engine = engine,
             Err(error) => warn!(%error, "rules not reloaded"),
+        }
+        let forgotten = self
+            .scratchpads
+            .forget_changed_geometry(&self.scratchpad_definitions, &config.scratchpads);
+        if !forgotten.is_empty() {
+            info!(
+                ?forgotten,
+                "scratchpad placement changed; remembered frame dropped"
+            );
+            save_scratchpads(&self.scratchpads);
         }
         self.scratchpad_definitions = config.scratchpads.clone();
         let removed = self.scratchpads.sync_definitions(&config.scratchpads);

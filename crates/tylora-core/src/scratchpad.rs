@@ -185,6 +185,7 @@ pub fn scratchpad_frame(
     definition: &ScratchpadDefinition,
     area: Rect,
     remembered: Option<Rect>,
+    remembered_area: Option<Rect>,
 ) -> Rect {
     let mut width = (area.width * definition.width).max(160.0_f64.min(area.width));
     let mut height = (area.height * definition.height).max(120.0_f64.min(area.height));
@@ -197,26 +198,49 @@ pub fn scratchpad_frame(
     let free_x = area.width - width;
     let free_y = area.height - height;
     use ScratchpadAlignment::*;
-    let fx = match definition.alignment {
+    let mut fx = match definition.alignment {
         Left | TopLeft | BottomLeft => 0.0,
         Right | TopRight | BottomRight => 1.0,
         Center | Top | Bottom => 0.5,
     };
-    let fy = match definition.alignment {
+    let mut fy = match definition.alignment {
         Top | TopLeft | TopRight => 0.0,
         Bottom | BottomLeft | BottomRight => 1.0,
         Center | Left | Right => 0.5,
     };
-    let mut x = area.x + free_x * fx + definition.offset_x;
-    let mut y = area.y + free_y * fy + definition.offset_y;
+    let mut offset = (definition.offset_x, definition.offset_y);
     if let Some(previous) = remembered.filter(|_| definition.remembers_position()) {
-        // Keep the remembered position relative to the work area so it
-        // survives moving between displays of different sizes.
-        x = previous.x;
-        y = previous.y;
+        match remembered_area {
+            // Keep the remembered position as a share of the free space of
+            // the work area it was seen in, so a centred window stays
+            // centred on a display of another size or place.
+            Some(origin) => {
+                let share = |at: f64, start: f64, free: f64, fallback: f64| {
+                    if free > 0.0 {
+                        ((at - start) / free).clamp(0.0, 1.0)
+                    } else {
+                        fallback
+                    }
+                };
+                fx = share(previous.x, origin.x, origin.width - previous.width, fx);
+                fy = share(previous.y, origin.y, origin.height - previous.height, fy);
+                offset = (0.0, 0.0);
+            }
+            // Recorded before positions knew their display: trust it only
+            // where it still fits, otherwise fall back to the alignment.
+            None if previous.x >= area.x - 1.0
+                && previous.y >= area.y - 1.0
+                && previous.x + previous.width <= area.x + area.width + 1.0
+                && previous.y + previous.height <= area.y + area.height + 1.0 =>
+            {
+                return Rect::new(previous.x, previous.y, width, height)
+                    .expect("finite scratchpad frame");
+            }
+            None => {}
+        }
     }
-    x = x.clamp(area.x, area.x + free_x.max(0.0));
-    y = y.clamp(area.y, area.y + free_y.max(0.0));
+    let x = (area.x + free_x * fx + offset.0).clamp(area.x, area.x + free_x.max(0.0));
+    let y = (area.y + free_y * fy + offset.1).clamp(area.y, area.y + free_y.max(0.0));
     Rect::new(x, y, width, height).expect("finite scratchpad frame")
 }
 
@@ -254,6 +278,10 @@ pub struct ScratchpadEntry {
     pub was_tiled: bool,
     pub state: ScratchpadState,
     pub geometry: Option<Rect>,
+    /// Work area of the display `geometry` was seen on; the position is
+    /// carried over to other displays relative to it.
+    #[serde(default)]
+    pub geometry_area: Option<Rect>,
     pub generation: u64,
     /// Assigned explicitly; rules never replace a manual assignment.
     pub manual: bool,
@@ -273,6 +301,7 @@ impl ScratchpadEntry {
             was_tiled: false,
             state: ScratchpadState::Unassigned,
             geometry: None,
+            geometry_area: None,
             generation: 0,
             manual: false,
             previous_focus: None,
@@ -635,7 +664,8 @@ impl ScratchpadRegistry {
         cg: u32,
         space: Option<u64>,
         display: DisplayId,
-        frame: Rect,
+        // The window frame and the work area of `display`, when known.
+        (frame, area): (Rect, Option<Rect>),
         title: Option<&str>,
     ) {
         if let Some(entry) = self.entries.values_mut().find(|entry| {
@@ -653,11 +683,48 @@ impl ScratchpadRegistry {
             entry.current_display = Some(display);
             if entry.state == ScratchpadState::Visible {
                 entry.geometry = Some(frame);
+                entry.geometry_area = area;
             }
             if let (Some(window), Some(title)) = (entry.window.as_mut(), title) {
                 window.title = Some(title.to_string());
             }
         }
+    }
+
+    /// Drops the remembered frame of scratchpads whose placement settings
+    /// changed, so a new alignment or size applies on the next show.
+    pub fn forget_changed_geometry(
+        &mut self,
+        old: &[ScratchpadDefinition],
+        new: &[ScratchpadDefinition],
+    ) -> Vec<String> {
+        let placement = |pad: &ScratchpadDefinition| {
+            (
+                pad.alignment,
+                pad.width.to_bits(),
+                pad.height.to_bits(),
+                pad.offset_x.to_bits(),
+                pad.offset_y.to_bits(),
+                pad.remembers_position(),
+                pad.remembers_size(),
+            )
+        };
+        let mut changed = Vec::new();
+        for pad in new {
+            let Some(before) = old.iter().find(|before| before.id == pad.id) else {
+                continue;
+            };
+            if placement(before) == placement(pad) {
+                continue;
+            }
+            if let Some(entry) = self.entries.get_mut(&pad.id) {
+                if entry.geometry.take().is_some() {
+                    changed.push(pad.id.clone());
+                }
+                entry.geometry_area = None;
+            }
+        }
+        changed
     }
 
     /// Marks scratchpads whose process exited or window vanished.
@@ -732,7 +799,7 @@ mod tests {
     #[test]
     fn geometry_defaults_alignment_and_clamping() {
         let pad = ScratchpadDefinition::new("t");
-        let frame = scratchpad_frame(&pad, area(), None);
+        let frame = scratchpad_frame(&pad, area(), None, None);
         assert!((frame.width - 1470.0 * 0.7).abs() < 1e-9);
         assert!((frame.height - 923.0 * 0.65).abs() < 1e-9);
         assert!((frame.x - (1470.0 - frame.width) / 2.0).abs() < 1e-9);
@@ -740,7 +807,7 @@ mod tests {
         let mut corner = pad.clone();
         corner.alignment = ScratchpadAlignment::BottomRight;
         corner.offset_x = 500.0;
-        let frame = scratchpad_frame(&corner, area(), None);
+        let frame = scratchpad_frame(&corner, area(), None, None);
         assert!(
             frame.x + frame.width <= 1470.0 + 1e-9,
             "offset clamped into the area"
@@ -750,16 +817,52 @@ mod tests {
         // smaller display.
         let remembered = Rect::new(1200.0, 700.0, 2000.0, 400.0).unwrap();
         let small = Rect::new(0.0, 25.0, 1280.0, 775.0).unwrap();
-        let frame = scratchpad_frame(&pad, small, Some(remembered));
+        let frame = scratchpad_frame(&pad, small, Some(remembered), Some(area()));
         assert_eq!(frame.width, 1280.0);
         assert!(frame.x >= 0.0 && frame.y + frame.height <= 800.0 + 1e-9);
         let mut forget = pad;
         forget.remember_size = false;
         forget.remember_position = false;
         assert_eq!(
-            scratchpad_frame(&forget, area(), Some(remembered)),
-            scratchpad_frame(&forget, area(), None)
+            scratchpad_frame(&forget, area(), Some(remembered), Some(area())),
+            scratchpad_frame(&forget, area(), None, None)
         );
+    }
+
+    #[test]
+    fn remembered_position_follows_the_window_to_another_display() {
+        let pad = ScratchpadDefinition::new("t");
+        // Centred on the Mac (work area 0,33 1470x923).
+        let centred = scratchpad_frame(&pad, area(), None, None);
+        // An external display above it, as in a real arrangement.
+        let external = Rect::new(-201.0, -1080.0, 1920.0, 1080.0).unwrap();
+        let moved = scratchpad_frame(&pad, external, Some(centred), Some(area()));
+        assert!((moved.x - (-201.0 + (1920.0 - moved.width) / 2.0)).abs() < 1e-6);
+        assert!((moved.y - (-1080.0 + (1080.0 - moved.height) / 2.0)).abs() < 1e-6);
+        // A legacy absolute position from the Mac does not fit up there:
+        // the alignment applies instead of a clamp to the display edge.
+        let legacy = Rect::new(739.0, 33.0, 731.0, 499.0).unwrap();
+        let fallback = scratchpad_frame(&pad, external, Some(legacy), None);
+        assert!((fallback.x - (-201.0 + (1920.0 - 731.0) / 2.0)).abs() < 1e-6);
+        assert!((fallback.y - (-1080.0 + (1080.0 - 499.0) / 2.0)).abs() < 1e-6);
+        // ...but where it fits, it is kept as is.
+        assert_eq!(scratchpad_frame(&pad, area(), Some(legacy), None), legacy);
+    }
+
+    #[test]
+    fn changed_placement_settings_forget_the_remembered_frame() {
+        let mut registry = registry();
+        let old = vec![ScratchpadDefinition::new("terminal")];
+        let entry = registry.entries.get_mut("terminal").unwrap();
+        entry.geometry = Some(Rect::new(739.0, 33.0, 731.0, 499.0).unwrap());
+        assert!(registry.forget_changed_geometry(&old, &old).is_empty());
+        let mut new = old.clone();
+        new[0].alignment = ScratchpadAlignment::Top;
+        assert_eq!(
+            registry.forget_changed_geometry(&old, &new),
+            vec!["terminal".to_string()]
+        );
+        assert_eq!(registry.get("terminal").unwrap().geometry, None);
     }
 
     #[test]
@@ -988,7 +1091,7 @@ mod tests {
             10,
             Some(5),
             DisplayId(1),
-            frame,
+            (frame, None),
             Some("zsh"),
         );
         let entry = registry.get("terminal").unwrap();
