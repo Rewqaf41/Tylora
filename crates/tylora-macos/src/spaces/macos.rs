@@ -81,8 +81,12 @@ impl NativeSpaceSwitcher {
                 "Accessibility permission is required to post Dock gesture events".into(),
             ));
         }
-        let mut steps = 0;
-        while steps < 12 && started.elapsed() < Duration::from_secs(12) {
+        // Jump the whole distance at once with instant swipes; the Dock
+        // never settles on the Desktops in between. If they have no effect
+        // (another macOS release), fall back to animated one-step swipes.
+        let mut instant = true;
+        let mut rounds = 0;
+        while rounds < 12 && started.elapsed() < Duration::from_secs(12) {
             if SWITCH_GENERATION.load(Ordering::Acquire) != generation {
                 return Err(SpaceError::SwitchCancelled);
             }
@@ -93,42 +97,56 @@ impl NativeSpaceSwitcher {
                     source: initial,
                     target,
                     display,
-                    backend: "dock_gesture",
+                    backend: if instant {
+                        "instant_dock_gesture"
+                    } else {
+                        "dock_gesture"
+                    },
                     elapsed_ms: started.elapsed().as_millis(),
                     confirmed: true,
                 });
             }
-            let (expected, sign) = gesture_step(&order.ids(), current, target)?;
-            post_gesture(sign)?;
-            let step_deadline = Instant::now() + Duration::from_secs(2);
+            let (distance, sign) = gesture_distance(&order.ids(), current, target)?;
+            if instant {
+                post_instant_jump(sign, distance)?;
+            } else {
+                post_gesture(sign)?;
+            }
+            let deadline =
+                Instant::now() + Duration::from_millis(if instant { 1500 } else { 2000 });
             loop {
                 if SWITCH_GENERATION.load(Ordering::Acquire) != generation {
                     return Err(SpaceError::SwitchCancelled);
                 }
-                if let Ok(order) = backend.display_order_for(display) {
-                    if order.active == expected || order.active == target {
-                        break;
-                    }
-                    if order.active != current {
-                        return Err(SpaceError::VerificationFailed);
-                    }
+                // Any movement counts: a partial jump continues from there.
+                if backend
+                    .display_order_for(display)
+                    .is_ok_and(|order| order.active != current)
+                {
+                    break;
                 }
-                if Instant::now() >= step_deadline {
-                    return Err(SpaceError::SwitchTimeout);
+                if Instant::now() >= deadline {
+                    if !instant {
+                        return Err(SpaceError::SwitchTimeout);
+                    }
+                    instant = false;
+                    break;
                 }
-                thread::sleep(Duration::from_millis(25));
+                thread::sleep(Duration::from_millis(10));
             }
-            steps += 1;
+            rounds += 1;
         }
         Err(SpaceError::SwitchTimeout)
     }
 }
 
-fn gesture_step(
+/// How many Spaces separate `current` from `target` in the display's
+/// Mission Control order, and the swipe direction (+1 towards the end).
+fn gesture_distance(
     ordered: &[NativeSpaceId],
     current: NativeSpaceId,
     target: NativeSpaceId,
-) -> Result<(NativeSpaceId, f64), SpaceError> {
+) -> Result<(usize, f64), SpaceError> {
     let from = ordered
         .iter()
         .position(|id| *id == current)
@@ -139,14 +157,11 @@ fn gesture_step(
         .ok_or(SpaceError::Unsupported(
             "target native Space no longer exists on this display".into(),
         ))?;
-    if from == to {
-        return Err(SpaceError::VerificationFailed);
+    match from.cmp(&to) {
+        std::cmp::Ordering::Equal => Err(SpaceError::VerificationFailed),
+        std::cmp::Ordering::Less => Ok((to - from, 1.0)),
+        std::cmp::Ordering::Greater => Ok((from - to, -1.0)),
     }
-    Ok(if from < to {
-        (ordered[from + 1], 1.0)
-    } else {
-        (ordered[from - 1], -1.0)
-    })
 }
 
 #[cfg(test)]
@@ -156,19 +171,19 @@ mod gesture_tests {
         NativeSpaceId(id)
     }
     #[test]
-    fn gesture_direction_tracks_current_order_and_deleted_target_fails() {
+    fn gesture_distance_tracks_current_order_and_deleted_target_fails() {
         let original = vec![space(4), space(7), space(5)];
         assert_eq!(
-            gesture_step(&original, NativeSpaceId(4), NativeSpaceId(5)).unwrap(),
-            (NativeSpaceId(7), 1.0)
+            gesture_distance(&original, NativeSpaceId(4), NativeSpaceId(5)).unwrap(),
+            (2, 1.0)
         );
         let reordered = vec![space(5), space(4), space(7)];
         assert_eq!(
-            gesture_step(&reordered, NativeSpaceId(4), NativeSpaceId(5)).unwrap(),
-            (NativeSpaceId(5), -1.0)
+            gesture_distance(&reordered, NativeSpaceId(4), NativeSpaceId(5)).unwrap(),
+            (1, -1.0)
         );
         assert!(matches!(
-            gesture_step(&reordered, NativeSpaceId(4), NativeSpaceId(99)),
+            gesture_distance(&reordered, NativeSpaceId(4), NativeSpaceId(99)),
             Err(SpaceError::Unsupported(_))
         ));
     }
@@ -193,6 +208,34 @@ fn switch_lock() -> Result<File, SpaceError> {
         thread::sleep(Duration::from_millis(20));
     }
     Ok(file)
+}
+
+/// Swipes `steps` Spaces towards `sign` without the Dock's sliding
+/// animation, the form InstantSpaceSwitcher uses up to macOS 26: per step a
+/// began, changed and ended Dock swipe with an almost zero progress (nothing
+/// left to animate) and a high velocity that commits it, all posted back to
+/// back. The velocity grows with the distance, as there.
+fn post_instant_jump(sign: f64, steps: usize) -> Result<(), SpaceError> {
+    let velocity = 2000.0 * steps as f64 * sign;
+    for _ in 0..steps {
+        for phase in [1, 2, 4] {
+            let event = OwnedCF(unsafe { CGEventCreate(ptr::null()) });
+            if event.0.is_null() {
+                return Err(SpaceError::QueryFailed("CGEventCreate"));
+            }
+            unsafe {
+                CGEventSetIntegerValueField(event.0, 55, 30); // Dock control event
+                CGEventSetIntegerValueField(event.0, 110, 23); // Dock swipe HID type
+                CGEventSetIntegerValueField(event.0, 132, phase);
+                CGEventSetDoubleValueField(event.0, 124, 0.000016 * sign);
+                CGEventSetIntegerValueField(event.0, 123, 1); // horizontal
+                CGEventSetDoubleValueField(event.0, 129, velocity);
+                CGEventSetDoubleValueField(event.0, 130, velocity);
+                CGEventPost(1, event.0); // session event tap
+            }
+        }
+    }
+    Ok(())
 }
 
 fn post_gesture(sign: f64) -> Result<(), SpaceError> {
