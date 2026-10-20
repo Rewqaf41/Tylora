@@ -3654,6 +3654,22 @@ impl DisplayState {
         windows: Vec<WindowSnapshot>,
     ) -> bool {
         let mut windows = windows;
+        // A Layout Zoom target fills the whole work area, which on a display
+        // without menu bar or Dock is the whole display: the AX worker then
+        // sees "covers the display" and reports it unmanaged. Only tiled
+        // windows are zoomed, so it stays tiled (before zoom upkeep below).
+        for window in &mut windows {
+            if window.mode == tylora_core::registry::ManagementMode::Unmanaged
+                && window.lifecycle != tylora_core::registry::WindowLifecycle::Minimized
+                && window.cg_window_id.is_some_and(|cg| {
+                    self.layout_zoom
+                        .values()
+                        .any(|zoom| zoom.cg_window_id == cg && zoom.id.process == window.id.process)
+                })
+            {
+                window.mode = tylora_core::registry::ManagementMode::Tiled;
+            }
+        }
         self.pending_display.retain(|cg, pending| {
             pending.verified
                 || pending.prepared.id.process != process
