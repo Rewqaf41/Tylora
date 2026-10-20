@@ -941,7 +941,7 @@ impl Worker {
                             return;
                         }
                     }
-                    Ok(ManagedCommand::Focus(window)) => match self.focus(window) {
+                    Ok(ManagedCommand::Focus(window)) => match self.timed_focus(window) {
                         Ok(()) => {
                             let _ = self.events.send(ManagedEvent::FocusApplied(window));
                         }
@@ -1581,6 +1581,17 @@ impl Worker {
         })
     }
 
+    fn timed_focus(&self, id: ManagedWindowId) -> Result<(), i32> {
+        let started = Instant::now();
+        let result = self.focus(id);
+        debug!(
+            pid = id.process.pid,
+            elapsed_us = started.elapsed().as_micros(),
+            "AX focus completed"
+        );
+        result
+    }
+
     fn focus(&self, id: ManagedWindowId) -> Result<(), i32> {
         let watch = self.apps.get(&id.process.pid).ok_or(-1)?;
         if watch.process != id.process {
@@ -1606,6 +1617,15 @@ impl Worker {
         let code = unsafe { AXUIElementSetAttributeValue(watch.app.0, key.0, handle.element.0) };
         if code != 0 {
             return Err(code);
+        }
+        // Activating through NSRunningApplication from this thread blocks
+        // for about a second waiting on the Dock, stalling every geometry
+        // write and animation queued behind it. WindowServer makes the same
+        // window key and its app frontmost in milliseconds.
+        if crate::spaces::ax_cg_window(handle.element.0)
+            .is_some_and(|window| crate::spaces::focus_window(id.process.pid, window).is_ok())
+        {
+            return Ok(());
         }
         if let Some(app) = unsafe {
             objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(
