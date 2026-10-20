@@ -18,11 +18,51 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tracing::{debug, info, warn};
+use tylora_core::animation::{
+    AnimationConfig, AnimationEvent, AnimationMetrics, AnimationPolicy, AnimationScheduler,
+    Decision, Frame, SlideDirection, StartRequest, Started, Transition, WindowConstraints,
+};
 use tylora_core::coordinator::ApplyCommand;
 use tylora_core::registry::{
     ManagedWindowId, ManagementMode, ProcessInstance, WindowLifecycle, WindowSnapshot,
 };
 pub const VISIBILITY_ROLLBACK_FAILED: i32 = -32001;
+/// `Applied` error: an animation was stopped before reaching its target
+/// (window dragged by the user). The coordinator retries after its backoff.
+pub const ANIMATION_CANCELLED: i32 = -32002;
+/// Frame writes this slow, twice in a row, mean the app cannot keep up
+/// with an animation; its windows then move instantly for a while. One
+/// write slower than `STALLED_FRAME_WRITE` is enough. A first resize of an
+/// Electron window often takes ~50 ms once and is no reason to give up.
+const SLOW_FRAME_WRITE: Duration = Duration::from_millis(40);
+const STALLED_FRAME_WRITE: Duration = Duration::from_millis(120);
+const SLOW_APPLICATION_COOLDOWN: Duration = Duration::from_secs(600);
+static ANIMATION_METRICS: Mutex<Option<AnimationMetrics>> = Mutex::new(None);
+static ANIMATION_STATE: Mutex<Option<AnimationState>> = Mutex::new(None);
+
+/// What the AX worker currently does with animations, for diagnostics.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnimationState {
+    pub policy_enabled: bool,
+    pub backend: tylora_core::animation::ResolvedBackend,
+    pub reduce_motion: bool,
+    pub accessibility: bool,
+    pub slow_applications: Vec<i32>,
+    pub instant_reasons: HashMap<String, u64>,
+}
+
+/// Counters of the AX worker's animation scheduler (zero before it ran).
+pub fn animation_metrics() -> AnimationMetrics {
+    ANIMATION_METRICS
+        .lock()
+        .ok()
+        .and_then(|metrics| *metrics)
+        .unwrap_or_default()
+}
+
+pub fn animation_state() -> Option<AnimationState> {
+    ANIMATION_STATE.lock().ok().and_then(|state| state.clone())
+}
 static POINTER_FOCUS_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 static AX_RUN_LOOP: Mutex<Option<usize>> = Mutex::new(None);
 pub fn suppress_pointer_focus(value: bool) {
@@ -401,6 +441,21 @@ extern "C" fn display_callback(_display: u32, _flags: u32, user: *mut c_void) {
 #[derive(Debug, Clone)]
 pub enum ManagedCommand {
     Apply(ApplyCommand),
+    /// Like `Apply`, but `event` caused it: the worker animates the change
+    /// when the animation policy allows, and applies it at once otherwise.
+    /// `Applied` is reported when the target is reached (or abandoned).
+    Animate {
+        command: ApplyCommand,
+        event: AnimationEvent,
+    },
+    /// Animation settings and the system Reduce Motion state.
+    Animations {
+        config: AnimationConfig,
+        reduce_motion: bool,
+    },
+    /// Ends every running animation at its target now (Space switch,
+    /// display change); windows never stay at intermediate frames.
+    FinishAnimations,
     Rehome {
         id: ManagedWindowId,
         target: Rect,
@@ -434,6 +489,18 @@ pub enum ManagedCommand {
         cg_window_id: u32,
         frame: Option<Rect>,
         focus: bool,
+        /// Glide into `frame` (scratchpad show) when animations allow it;
+        /// `Presented` then comes when the window arrives.
+        animate: bool,
+    },
+    /// Moves a visible scratchpad window a short way towards `direction`
+    /// before it is parked, when animations allow it; answered by `Slid`
+    /// (at once, without motion, when they do not).
+    Slide {
+        request: u64,
+        pid: i32,
+        cg_window_id: u32,
+        direction: SlideDirection,
     },
     /// Windows a Scrolling layout deliberately keeps outside the viewport.
     /// `RestoreVisibility` leaves them parked; `Stop` restores everything.
@@ -481,6 +548,10 @@ pub enum ManagedEvent {
         request: u64,
         result: Result<Rect, i32>,
     },
+    Slid {
+        request: u64,
+        result: Result<(), i32>,
+    },
     QueueOverflow,
 }
 
@@ -504,6 +575,18 @@ impl ManagedAdapter {
             commands: command_tx,
             events: event_rx,
         }
+    }
+
+    /// Sends a command and wakes the AX worker at once instead of on its
+    /// next 50 ms poll: geometry changes and animations start immediately.
+    pub fn send_now(&self, command: ManagedCommand) -> Result<(), TrySendError<ManagedCommand>> {
+        self.commands.try_send(command)?;
+        if let Ok(guard) = AX_RUN_LOOP.lock() {
+            if let Some(pointer) = *guard {
+                unsafe { CFRunLoopWakeUp(pointer as CFRef) };
+            }
+        }
+        Ok(())
     }
 
     pub fn request_pointer_focus(
@@ -758,6 +841,29 @@ struct Worker {
     next_reconcile: Instant,
     last_wall_tick: SystemTime,
     last_gap_scan: SystemTime,
+    /// The only animation scheduler: every geometry write stays on this
+    /// thread, so frames of one window never race.
+    animations: AnimationScheduler<Completion>,
+    animation_policy: AnimationPolicy,
+    /// Apps whose frame writes were too slow to animate, until when.
+    slow_pids: HashMap<i32, Instant>,
+    /// AX notifications caused by our own frame writes; scanned once the
+    /// app's animations end instead of on every frame.
+    deferred_scans: HashSet<i32>,
+    instant_reasons: HashMap<String, u64>,
+    /// Consecutive slow frame writes per app.
+    slow_strikes: HashMap<i32, u8>,
+}
+
+/// What a finished animation fulfils.
+#[derive(Debug, Clone, Copy)]
+enum Completion {
+    /// A layout target: reported as `Applied` like an instant apply.
+    Apply(ApplyCommand),
+    /// A scratchpad show: reported as `Presented` with the final frame.
+    Present { request: u64 },
+    /// A scratchpad leaving before it is parked: reported as `Slid`.
+    Slide { request: u64 },
 }
 
 impl Worker {
@@ -793,6 +899,12 @@ impl Worker {
             next_reconcile: Instant::now(),
             last_wall_tick: SystemTime::now(),
             last_gap_scan: SystemTime::UNIX_EPOCH,
+            animations: AnimationScheduler::new(AnimationConfig::default().frame_interval()),
+            animation_policy: AnimationPolicy::default(),
+            slow_pids: HashMap::new(),
+            deferred_scans: HashSet::new(),
+            instant_reasons: HashMap::new(),
+            slow_strikes: HashMap::new(),
         }
     }
 
@@ -826,46 +938,22 @@ impl Worker {
             for _ in 0..64 {
                 match self.commands.try_recv() {
                     Ok(ManagedCommand::Apply(command)) => {
-                        let start = Instant::now();
-                        let result = self.apply(command);
-                        debug!(
-                            pid = command.id.process.pid,
-                            token = command.id.token,
-                            elapsed_us = start.elapsed().as_micros(),
-                            "AX geometry write completed"
-                        );
-                        match result {
-                            Ok(None) => self
-                                .pending_applies
-                                .push((command, Instant::now() + Duration::from_millis(200))),
-                            Ok(Some(actual)) => {
-                                self.track_offscreen(command.id, actual);
-                                if self
-                                    .events
-                                    .send(ManagedEvent::Applied {
-                                        command,
-                                        result: Ok(actual),
-                                    })
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            Err(code) => {
-                                if self
-                                    .events
-                                    .send(ManagedEvent::Applied {
-                                        command,
-                                        result: Err(code),
-                                    })
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                if code != INACTIVE_SPACE {
-                                    self.scan_pid(command.id.process.pid);
-                                }
-                            }
+                        if !self.apply_now(command) {
+                            return;
+                        }
+                    }
+                    Ok(ManagedCommand::Animate { command, event }) => {
+                        if !self.animate(command, event) {
+                            return;
+                        }
+                    }
+                    Ok(ManagedCommand::Animations {
+                        config,
+                        reduce_motion,
+                    }) => self.configure_animations(config, reduce_motion),
+                    Ok(ManagedCommand::FinishAnimations) => {
+                        if !self.finish_all_animations() {
+                            return;
                         }
                     }
                     Ok(ManagedCommand::Rehome { id, target }) => {
@@ -901,6 +989,8 @@ impl Worker {
                         }
                     }
                     Ok(ManagedCommand::DragFrame { id, target }) => {
+                        // The user's hand wins over any running transition.
+                        self.cancel_animation(id);
                         let command = ApplyCommand {
                             id,
                             generation: 0,
@@ -952,7 +1042,10 @@ impl Worker {
                     Ok(ManagedCommand::FocusAt { id, cg_id }) => {
                         // Check at execution time: a queued request must not focus a
                         // window which the pointer has already left or which was hidden.
-                        let result = if !POINTER_FOCUS_SUPPRESSED.load(Ordering::Acquire)
+                        // Windows moving under a still pointer must not steal
+                        // focus: pointer requests wait until motion ends.
+                        let result = if self.animations.is_idle()
+                            && !POINTER_FOCUS_SUPPRESSED.load(Ordering::Acquire)
                             && crate::current_pointer().is_some_and(|current| {
                                 crate::topmost_window_at(current) == Some((cg_id, id.process.pid))
                             }) {
@@ -998,11 +1091,28 @@ impl Worker {
                         cg_window_id,
                         frame,
                         focus,
+                        animate,
                     }) => {
-                        let result = self.present(pid, cg_window_id, frame, focus);
-                        let _ = self
-                            .events
-                            .send(ManagedEvent::Presented { request, result });
+                        let animated = animate
+                            && frame.is_some_and(|frame| {
+                                self.present_animated(request, pid, cg_window_id, frame, focus)
+                            });
+                        if !animated {
+                            let result = self.present(pid, cg_window_id, frame, focus);
+                            let _ = self
+                                .events
+                                .send(ManagedEvent::Presented { request, result });
+                        }
+                    }
+                    Ok(ManagedCommand::Slide {
+                        request,
+                        pid,
+                        cg_window_id,
+                        direction,
+                    }) => {
+                        if !self.slide(request, pid, cg_window_id, direction) {
+                            return;
+                        }
                     }
                     Ok(ManagedCommand::SetParked(ids)) => {
                         self.parked = ids.into_iter().collect();
@@ -1024,6 +1134,8 @@ impl Worker {
                 }
             }
             if stop {
+                // No window may stay at an intermediate frame after stop.
+                let _ = self.finish_all_animations();
                 if let Err(code) = self.restore_offscreen(&HashSet::new()) {
                     warn!(
                         code,
@@ -1063,11 +1175,21 @@ impl Worker {
                     self.scan_pid(command.id.process.pid);
                 }
             }
-            let mut dirty = HashSet::new();
+            if !self.tick_animations() {
+                return;
+            }
+            let mut dirty = std::mem::take(&mut self.deferred_scans);
             while let Ok(pid) = self.raw_rx.try_recv() {
                 dirty.insert(pid);
             }
+            // Our own frame writes notify AXMoved/AXResized: scan those apps
+            // once their animations end, not on every frame.
+            let animating: HashSet<i32> = self.animations.ids().map(|id| id.process.pid).collect();
             for pid in dirty {
+                if animating.contains(&pid) {
+                    self.deferred_scans.insert(pid);
+                    continue;
+                }
                 debug!(pid, "AX notification received; scanning process");
                 self.scan_pid(pid);
             }
@@ -1095,9 +1217,16 @@ impl Worker {
                 self.scan_all();
                 self.next_reconcile = Instant::now() + Duration::from_secs(30);
             }
-            // Pumps AXObserver sources. Callback only enqueues PID.
+            // Pumps AXObserver sources. Callback only enqueues PID. While
+            // animating, wake for the next frame; idle, poll as before.
+            let wait = self.animations.next_deadline().map_or(0.05, |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs_f64()
+                    .min(0.05)
+            });
             unsafe {
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, 1);
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, wait, 1);
             }
         }
     }
@@ -2233,6 +2362,545 @@ impl Worker {
             return Err(size_code);
         }
         Ok(None)
+    }
+}
+
+/// Animation Engine integration: the scheduler decides the frames, these
+/// methods write them. Intermediate frames are never read back; the final
+/// one goes through `apply` and is verified like any instant change.
+impl Worker {
+    /// Reports an apply result to the coordinator. False once the event
+    /// channel is gone (daemon stopping).
+    fn report_apply(&mut self, command: ApplyCommand, result: Result<Option<Rect>, i32>) -> bool {
+        match result {
+            Ok(None) => {
+                self.pending_applies
+                    .push((command, Instant::now() + Duration::from_millis(200)));
+                true
+            }
+            Ok(Some(actual)) => {
+                self.track_offscreen(command.id, actual);
+                self.events
+                    .send(ManagedEvent::Applied {
+                        command,
+                        result: Ok(actual),
+                    })
+                    .is_ok()
+            }
+            Err(code) => {
+                let sent = self
+                    .events
+                    .send(ManagedEvent::Applied {
+                        command,
+                        result: Err(code),
+                    })
+                    .is_ok();
+                if code != INACTIVE_SPACE && code != ANIMATION_CANCELLED {
+                    self.scan_pid(command.id.process.pid);
+                }
+                sent
+            }
+        }
+    }
+
+    /// Instant apply. A running transition of the window is superseded by
+    /// this newer target and dropped without a report of its own.
+    fn apply_now(&mut self, command: ApplyCommand) -> bool {
+        let _ = self.animations.cancel(command.id);
+        let start = Instant::now();
+        let result = self.apply(command);
+        debug!(
+            pid = command.id.process.pid,
+            token = command.id.token,
+            elapsed_us = start.elapsed().as_micros(),
+            "AX geometry write completed"
+        );
+        self.publish_animation_metrics();
+        self.report_apply(command, result)
+    }
+
+    fn handle_for(&self, id: ManagedWindowId) -> Option<&AxHandle> {
+        let watch = self.apps.get(&id.process.pid)?;
+        (watch.process == id.process)
+            .then(|| watch.handles.iter().find(|handle| handle.id == id))
+            .flatten()
+    }
+
+    /// Animates `command` when the policy allows it, else applies it now.
+    fn animate(&mut self, command: ApplyCommand, event: AnimationEvent) -> bool {
+        let id = command.id;
+        // A running transition continues from where it is drawn now.
+        let from = match self.animations.get(id) {
+            Some(running) => Some(running.current),
+            None => self
+                .handle_for(id)
+                .and_then(|handle| ax_rect(handle.element.0).ok()),
+        };
+        let Some(from) = from else {
+            return self.apply_now(command);
+        };
+        let checked = Instant::now();
+        let constraints = self.window_constraints(id, from, command.target);
+        debug!(
+            elapsed_us = checked.elapsed().as_micros(),
+            ?constraints,
+            "animation constraints checked"
+        );
+        match self
+            .animation_policy
+            .decide(Some(event), from, command.target, constraints)
+        {
+            Decision::Instant(reason) => {
+                debug!(
+                    pid = id.process.pid,
+                    token = id.token,
+                    ?event,
+                    ?reason,
+                    "geometry applied instantly"
+                );
+                *self
+                    .instant_reasons
+                    .entry(format!("{reason:?}"))
+                    .or_default() += 1;
+                self.animations.metrics_mut().instant += 1;
+                self.apply_now(command)
+            }
+            Decision::Animate(curve) => {
+                debug!(pid = id.process.pid, token = id.token, ?event, ?from, to = ?command.target, "animation started");
+                let started = self.animations.start(
+                    StartRequest {
+                        id,
+                        generation: command.generation,
+                        version: command.version,
+                        from,
+                        to: command.target,
+                        curve,
+                        completion: Completion::Apply(command),
+                    },
+                    Instant::now(),
+                );
+                // A superseded layout target needs no report: the
+                // coordinator already waits for the newer version.
+                if let Started::Retargeted { superseded } = started {
+                    debug!(
+                        pid = id.process.pid,
+                        token = id.token,
+                        "animation retargeted"
+                    );
+                    self.report_superseded(superseded, from);
+                }
+                // The first frame goes out in this iteration.
+                self.tick_animations()
+            }
+        }
+    }
+
+    fn window_constraints(&self, id: ManagedWindowId, from: Rect, to: Rect) -> WindowConstraints {
+        let displays = display_bounds();
+        let window = self
+            .handle_for(id)
+            .and_then(|handle| crate::spaces::ax_cg_window(handle.element.0));
+        WindowConstraints {
+            slow_application: self
+                .slow_pids
+                .get(&id.process.pid)
+                .is_some_and(|until| Instant::now() < *until),
+            offscreen: self.parked.contains(&id)
+                || mostly_offscreen(from, &displays)
+                || mostly_offscreen(to, &displays),
+            cross_display: display_for(from) != display_for(to),
+            inactive_space: window
+                .is_some_and(|window| !crate::spaces::window_on_active_space(window)),
+            dragging: false,
+        }
+    }
+
+    fn configure_animations(&mut self, config: AnimationConfig, reduce_motion: bool) {
+        self.animation_policy = AnimationPolicy {
+            config,
+            reduce_motion,
+            accessibility: super::trusted(),
+        };
+        self.animations.set_interval(config.frame_interval());
+        // Settings that rule animations out end the running ones at once.
+        let still = self.animation_policy.decide(
+            Some(AnimationEvent::LayoutChange),
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            Rect {
+                x: 100.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            WindowConstraints::default(),
+        );
+        if matches!(still, Decision::Instant(_)) {
+            let _ = self.finish_all_animations();
+        }
+        self.publish_animation_metrics();
+    }
+
+    /// Writes the due frames. False once the event channel is gone.
+    fn tick_animations(&mut self) -> bool {
+        if self.animations.next_deadline().is_none() {
+            return true;
+        }
+        let frames = self.animations.frames(Instant::now());
+        let mut ok = true;
+        for frame in frames {
+            match frame {
+                Frame::Step {
+                    id,
+                    frame,
+                    previous,
+                } => match self.write_step(id, frame, previous) {
+                    Ok(latency) => {
+                        self.animations.metrics_mut().record_write(latency);
+                        let pid = id.process.pid;
+                        let strikes = if latency > SLOW_FRAME_WRITE {
+                            let strikes = self.slow_strikes.entry(pid).or_default();
+                            *strikes = strikes.saturating_add(1);
+                            *strikes
+                        } else {
+                            self.slow_strikes.remove(&pid);
+                            0
+                        };
+                        if strikes >= 2 || latency > STALLED_FRAME_WRITE {
+                            // The app cannot keep up: finish this window now
+                            // and move its windows instantly for a while.
+                            warn!(
+                                pid,
+                                latency_ms = latency.as_millis(),
+                                "animation frame writes too slow; this app moves instantly for now"
+                            );
+                            self.slow_strikes.remove(&pid);
+                            self.slow_pids
+                                .insert(pid, Instant::now() + SLOW_APPLICATION_COOLDOWN);
+                            if let Some(transition) = self.animations.cancel(id) {
+                                ok &= self.finish_transition(transition);
+                            }
+                        }
+                    }
+                    Err(code) => {
+                        debug!(
+                            pid = id.process.pid,
+                            token = id.token,
+                            code,
+                            "animation frame write failed"
+                        );
+                        // The final apply reports what really happened.
+                        if let Some(transition) = self.animations.fail(id) {
+                            ok &= self.finish_transition(transition);
+                        }
+                    }
+                },
+                Frame::Final(transition) => ok &= self.finish_transition(transition),
+            }
+        }
+        self.publish_animation_metrics();
+        ok
+    }
+
+    /// Writes the target of a transition and reports it like an apply.
+    fn finish_transition(&mut self, transition: Transition<Completion>) -> bool {
+        debug!(
+            pid = transition.id.process.pid,
+            token = transition.id.token,
+            status = ?transition.status,
+            elapsed_ms = transition.started.elapsed().as_millis(),
+            "animation finished"
+        );
+        let command = ApplyCommand {
+            id: transition.id,
+            generation: transition.generation,
+            version: transition.version,
+            target: transition.to,
+        };
+        match transition.completion {
+            Completion::Apply(command) => {
+                let result = self.apply(command);
+                if let Ok(Some(actual)) = result {
+                    self.animations
+                        .metrics_mut()
+                        .record_final_error(command.target, actual);
+                }
+                self.report_apply(command, result)
+            }
+            Completion::Present { request } => {
+                let result = self
+                    .apply(command)
+                    .and_then(|_| self.read_geometry(command));
+                if let Ok(actual) = result {
+                    self.animations
+                        .metrics_mut()
+                        .record_final_error(command.target, actual);
+                }
+                self.events
+                    .send(ManagedEvent::Presented { request, result })
+                    .is_ok()
+            }
+            Completion::Slide { request } => {
+                let result = self.apply(command).map(|_| ());
+                self.events
+                    .send(ManagedEvent::Slid { request, result })
+                    .is_ok()
+            }
+        }
+    }
+
+    /// A transition replaced by a newer target of the same window. Layout
+    /// targets are superseded silently; a scratchpad step still answers, at
+    /// the frame it reached, so its operation never hangs.
+    fn report_superseded(&mut self, superseded: Completion, reached: Rect) {
+        match superseded {
+            Completion::Apply(_) => {}
+            Completion::Present { request } => {
+                let _ = self.events.send(ManagedEvent::Presented {
+                    request,
+                    result: Ok(reached),
+                });
+            }
+            Completion::Slide { request } => {
+                let _ = self.events.send(ManagedEvent::Slid {
+                    request,
+                    result: Ok(()),
+                });
+            }
+        }
+    }
+
+    /// The managed id of `pid`'s window `cg_window_id`, scanning the app if
+    /// it is not known yet (it may just have arrived from another Space).
+    fn window_by_cg(&mut self, pid: i32, cg_window_id: u32) -> Option<ManagedWindowId> {
+        let find = |worker: &Self| {
+            worker.apps.get(&pid).and_then(|watch| {
+                watch
+                    .handles
+                    .iter()
+                    .find(|handle| {
+                        crate::spaces::ax_cg_window(handle.element.0) == Some(cg_window_id)
+                    })
+                    .map(|handle| handle.id)
+            })
+        };
+        find(self).or_else(|| {
+            self.scan_pid(pid);
+            find(self)
+        })
+    }
+
+    /// Scratchpad show that glides into `frame`. False when the policy wants
+    /// it instant; the caller then presents it the usual way.
+    fn present_animated(
+        &mut self,
+        request: u64,
+        pid: i32,
+        cg_window_id: u32,
+        frame: Rect,
+        focus: bool,
+    ) -> bool {
+        // A window that just arrived from another Space has no handle yet.
+        self.scan_pid(pid);
+        let Some(id) = self.window_by_cg(pid, cg_window_id) else {
+            return false;
+        };
+        let Some(from) = self
+            .handle_for(id)
+            .and_then(|handle| ax_rect(handle.element.0).ok())
+        else {
+            return false;
+        };
+        let constraints = self.window_constraints(id, from, frame);
+        let Decision::Animate(curve) = self.animation_policy.decide(
+            Some(AnimationEvent::Scratchpad),
+            from,
+            frame,
+            constraints,
+        ) else {
+            return false;
+        };
+        // Focus first: the window is usable while it is still moving.
+        if focus {
+            if let Err(code) = self.focus(id) {
+                let _ = self.events.send(ManagedEvent::Presented {
+                    request,
+                    result: Err(code),
+                });
+                return true;
+            }
+        }
+        let started = self.animations.start(
+            StartRequest {
+                id,
+                generation: 0,
+                version: 0,
+                from,
+                to: frame,
+                curve,
+                completion: Completion::Present { request },
+            },
+            Instant::now(),
+        );
+        if let Started::Retargeted { superseded } = started {
+            self.report_superseded(superseded, from);
+        }
+        let _ = self.tick_animations();
+        true
+    }
+
+    /// Scratchpad hide, first part: a short glide out before parking.
+    fn slide(
+        &mut self,
+        request: u64,
+        pid: i32,
+        cg_window_id: u32,
+        direction: SlideDirection,
+    ) -> bool {
+        let done = |worker: &Self, result| {
+            worker
+                .events
+                .send(ManagedEvent::Slid { request, result })
+                .is_ok()
+        };
+        let Some(id) = self.window_by_cg(pid, cg_window_id) else {
+            return done(self, Err(-25202));
+        };
+        let Some(from) = self
+            .handle_for(id)
+            .and_then(|handle| ax_rect(handle.element.0).ok())
+        else {
+            return done(self, Err(-25202));
+        };
+        let to = direction.offstage(from);
+        let constraints = self.window_constraints(id, from, to);
+        match self
+            .animation_policy
+            .decide(Some(AnimationEvent::Scratchpad), from, to, constraints)
+        {
+            // No motion: park the window where it is.
+            Decision::Instant(_) => done(self, Ok(())),
+            Decision::Animate(curve) => {
+                let started = self.animations.start(
+                    StartRequest {
+                        id,
+                        generation: 0,
+                        version: 0,
+                        from,
+                        to,
+                        curve,
+                        completion: Completion::Slide { request },
+                    },
+                    Instant::now(),
+                );
+                if let Started::Retargeted { superseded } = started {
+                    self.report_superseded(superseded, from);
+                }
+                self.tick_animations()
+            }
+        }
+    }
+
+    /// Ends every transition at its target (Space switch, display change,
+    /// settings change, stop).
+    fn finish_all_animations(&mut self) -> bool {
+        let mut ok = true;
+        for transition in self.animations.cancel_all() {
+            ok &= self.finish_transition(transition);
+        }
+        self.publish_animation_metrics();
+        ok
+    }
+
+    /// Stops a transition where it is, for the user's drag. Its layout target
+    /// is reported as abandoned so the coordinator plans again afterwards.
+    fn cancel_animation(&mut self, id: ManagedWindowId) {
+        let Some(transition) = self.animations.cancel(id) else {
+            return;
+        };
+        match transition.completion {
+            Completion::Apply(command) => {
+                let _ = self.events.send(ManagedEvent::Applied {
+                    command,
+                    result: Err(ANIMATION_CANCELLED),
+                });
+            }
+            // The user took the scratchpad mid-glide: it is where they hold it.
+            other => self.report_superseded(other, transition.current),
+        }
+        self.publish_animation_metrics();
+    }
+
+    /// One intermediate frame: only the attributes that change, never read
+    /// back. Growing windows move first and shrinking ones resize first, so
+    /// no step pushes the window against a display edge.
+    fn write_step(
+        &self,
+        id: ManagedWindowId,
+        frame: Rect,
+        previous: Rect,
+    ) -> Result<Duration, i32> {
+        let handle = self.handle_for(id).ok_or(-25202)?;
+        let element = handle.element.0;
+        let started = Instant::now();
+        let set = |name: &'static CStr, kind: u32, value: *const c_void| -> Result<(), i32> {
+            let key = cf_string(name);
+            let value = OwnedCF(unsafe { AXValueCreate(kind, value) });
+            if key.0.is_null() || value.0.is_null() {
+                return Err(-1);
+            }
+            match unsafe { AXUIElementSetAttributeValue(element, key.0, value.0) } {
+                0 => Ok(()),
+                code => Err(code),
+            }
+        };
+        let position = CGPoint {
+            x: frame.x,
+            y: frame.y,
+        };
+        let size = CGSize {
+            width: frame.width,
+            height: frame.height,
+        };
+        let moves = frame.x != previous.x || frame.y != previous.y;
+        let resizes = frame.width != previous.width || frame.height != previous.height;
+        let grows = frame.width * frame.height > previous.width * previous.height;
+        if resizes && !grows {
+            set(c"AXSize", 2, (&size as *const CGSize).cast())?;
+        }
+        if moves {
+            set(c"AXPosition", 1, (&position as *const CGPoint).cast())?;
+        }
+        if resizes && grows {
+            set(c"AXSize", 2, (&size as *const CGSize).cast())?;
+        }
+        Ok(started.elapsed())
+    }
+
+    fn publish_animation_metrics(&self) {
+        if let Ok(mut metrics) = ANIMATION_METRICS.lock() {
+            *metrics = Some(self.animations.metrics());
+        }
+        if let Ok(mut state) = ANIMATION_STATE.lock() {
+            let now = Instant::now();
+            *state = Some(AnimationState {
+                policy_enabled: self.animation_policy.config.enabled,
+                backend: self.animation_policy.backend(),
+                reduce_motion: self.animation_policy.reduce_motion,
+                accessibility: self.animation_policy.accessibility,
+                slow_applications: self
+                    .slow_pids
+                    .iter()
+                    .filter(|(_, until)| now < **until)
+                    .map(|(pid, _)| *pid)
+                    .collect(),
+                instant_reasons: self.instant_reasons.clone(),
+            });
+        }
     }
 }
 

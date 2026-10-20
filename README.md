@@ -126,6 +126,31 @@ Mouse resize changes split ratios in BSP/Dwindle and the focused column width in
 
 Windows left mostly off screen are journaled in `$TMPDIR/tylora-<uid>.offscreen.json` (mode 0600). `tylora stop` brings them all back on screen; after a crash the next `tylora start` or an offline `tylora recover-windows` restores them, matching by process, frame and title. With the daemon running, `recover-windows` leaves columns the Scrolling layout parks on purpose — reach them by navigation or switch the workspace to BSP.
 
+## Animations
+
+Windows glide to their new frames when the layout changes: a window opens or closes, a layout command (swap, move, resize, layout switch), a gap change, the end of a mouse drag, Layout Zoom, Scrolling navigation, and scratchpads appearing or leaving. Space switches, display changes and mouse drags themselves stay instant, and so does any geometry without such a cause (reconciliation). The only way to move other apps' windows is Accessibility (`AXPosition`/`AXSize`), so there is no fading or scaling; how smooth it looks depends on the app (moves run near 60 fps, heavy resizes such as Electron's lower). See [architecture.md](architecture.md#animation-engine) for measurements and limits.
+
+```toml
+[animations]
+enabled = true
+backend = "auto"            # auto (Accessibility when granted) | accessibility | instant; native_experimental is unsupported
+duration_ms = 180           # 0–500; 0 is instant
+easing = "ease_out_cubic"   # linear | ease_out_cubic | ease_in_out_cubic | ease_out_quart | ease_out_expo
+preferred_fps = 60          # 15–240: how often frames are written, not a promise of what apps show
+respect_reduce_motion = true  # macOS Reduce Motion makes every move instant (the setting is only read)
+scratchpad_slide = "down"   # down (from above) | up | left | right
+
+[animations.events]
+window_open = true
+window_close = true
+layout_change = true
+layout_zoom = true
+scrolling = true
+scratchpad = true
+```
+
+Changes apply without a restart (also from Settings → Animations, whose preview animates demo rectangles only). Apps too slow to keep up (two frame writes over 40 ms, or one over 120 ms) move instantly for ten minutes. `tylora animations status` shows the settings, the backend in use, Reduce Motion, instant reasons and counters. On `stop`, running animations end at their targets.
+
 ## Application rules
 
 `[[rules]]` place windows of an application in a workspace or on a display and set their mode. Matching is deterministic: rules are visited by `priority` (higher first, then file order); each action (move, mode) comes from the first matching rule that sets it, and `stop = true` (default) ends the walk. Workspace and display always come from the same rule, so a window never gets two conflicting moves.

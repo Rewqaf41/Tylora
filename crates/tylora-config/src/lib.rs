@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fmt, fs, path::Path};
+pub use tylora_core::animation::{
+    AnimationConfig, AnimationEvents, BackendChoice, Easing, SlideDirection,
+};
 use tylora_core::commands::{Direction, StateCommand};
 pub use tylora_core::layout::{
     DwindleSettings, LayoutKind, ScrollingSettings, SplitOrientation, ViewportAlignment,
@@ -35,6 +38,8 @@ pub struct Config {
     pub resize_step: f64,
     pub cross_monitor_navigation: bool,
     pub disconnect_policy: DisconnectPolicy,
+    /// `[animations]`; files without it get the defaults.
+    pub animations: AnimationConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -411,6 +416,7 @@ impl Default for Config {
             resize_step: 50.0,
             cross_monitor_navigation: true,
             disconnect_policy: DisconnectPolicy::MoveToPrimary,
+            animations: AnimationConfig::default(),
         }
     }
 }
@@ -514,6 +520,7 @@ impl Config {
             }
         }
         self.scrolling.validate().map_err(ConfigError::Invalid)?;
+        self.animations.validate().map_err(ConfigError::Invalid)?;
         if !self.resize_step.is_finite() || self.resize_step <= 0.0 {
             return fail("resize_step must be positive");
         }
@@ -614,6 +621,25 @@ mod tests {
     #[test]
     fn defaults_validate() {
         Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn animations_parse_with_defaults_and_reject_bad_values() {
+        // Files written before animations existed keep working.
+        let old = Config::parse("version = 1\n").unwrap();
+        assert_eq!(old.animations, AnimationConfig::default());
+        let config = Config::parse(
+            "version = 1\n[animations]\nenabled = false\nduration_ms = 120\neasing = \"ease_out_expo\"\nbackend = \"instant\"\n[animations.events]\nscrolling = false\n",
+        )
+        .unwrap();
+        assert!(!config.animations.enabled);
+        assert_eq!(config.animations.duration_ms, 120);
+        assert_eq!(config.animations.easing, Easing::EaseOutExpo);
+        assert_eq!(config.animations.backend, BackendChoice::Instant);
+        assert!(!config.animations.events.scrolling && config.animations.events.layout_zoom);
+        assert!(Config::parse("version = 1\n[animations]\nduration_ms = 900\n").is_err());
+        assert!(Config::parse("version = 1\n[animations]\npreferred_fps = 1\n").is_err());
+        assert!(Config::parse("version = 1\n[animations]\neasing = \"bounce\"\n").is_err());
     }
 
     #[test]

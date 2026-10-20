@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod animation;
 pub mod commands;
 pub mod coordinator;
 pub mod layout;

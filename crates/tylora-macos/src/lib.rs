@@ -164,6 +164,56 @@ pub fn remove_spaces(
     }
 }
 
+/// The system "Reduce motion" accessibility setting. Read only; Tylora never
+/// changes it.
+pub fn reduce_motion() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// One animation backend and whether it can move windows here.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AnimationBackendInfo {
+    pub name: &'static str,
+    pub available: bool,
+    pub reason: Option<&'static str>,
+}
+
+/// Animation backends with their availability, measured facts rather than
+/// guesses: see `examples/animation_probe.rs` and architecture.md.
+pub fn animation_backends() -> Vec<AnimationBackendInfo> {
+    let trusted = accessibility_trusted();
+    vec![
+        AnimationBackendInfo {
+            name: "instant",
+            available: true,
+            reason: None,
+        },
+        AnimationBackendInfo {
+            name: "accessibility",
+            available: trusted,
+            reason: (!trusted).then_some("Accessibility permission is not granted"),
+        },
+        AnimationBackendInfo {
+            name: "native_experimental",
+            available: false,
+            reason: Some(
+                "WindowServer ignores geometry and alpha changes to other apps' windows \
+                 (SLSMoveWindow/SLSSetWindowAlpha return success without effect) unless \
+                 code runs inside the Dock, which needs SIP disabled",
+            ),
+        },
+    ]
+}
+
 pub fn current_pointer() -> Option<(f64, f64)> {
     #[cfg(target_os = "macos")]
     {
@@ -205,8 +255,9 @@ pub use native::input::{
 };
 #[cfg(target_os = "macos")]
 pub use native::managed::{
-    bundle_identifier, raise_window, running_applications, suppress_pointer_focus, work_areas,
-    DisplayEvents, ManagedAdapter, ManagedCommand, ManagedEvent, RunningApplication, WorkArea,
+    animation_metrics, animation_state, bundle_identifier, raise_window, running_applications,
+    suppress_pointer_focus, work_areas, AnimationState, DisplayEvents, ManagedAdapter,
+    ManagedCommand, ManagedEvent, RunningApplication, WorkArea, ANIMATION_CANCELLED,
     INACTIVE_SPACE, VISIBILITY_ROLLBACK_FAILED,
 };
 

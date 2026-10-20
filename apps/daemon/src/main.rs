@@ -89,6 +89,10 @@ fn main() -> ExitCode {
             runtime::request(&args.join(" "))
         }
         #[cfg(target_os = "macos")]
+        [group, action, ..] if group == "animations" && action == "status" => {
+            runtime::request("animations status")
+        }
+        #[cfg(target_os = "macos")]
         [group, action] if group == "hotkeys" && matches!(action.as_str(), "pause" | "resume") => {
             runtime::request(&args.join(" "))
         }

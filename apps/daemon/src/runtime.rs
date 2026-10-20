@@ -475,6 +475,7 @@ fn focus_fullscreen_window(
                 cg_window_id: window.id.0,
                 frame: None,
                 focus: true,
+                animate: false,
             })
             .is_ok()
     })
@@ -842,6 +843,16 @@ struct DisplayState {
     /// Local scratchpads shown by visiting their home Space: where to go
     /// back to when they are hidden again.
     scratchpad_returns: HashMap<String, ScratchpadReturn>,
+    /// What just caused a layout change, for the Animation Engine. Applies
+    /// dispatched shortly after it animate; others (reconciliation, Space
+    /// switches) are written at once.
+    animation_hint: Option<(tylora_core::animation::AnimationEvent, Instant)>,
+    /// No animations until then: right after a Space switch or a display
+    /// change, layouts are restored, not rearranged.
+    animation_quiet_until: Option<Instant>,
+    /// Scratchpads gliding out before they are parked, by `Slide` request.
+    scratchpad_slides: HashMap<u64, (tylora_core::scratchpad::ScratchpadWindow, PendingScratchpad)>,
+    scratchpad_slide: tylora_core::animation::SlideDirection,
     scratchpad_request_counter: u64,
     scratchpad_metrics: ScratchpadMetrics,
     /// Windows a rule wants in a scratchpad: (scratchpad, CGWindowID).
@@ -1852,6 +1863,22 @@ fn handle_rules_request(
 /// Request IDs of scratchpad AX operations; disjoint from other requests.
 const SCRATCHPAD_REQUEST: u64 = 1 << 61;
 
+/// How long after its cause a geometry change still counts as animated.
+const ANIMATION_HINT_TTL: Duration = Duration::from_millis(300);
+/// Quiet period after Space switches and display changes.
+const ANIMATION_QUIET: Duration = Duration::from_millis(800);
+/// System Reduce Motion, refreshed by the main thread.
+static REDUCE_MOTION: AtomicBool = AtomicBool::new(false);
+
+fn send_animation_settings(adapter: &ManagedAdapter, config: &Config) -> bool {
+    let reduce_motion = REDUCE_MOTION.load(Ordering::Acquire);
+    let _ = adapter.send_now(ManagedCommand::Animations {
+        config: config.animations,
+        reduce_motion,
+    });
+    reduce_motion
+}
+
 /// Timing and error counters reported by `scratchpad list --json`.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 struct ScratchpadMetrics {
@@ -2484,7 +2511,20 @@ fn scratchpad_action(
                     show: Vec::new(),
                 });
             } else if park.is_some() {
-                start_scratchpad_move(state, io, window, pending);
+                // Glide out first when animations allow it; the AX worker
+                // answers `Slid` (at once when they do not), then it parks.
+                let request = state.next_scratchpad_request();
+                let slide = ManagedCommand::Slide {
+                    request,
+                    pid: window.process.pid,
+                    cg_window_id: window.cg_window_id,
+                    direction: state.scratchpad_slide,
+                };
+                if io.adapter.send_now(slide).is_ok() {
+                    state.scratchpad_slides.insert(request, (window, pending));
+                } else {
+                    start_scratchpad_move(state, io, window, pending);
+                }
             }
             Ok(())
         }
@@ -2585,6 +2625,8 @@ fn present_scratchpad(
         frame,
         // Activating the whole app could jump to its windows elsewhere.
         focus: !focused,
+        // Glide in from where the hide left it (see `ScratchpadPlan::Hide`).
+        animate: true,
     });
 }
 
@@ -3361,6 +3403,59 @@ impl DisplayState {
         }
     }
 
+    /// Records what is about to change the layout; see `animation_hint`.
+    fn hint_animation(&mut self, event: tylora_core::animation::AnimationEvent) {
+        self.animation_hint = Some((event, Instant::now()));
+    }
+
+    /// Suppresses animations briefly and forgets the pending cause.
+    fn quiet_animations(&mut self) {
+        self.animation_hint = None;
+        self.animation_quiet_until = Some(Instant::now() + ANIMATION_QUIET);
+    }
+
+    /// The cause of geometry being dispatched now, if it should animate.
+    fn animation_event(&self) -> Option<tylora_core::animation::AnimationEvent> {
+        let now = Instant::now();
+        if self.animation_quiet_until.is_some_and(|until| now < until) {
+            return None;
+        }
+        self.animation_hint
+            .filter(|(_, at)| now.duration_since(*at) <= ANIMATION_HINT_TTL)
+            .map(|(event, _)| event)
+    }
+
+    /// What a state command changes, for the Animation Engine: Scrolling
+    /// navigation moves the strip, zoom toggles zoom, the rest rearranges.
+    fn command_animation_event(
+        &self,
+        command: &StateCommand,
+        focused: Option<ManagedWindowId>,
+    ) -> Option<tylora_core::animation::AnimationEvent> {
+        use tylora_core::animation::AnimationEvent;
+        if let StateCommand::ToggleLayoutZoom { .. } = command {
+            return Some(AnimationEvent::LayoutZoom);
+        }
+        let scrolling = focused
+            .and_then(|id| self.coordinator_for_active_ref(id))
+            .is_some_and(|coordinator| coordinator.layout.kind() == LayoutKind::Scrolling);
+        Some(if scrolling {
+            AnimationEvent::Scrolling
+        } else {
+            AnimationEvent::LayoutChange
+        })
+    }
+
+    fn coordinator_for_active_ref(
+        &self,
+        id: ManagedWindowId,
+    ) -> Option<&Coordinator<TilingLayout>> {
+        self.coordinators
+            .iter()
+            .find(|(display, c)| self.active.contains(display) && c.registry.get(id).is_some())
+            .map(|(_, coordinator)| coordinator)
+    }
+
     fn apply_live_config(&mut self, config: &Config) {
         // Existing windows keep their rule state: a reload never re-applies
         // rules to windows that are already open.
@@ -3379,6 +3474,7 @@ impl DisplayState {
             save_scratchpads(&self.scratchpads);
         }
         self.scratchpad_definitions = config.scratchpads.clone();
+        self.scratchpad_slide = config.animations.scratchpad_slide;
         let removed = self.scratchpads.sync_definitions(&config.scratchpads);
         if removed.iter().any(|entry| entry.window.is_some()) {
             // A deleted scratchpad must not leave its window parked.
@@ -3470,6 +3566,10 @@ impl DisplayState {
             scratchpad_definitions: config.scratchpads.clone(),
             scratchpad_requests: HashMap::new(),
             scratchpad_returns: HashMap::new(),
+            animation_hint: None,
+            animation_quiet_until: None,
+            scratchpad_slides: HashMap::new(),
+            scratchpad_slide: config.animations.scratchpad_slide,
             scratchpad_request_counter: 0,
             scratchpad_metrics: ScratchpadMetrics::default(),
             scratchpad_rule_queue: Vec::new(),
@@ -4487,6 +4587,7 @@ fn bind_socket() -> std::io::Result<UnixListener> {
 }
 
 pub fn serve(requested_display: Option<u32>) -> ExitCode {
+    REDUCE_MOTION.store(tylora_macos::reduce_motion(), Ordering::Release);
     if legacy_daemon_running() {
         error!("older FluxWM daemon still running; stop it before starting Tylora");
         return ExitCode::FAILURE;
@@ -4539,7 +4640,12 @@ pub fn serve(requested_display: Option<u32>) -> ExitCode {
     let display_events = DisplayEvents::start();
     let mut next_area_check = Instant::now() + Duration::from_secs(30);
     let mut display_change_due: Option<Instant> = None;
+    let mut next_motion_check = Instant::now();
     while !worker.is_finished() {
+        if Instant::now() >= next_motion_check {
+            REDUCE_MOTION.store(tylora_macos::reduce_motion(), Ordering::Release);
+            next_motion_check = Instant::now() + Duration::from_secs(5);
+        }
         if display_events.events.try_recv().is_ok() {
             display_change_due = Some(Instant::now() + Duration::from_millis(250));
         }
@@ -4575,6 +4681,7 @@ fn run_coordinator(
         return ExitCode::FAILURE;
     }
     let adapter = ManagedAdapter::start();
+    let mut sent_reduce_motion = send_animation_settings(&adapter, &config);
     let mut state = DisplayState::new(areas, primary, &config);
     // Windows open before the daemon started never count as "created", so
     // on_create rules leave them alone.
@@ -4807,6 +4914,7 @@ fn run_coordinator(
                                 // Show the window: switch the target display to its
                                 // Desktop, then return the pointer unless focus follows.
                                 workspace_switch = workspace_switch.wrapping_add(1).max(1);
+                                state.quiet_animations();
                                 let switch = workspace_switch;
                                 follow_mouse.cancel();
                                 suppress_pointer_focus(true);
@@ -5400,6 +5508,10 @@ fn run_coordinator(
                 .map(|space| (space.display, space.id))
                 .collect();
             if old_active != new_active || state.native_spaces.len() != spaces.len() {
+                // The system animates Space switches; layouts are restored,
+                // never animated, and nothing keeps moving on the old Space.
+                state.quiet_animations();
+                let _ = adapter.send_now(ManagedCommand::FinishAnimations);
                 follow_mouse.cancel();
                 info!(
                     ?new_active,
@@ -5537,6 +5649,13 @@ fn run_coordinator(
                 }
             }
         }
+        if REDUCE_MOTION.load(Ordering::Acquire) != sent_reduce_motion {
+            sent_reduce_motion = send_animation_settings(&adapter, &config);
+            info!(
+                reduce_motion = sent_reduce_motion,
+                "system Reduce Motion changed"
+            );
+        }
         if hotkeys_paused_until.is_some_and(|until| Instant::now() >= until) {
             hotkeys_paused_until = None;
             bindings_dirty = true;
@@ -5548,6 +5667,9 @@ fn run_coordinator(
                 follow_mouse.cancel();
                 state.apply_live_config(&updated);
                 config = updated;
+                sent_reduce_motion = send_animation_settings(&adapter, &config);
+                // Gaps or layout settings may move windows: animate that.
+                state.hint_animation(tylora_core::animation::AnimationEvent::LayoutChange);
                 suppress_pointer_focus(
                     !config.focus.follows_mouse || config.focus.mode == FocusMode::Disabled,
                 );
@@ -5594,6 +5716,18 @@ fn run_coordinator(
                         }
                     }
                     let changed = state.handle_reconciled(process, windows);
+                    if changed {
+                        use tylora_core::animation::AnimationEvent;
+                        match state.len().cmp(&before) {
+                            std::cmp::Ordering::Greater => {
+                                state.hint_animation(AnimationEvent::WindowOpen)
+                            }
+                            std::cmp::Ordering::Less => {
+                                state.hint_animation(AnimationEvent::WindowClose)
+                            }
+                            std::cmp::Ordering::Equal => {}
+                        }
+                    }
                     for (id, target) in std::mem::take(&mut state.display_rehomes) {
                         let _ = adapter
                             .commands
@@ -5614,6 +5748,7 @@ fn run_coordinator(
                     }
                 }
                 Ok(ManagedEvent::ProcessExited(process)) => {
+                    state.hint_animation(tylora_core::animation::AnimationEvent::WindowClose);
                     state.handle_process_exited(process);
                     info!(pid = process.pid, "process exited; windows removed");
                 }
@@ -5961,6 +6096,9 @@ fn run_coordinator(
                             }
                             continue;
                         }
+                        if let Some(event) = state.command_animation_event(&command, window) {
+                            state.hint_animation(event);
+                        }
                         let result =
                             execute_state_command(&mut state, &adapter, &config, &command, window);
                         debug!(
@@ -6051,6 +6189,21 @@ fn run_coordinator(
                             );
                             session.finished = true;
                         }
+                    }
+                }
+                Ok(ManagedEvent::Slid { request, result }) => {
+                    if let Some((window, pending)) = state.scratchpad_slides.remove(&request) {
+                        if let Err(code) = result {
+                            // The window stays usable: park it from where it is.
+                            debug!(code, scratchpad = %pending.id, "scratchpad slide failed");
+                        }
+                        let io = ScratchpadIo {
+                            adapter: &adapter,
+                            native: &native_move_tx,
+                            focused: focus_trail.last().copied(),
+                            trail: &focus_trail,
+                        };
+                        start_scratchpad_move(&mut state, &io, window, pending);
                     }
                 }
                 Ok(ManagedEvent::Presented { request, result }) => {
@@ -6206,6 +6359,7 @@ fn run_coordinator(
                         // Pointer focus must not raise a window from the old Space while
                         // the switch animates; WindowServer would switch straight back.
                         workspace_switch = workspace_switch.wrapping_add(1).max(1);
+                        state.quiet_animations();
                         let switch = workspace_switch;
                         follow_mouse.cancel();
                         suppress_pointer_focus(true);
@@ -6468,6 +6622,8 @@ fn run_coordinator(
             if session.flush(&adapter, &config) {
                 debug!(elapsed_us = session.start.at.elapsed().as_micros(), floating = session.start.floating, button = ?session.start.button, "mouse drag completed");
                 drag = None;
+                // A short settle from the drop position into the layout.
+                state.hint_animation(tylora_core::animation::AnimationEvent::LayoutChange);
                 suppress_pointer_focus(
                     !config.focus.follows_mouse || config.focus.mode == FocusMode::Disabled,
                 );
@@ -6530,6 +6686,19 @@ fn run_coordinator(
         }
         while let Ok(updated) = area_rx.try_recv() {
             let previous_display_count = state.active.len();
+            let displays_changed = updated.len() != state.active.len()
+                || updated.iter().any(|area| {
+                    state
+                        .areas
+                        .get(&area.display)
+                        .map(|known| (known.frame, known.full_frame))
+                        != Some((area.frame, area.full_frame))
+                });
+            if displays_changed {
+                // Across or on changed displays only the end position counts.
+                state.quiet_animations();
+                let _ = adapter.send_now(ManagedCommand::FinishAnimations);
+            }
             for (id, target) in state.update_areas(updated, &config) {
                 if adapter
                     .commands
@@ -6625,7 +6794,21 @@ fn run_coordinator(
             if !current {
                 continue;
             }
-            match adapter.commands.try_send(ManagedCommand::Apply(command)) {
+            // Mouse drags write geometry directly; everything else may
+            // animate when it has a fresh cause.
+            let event = state.animation_event().filter(|_| drag.is_none());
+            debug!(
+                pid = command.id.process.pid,
+                token = command.id.token,
+                version = command.version,
+                ?event,
+                "geometry dispatched"
+            );
+            let message = match event {
+                Some(event) => ManagedCommand::Animate { command, event },
+                None => ManagedCommand::Apply(command),
+            };
+            match adapter.send_now(message) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     deferred.push_front(command);
@@ -7012,6 +7195,11 @@ fn run_coordinator(
                     "request_to_applied_total_us": follow_mouse.request_to_applied_total_us,
                 });
                 value.to_string()
+            } else if matches!(
+                request.command.as_str(),
+                "animations" | "animations status" | "animations status --json"
+            ) {
+                animations_status(&config)
             } else {
                 handle_request(&request.command, &state, &adapter, &mut stopping)
             };
@@ -8020,6 +8208,31 @@ fn layout_current_json(state: &DisplayState) -> Vec<serde_json::Value> {
             }))
         })
         .collect()
+}
+
+/// `tylora animations status`: settings, the backend in use, why changes
+/// were applied instantly, scheduler metrics and backend availability.
+fn animations_status(config: &Config) -> String {
+    let metrics = tylora_macos::animation_metrics();
+    let mean = |total: u64, count: u64| (count > 0).then(|| total as f64 / count as f64 / 1000.0);
+    serde_json::json!({
+        "version": 1,
+        "config": config.animations,
+        "worker": tylora_macos::animation_state(),
+        "reduce_motion": REDUCE_MOTION.load(Ordering::Acquire),
+        "backends": tylora_macos::animation_backends(),
+        "metrics": metrics,
+        "summary": {
+            "active": metrics.active,
+            "mean_write_ms": mean(metrics.write_total_us, metrics.writes),
+            "max_write_ms": metrics.write_max_us as f64 / 1000.0,
+            // Scheduler wake-ups, not what WindowServer showed on screen.
+            "mean_tick_interval_ms": mean(metrics.tick_interval_total_us, metrics.ticks.saturating_sub(1)),
+            "mean_final_error_pt": (metrics.finals_measured > 0)
+                .then(|| metrics.final_error_total / metrics.finals_measured as f64),
+        },
+    })
+    .to_string()
 }
 
 fn handle_request(
@@ -9478,6 +9691,76 @@ mod tests {
         assert_eq!(
             state.coordinators[&display].layout.kind(),
             LayoutKind::Dwindle
+        );
+    }
+
+    #[test]
+    fn animation_hints_expire_and_space_switches_stay_instant() {
+        use tylora_core::animation::AnimationEvent;
+        let config = Config::default();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        // Reconciliation without a cause never animates.
+        assert_eq!(state.animation_event(), None);
+        state.hint_animation(AnimationEvent::WindowOpen);
+        assert_eq!(state.animation_event(), Some(AnimationEvent::WindowOpen));
+        // A stale cause no longer animates later geometry.
+        state.animation_hint = Some((
+            AnimationEvent::LayoutChange,
+            Instant::now() - ANIMATION_HINT_TTL - Duration::from_millis(1),
+        ));
+        assert_eq!(state.animation_event(), None);
+        // After a Space switch or display change layouts are restored, not
+        // animated, even if something hints during the quiet period.
+        state.hint_animation(AnimationEvent::LayoutChange);
+        state.quiet_animations();
+        assert_eq!(state.animation_event(), None);
+        state.hint_animation(AnimationEvent::WindowClose);
+        assert_eq!(state.animation_event(), None);
+        state.animation_quiet_until = Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(state.animation_event(), Some(AnimationEvent::WindowClose));
+    }
+
+    #[test]
+    fn commands_animate_as_zoom_scrolling_or_layout_change() {
+        use tylora_core::animation::AnimationEvent;
+        let config = layout_config();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        // Space 4 (Browser) starts as BSP; Space 7 is configured Scrolling.
+        switch_space(&mut state, &config, &[7, 4], 4);
+        let windows: Vec<_> = (1..=2).map(|token| on_space(token, 4)).collect();
+        state.handle_reconciled(windows[0].id.process, windows.clone());
+        let focused = Some(windows[0].id);
+        assert_eq!(
+            state.coordinators[&DisplayId(1)].layout.kind(),
+            LayoutKind::Bsp
+        );
+        assert_eq!(
+            state
+                .command_animation_event(&StateCommand::ToggleLayoutZoom { window: None }, focused),
+            Some(AnimationEvent::LayoutZoom)
+        );
+        let swap = StateCommand::MoveWindow {
+            direction: tylora_core::commands::Direction::Left,
+        };
+        assert_eq!(
+            state.command_animation_event(&swap, focused),
+            Some(AnimationEvent::LayoutChange)
+        );
+        state
+            .coordinators
+            .get_mut(&DisplayId(1))
+            .unwrap()
+            .execute(
+                &StateCommand::SetLayout {
+                    layout: LayoutKind::Scrolling,
+                },
+                None,
+            )
+            .unwrap();
+        // In a Scrolling layout, navigation moves the strip.
+        assert_eq!(
+            state.command_animation_event(&StateCommand::ScrollLayoutLeft, focused),
+            Some(AnimationEvent::Scrolling)
         );
     }
 

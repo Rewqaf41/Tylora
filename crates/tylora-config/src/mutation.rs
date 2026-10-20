@@ -1,8 +1,8 @@
 //! Narrow, validated edits that retain unrelated TOML entries and comments.
 
 use crate::{
-    Config, ConfigError, DwindleSettings, Focus, LayoutKind, RuleDefinition, ScratchpadDefinition,
-    ScrollingSettings, WindowMovement, WindowRule,
+    AnimationConfig, Config, ConfigError, DwindleSettings, Focus, LayoutKind, RuleDefinition,
+    ScratchpadDefinition, ScrollingSettings, WindowMovement, WindowRule,
 };
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -46,6 +46,10 @@ pub enum ConfigPatch {
     },
     SetFocus {
         focus: Focus,
+    },
+    /// Replaces `[animations]` (and `[animations.events]`).
+    SetAnimations {
+        animations: AnimationConfig,
     },
     SetDefaultLayout {
         layout: LayoutKind,
@@ -587,6 +591,38 @@ pub fn apply_patch(source: &str, patch: ConfigPatch) -> Result<(String, Config),
             })?;
             pads.remove(index);
         }
+        ConfigPatch::SetAnimations { animations } => {
+            if !doc.as_table().get("animations").is_some_and(Item::is_table) {
+                doc["animations"] = Item::Table(Table::new());
+            }
+            let table = doc["animations"]
+                .as_table_mut()
+                .expect("animations table inserted");
+            table["enabled"] = value(animations.enabled);
+            table["backend"] = value(animations.backend.name());
+            table["duration_ms"] = value(i64::from(animations.duration_ms));
+            table["easing"] = value(animations.easing.name());
+            table["preferred_fps"] = value(i64::from(animations.preferred_fps));
+            table["respect_reduce_motion"] = value(animations.respect_reduce_motion);
+            table["scratchpad_slide"] = value(animations.scratchpad_slide.name());
+            if !table.get("events").is_some_and(Item::is_table) {
+                table["events"] = Item::Table(Table::new());
+            }
+            let events = table["events"]
+                .as_table_mut()
+                .expect("events table inserted");
+            let flags = animations.events;
+            for (key, enabled) in [
+                ("window_open", flags.window_open),
+                ("window_close", flags.window_close),
+                ("layout_change", flags.layout_change),
+                ("layout_zoom", flags.layout_zoom),
+                ("scrolling", flags.scrolling),
+                ("scratchpad", flags.scratchpad),
+            ] {
+                events[key] = value(enabled);
+            }
+        }
         ConfigPatch::SetFocus { focus } => {
             if !doc.as_table().get("focus").is_some_and(Item::is_table) {
                 doc["focus"] = Item::Table(Table::new());
@@ -680,6 +716,29 @@ mod tests {
         assert_eq!(config.focus.ignore_apps[0].bundle_id, "com.example.Panel");
         focus.delay_ms = 501;
         assert!(apply_patch(&edited, ConfigPatch::SetFocus { focus }).is_err());
+    }
+    #[test]
+    fn animations_patch_round_trips_and_keeps_comments() {
+        let source = "version = 1\n# keep me\n[gaps]\ninner = 8.0\n";
+        let mut animations = AnimationConfig {
+            duration_ms: 240,
+            easing: crate::Easing::EaseOutExpo,
+            backend: crate::BackendChoice::Instant,
+            ..AnimationConfig::default()
+        };
+        animations.events.scrolling = false;
+        let (edited, config) =
+            apply_patch(source, ConfigPatch::SetAnimations { animations }).unwrap();
+        assert!(edited.contains("# keep me"));
+        assert_eq!(config.animations, animations);
+        // Editing again replaces values in place.
+        animations.enabled = false;
+        let (again, config) =
+            apply_patch(&edited, ConfigPatch::SetAnimations { animations }).unwrap();
+        assert!(!config.animations.enabled);
+        assert_eq!(again.matches("[animations]").count(), 1);
+        animations.duration_ms = 9000;
+        assert!(apply_patch(&again, ConfigPatch::SetAnimations { animations }).is_err());
     }
     #[test]
     fn workspace_binding_and_hotkey_round_trip() {
