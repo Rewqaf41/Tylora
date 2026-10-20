@@ -328,6 +328,16 @@ fn resolve_focus_target(
     let orders = backend.display_order().map_err(|error| error.to_string())?;
     let order_of = |display: DisplayId| orders.iter().find(|order| order.display == display);
     let pointer = cursor_display();
+    // Time spent in a fullscreen Space counts for the Desktop it belongs to,
+    // so the workspace instance holding the video is the recent one.
+    let mut history = history.clone();
+    for (fullscreen, desktop) in links {
+        if let Some(at) = history.get(&fullscreen.0).copied() {
+            let entry = history.entry(desktop.0).or_insert(at);
+            *entry = (*entry).max(at);
+        }
+    }
+    let history = &history;
     // Inside a native fullscreen Space the Desktop it was entered from is
     // the current workspace.
     let current = pointer
@@ -352,7 +362,7 @@ fn resolve_focus_target(
             .map(|space| space.display)
             .ok_or("bound native Space no longer exists")?;
         let target = order_of(display)
-            .map(|order| order.workspace_target(NativeSpaceId(id), links))
+            .map(|order| order.workspace_target(NativeSpaceId(id), links, pointer == Some(display)))
             .unwrap_or(NativeSpaceId(id));
         Ok((display, target))
     };
@@ -421,6 +431,53 @@ fn focus_workspace_space(
         NativeSpaceSwitcher::focus_id(display, target).map_err(|error| error.to_string())?;
     let needs_focus = cross_display && outcome.source == outcome.target;
     Ok((outcome, needs_focus))
+}
+
+/// Request ID of a fullscreen window focus; disjoint from scratchpad and
+/// passive focus requests, so the `Presented` reply is ignored.
+const FULLSCREEN_FOCUS_REQUEST: u64 = 1 << 60;
+
+/// Raises and focuses the window of native fullscreen Space `space`. Display
+/// focus would pick a managed window, which never lives in a fullscreen
+/// Space, and would switch that display away from the video. Returns false
+/// when `space` is no fullscreen Space or has no window.
+fn focus_fullscreen_window(
+    commands: &SyncSender<ManagedCommand>,
+    space: tylora_macos::spaces::NativeSpaceId,
+) -> bool {
+    use tylora_macos::spaces::{ExperimentalSkyLightBackend, NativeSpaceBackend};
+    let backend = ExperimentalSkyLightBackend::new();
+    let fullscreen = backend.display_order().is_ok_and(|orders| {
+        orders.iter().any(|order| {
+            order
+                .spaces
+                .iter()
+                .any(|entry| entry.id == space && entry.fullscreen)
+        })
+    });
+    if !fullscreen {
+        return false;
+    }
+    let window = tylora_macos::discover_all_cg_windows()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|window| {
+            backend
+                .get_window_spaces(window.id.0)
+                .is_ok_and(|spaces| spaces == [space])
+        })
+        .max_by(|a, b| a.frame.area().total_cmp(&b.frame.area()));
+    window.is_some_and(|window| {
+        commands
+            .try_send(ManagedCommand::Present {
+                request: FULLSCREEN_FOCUS_REQUEST,
+                pid: window.owner_pid,
+                cg_window_id: window.id.0,
+                frame: None,
+                focus: true,
+            })
+            .is_ok()
+    })
 }
 
 /// Records the native Space of a focused managed window.
@@ -5765,7 +5822,9 @@ fn run_coordinator(
                                                 "native workspace focus confirmed"
                                             );
                                             let _ = reconcile.try_send(ManagedCommand::Reconcile);
-                                            focus = needs_focus.then_some(display);
+                                            focus = (needs_focus
+                                                && !focus_fullscreen_window(&reconcile, target))
+                                            .then_some(display);
                                             space = Some(target.0);
                                         }
                                         Err(error) => {
@@ -6378,6 +6437,8 @@ fn run_coordinator(
                             let reply = match result {
                                 Ok((display, target, needs_focus)) => {
                                     let _ = reconcile.try_send(ManagedCommand::Reconcile);
+                                    let needs_focus =
+                                        needs_focus && !focus_fullscreen_window(&reconcile, target);
                                     let _ = focus_sender.send(NativeMoveEvent::WorkspaceSwitched {
                                         switch: 0,
                                         focus: needs_focus.then_some(display),

@@ -195,15 +195,19 @@ impl DisplaySpaceOrder {
 
     /// Where a workspace hotkey for `desktop` should go: into the Desktop's
     /// fullscreen Spaces first, cycling through them on repeated presses, and
-    /// back to the Desktop itself after the last one.
+    /// back to the Desktop itself after the last one. Pressing again only
+    /// counts as "from inside" on the display the user is on (`focused`); a
+    /// fullscreen Space showing on another display is simply focused.
     pub fn workspace_target(
         &self,
         desktop: NativeSpaceId,
         links: &FullscreenLinks,
+        focused: bool,
     ) -> NativeSpaceId {
         let fullscreen = self.fullscreen_of(desktop, links);
         match fullscreen.iter().position(|id| *id == self.active) {
-            Some(index) => fullscreen.get(index + 1).copied().unwrap_or(desktop),
+            Some(index) if focused => fullscreen.get(index + 1).copied().unwrap_or(desktop),
+            Some(_) => self.active,
             None => fullscreen.first().copied().unwrap_or(desktop),
         }
     }
@@ -335,7 +339,7 @@ mod tests {
             (NativeSpaceId(91), NativeSpaceId(4)),
         ]);
         let target = |active, desktop| {
-            order(active, &spaces).workspace_target(NativeSpaceId(desktop), &links)
+            order(active, &spaces).workspace_target(NativeSpaceId(desktop), &links, true)
         };
         // From another Desktop, and from the owner Desktop itself: the video.
         assert_eq!(target(5, 4), NativeSpaceId(90));
@@ -347,6 +351,15 @@ mod tests {
         // and the Desktop the video sits next to does not own it.
         assert_eq!(target(90, 5), NativeSpaceId(5));
         assert_eq!(target(5, 6), NativeSpaceId(6));
+        // On another display the video showing there is focused, not left.
+        assert_eq!(
+            order(90, &spaces).workspace_target(NativeSpaceId(4), &links, false),
+            NativeSpaceId(90)
+        );
+        assert_eq!(
+            order(5, &spaces).workspace_target(NativeSpaceId(4), &links, false),
+            NativeSpaceId(90)
+        );
         // A fullscreen Space without a learned link belongs to no workspace.
         assert_eq!(
             order(91, &spaces).owner(NativeSpaceId(91), &FullscreenLinks::new()),
