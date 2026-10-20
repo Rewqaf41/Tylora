@@ -587,6 +587,8 @@ enum NativeMoveEvent {
         window: tylora_core::scratchpad::ScratchpadWindow,
         elapsed_ms: u64,
         result: Result<tylora_macos::spaces::MoveOutcome, String>,
+        /// Shown and already made key through WindowServer.
+        focused: bool,
     },
     /// A parking Desktop was created (or not) for a hide request.
     ScratchpadParking {
@@ -2383,7 +2385,7 @@ fn scratchpad_action(
                         });
                     }
                 }
-                present_scratchpad(state, io, &window, pending);
+                present_scratchpad(state, io, &window, pending, false);
             }
             Ok(())
         }
@@ -2436,6 +2438,7 @@ fn start_scratchpad_move(
     pending: PendingScratchpad,
 ) {
     let target = pending.space;
+    let showing = pending.showing;
     let sender = io.native.clone();
     let key = state.next_scratchpad_request();
     state.scratchpad_requests.insert(key, pending);
@@ -2446,22 +2449,42 @@ fn start_scratchpad_move(
             tylora_macos::spaces::NativeSpaceId(target),
         )
         .map_err(|error| error.to_string());
+        // Focus right here, before the main loop and the AX worker see the
+        // move: the window is key a few milliseconds after it arrives, and
+        // no app activation can jump to the app's windows on other Spaces.
+        let focused = showing
+            && result.is_ok()
+            && tylora_macos::spaces::focus_window(window.process.pid, window.cg_window_id)
+                .inspect_err(|error| warn!(%error, "scratchpad WindowServer focus failed"))
+                .is_ok()
+            // Key is not frontmost: other apps' windows stay above until raised.
+            && tylora_macos::raise_window(window.process.pid, window.cg_window_id)
+                .inspect_err(|code| warn!(code, "scratchpad raise failed"))
+                .is_ok();
         let _ = sender.send(NativeMoveEvent::ScratchpadMoved {
             request: key,
             window,
             elapsed_ms: started.elapsed().as_millis() as u64,
             result,
+            focused,
         });
     });
 }
 
-/// Asks the AX worker to place, raise and focus the scratchpad window.
+/// Focuses the scratchpad window through WindowServer, then has the AX
+/// worker place it only when its frame is not already the target: the AX
+/// scan of a busy app is what made showing slow. `focused`: the mover thread
+/// already made the window key.
 fn present_scratchpad(
     state: &mut DisplayState,
     io: &ScratchpadIo<'_>,
     window: &tylora_core::scratchpad::ScratchpadWindow,
     pending: PendingScratchpad,
+    focused: bool,
 ) {
+    let focused = focused
+        || (tylora_macos::spaces::focus_window(window.process.pid, window.cg_window_id).is_ok()
+            && tylora_macos::raise_window(window.process.pid, window.cg_window_id).is_ok());
     let definition = state.scratchpad_definition(&pending.id).cloned();
     let remembered = state
         .scratchpads
@@ -2473,6 +2496,21 @@ fn present_scratchpad(
         }
         _ => None,
     };
+    if focused {
+        let current = tylora_macos::discover_all_cg_windows()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|cg| cg.id.0 == window.cg_window_id)
+            .map(|cg| cg.frame);
+        if let Some(current) =
+            current.filter(|current| frame.is_none_or(|frame| current.near(frame, 1.0)))
+        {
+            let request = state.next_scratchpad_request();
+            state.scratchpad_requests.insert(request, pending);
+            scratchpad_presented(state, request, Ok(current));
+            return;
+        }
+    }
     let request = state.next_scratchpad_request();
     state.scratchpad_requests.insert(request, pending);
     let _ = io.adapter.commands.try_send(ManagedCommand::Present {
@@ -2480,7 +2518,8 @@ fn present_scratchpad(
         pid: window.process.pid,
         cg_window_id: window.cg_window_id,
         frame,
-        focus: true,
+        // Activating the whole app could jump to its windows elsewhere.
+        focus: !focused,
     });
 }
 
@@ -2666,6 +2705,7 @@ fn scratchpad_moved(
     window: tylora_core::scratchpad::ScratchpadWindow,
     elapsed_ms: u64,
     result: Result<tylora_macos::spaces::MoveOutcome, String>,
+    focused: bool,
 ) {
     let Some(pending) = state.scratchpad_requests.remove(&request) else {
         return;
@@ -2685,7 +2725,7 @@ fn scratchpad_moved(
         Err(error) => return finish_scratchpad(state, pending, Err(error), "park"),
     };
     if pending.showing {
-        present_scratchpad(state, io, &window, pending);
+        present_scratchpad(state, io, &window, pending, focused);
         return;
     }
     // Hidden: drop it from the active Space's registry and give focus back.
@@ -5000,6 +5040,7 @@ fn run_coordinator(
                     window,
                     elapsed_ms,
                     result,
+                    focused,
                 } => {
                     let io = ScratchpadIo {
                         adapter: &adapter,
@@ -5007,7 +5048,9 @@ fn run_coordinator(
                         focused: focus_trail.last().copied(),
                         trail: &focus_trail,
                     };
-                    scratchpad_moved(&mut state, &io, request, window, elapsed_ms, result);
+                    scratchpad_moved(
+                        &mut state, &io, request, window, elapsed_ms, result, focused,
+                    );
                     if state.scratchpad_requests.is_empty() {
                         pointer_focus_pause_until =
                             Some(Instant::now() + WORKSPACE_SWITCH_POINTER_SETTLE);

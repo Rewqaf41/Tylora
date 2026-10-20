@@ -258,8 +258,8 @@ mod window_mover;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    cursor_display, warp_cursor_to, warp_cursor_to_display, ExperimentalSkyLightBackend,
-    NativeSpaceSwitcher, SpaceObserver, SwitchOutcome,
+    cursor_display, focus_window, warp_cursor_to, warp_cursor_to_display,
+    ExperimentalSkyLightBackend, NativeSpaceSwitcher, SpaceObserver, SwitchOutcome,
 };
 
 #[cfg(target_os = "macos")]

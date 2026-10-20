@@ -24,6 +24,15 @@ type CopyDisplaySpaces = unsafe extern "C" fn(c_int) -> CFRef;
 type CurrentSpace = unsafe extern "C" fn(c_int, CFRef) -> u64;
 type SpaceType = unsafe extern "C" fn(c_int, u64) -> c_int;
 type SpacesForWindows = unsafe extern "C" fn(c_int, c_int, CFRef) -> CFRef;
+type SetFrontProcess = unsafe extern "C" fn(*const ProcessSerialNumber, u32, u32) -> c_int;
+type PostEventRecord = unsafe extern "C" fn(*const ProcessSerialNumber, *const u8) -> c_int;
+
+#[repr(C)]
+#[derive(Default)]
+struct ProcessSerialNumber {
+    high: u32,
+    low: u32,
+}
 
 const UTF8: u32 = 0x0800_0100;
 static SWITCH_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -254,6 +263,8 @@ struct Symbols {
     current_space: Option<CurrentSpace>,
     space_type: Option<SpaceType>,
     spaces_for_windows: Option<SpacesForWindows>,
+    set_front_process: Option<SetFrontProcess>,
+    post_event_record: Option<PostEventRecord>,
 }
 impl Symbols {
     fn load() -> Self {
@@ -268,6 +279,8 @@ impl Symbols {
                 current_space: None,
                 space_type: None,
                 spaces_for_windows: None,
+                set_front_process: None,
+                post_event_record: None,
             };
         }
         let lookup = |name: &std::ffi::CStr| unsafe { dlsym(library, name.as_ptr()) };
@@ -276,6 +289,8 @@ impl Symbols {
         let current_space = lookup(c"SLSManagedDisplayGetCurrentSpace");
         let space_type = lookup(c"SLSSpaceGetType");
         let spaces_for_windows = lookup(c"SLSCopySpacesForWindows");
+        let set_front_process = lookup(c"_SLPSSetFrontProcessWithOptions");
+        let post_event_record = lookup(c"SLPSPostEventRecordTo");
         Self {
             connection: (!connection.is_null())
                 .then(|| unsafe { std::mem::transmute::<*mut c_void, Connection>(connection) }),
@@ -289,6 +304,12 @@ impl Symbols {
                 .then(|| unsafe { std::mem::transmute::<*mut c_void, SpaceType>(space_type) }),
             spaces_for_windows: (!spaces_for_windows.is_null()).then(|| unsafe {
                 std::mem::transmute::<*mut c_void, SpacesForWindows>(spaces_for_windows)
+            }),
+            set_front_process: (!set_front_process.is_null()).then(|| unsafe {
+                std::mem::transmute::<*mut c_void, SetFrontProcess>(set_front_process)
+            }),
+            post_event_record: (!post_event_record.is_null()).then(|| unsafe {
+                std::mem::transmute::<*mut c_void, PostEventRecord>(post_event_record)
             }),
         }
     }
@@ -392,6 +413,41 @@ pub(crate) fn window_on_active_space(window: u32) -> bool {
     backend.display_order().map_or(true, |orders| {
         orders.iter().any(|order| order.active == *space)
     })
+}
+
+/// Makes `window_id` the key window of its process and that process the
+/// front one, through WindowServer. Unlike activating the application, this
+/// never jumps to a Space holding another of the app's windows, and it needs
+/// no Accessibility scan of the app. The window must be on an active Space.
+pub fn focus_window(pid: i32, window_id: u32) -> Result<(), SpaceError> {
+    let syms = symbols();
+    let (Some(set_front), Some(post_event)) = (syms.set_front_process, syms.post_event_record)
+    else {
+        return Err(SpaceError::Unsupported(
+            "SkyLight window focus symbols are missing".into(),
+        ));
+    };
+    let mut psn = ProcessSerialNumber::default();
+    if unsafe { GetProcessForPID(pid, &mut psn) } != 0 {
+        return Err(SpaceError::QueryFailed("GetProcessForPID"));
+    }
+    // kCPSUserGenerated: treated like a click, so the app may take focus.
+    if unsafe { set_front(&psn, window_id, 0x200) } != 0 {
+        return Err(SpaceError::QueryFailed("_SLPSSetFrontProcessWithOptions"));
+    }
+    // Synthetic window-server event records that make the window key.
+    let mut bytes = [0u8; 0xf8];
+    bytes[0x04] = 0xf8;
+    bytes[0x3a] = 0x10;
+    bytes[0x3c..0x40].copy_from_slice(&window_id.to_ne_bytes());
+    bytes[0x20..0x30].fill(0xff);
+    for phase in [0x01, 0x02] {
+        bytes[0x08] = phase;
+        if unsafe { post_event(&psn, bytes.as_ptr()) } != 0 {
+            return Err(SpaceError::QueryFailed("SLPSPostEventRecordTo"));
+        }
+    }
+    Ok(())
 }
 
 /// Bounded read-only polling for Mission Control, gestures and Desktop edits.
@@ -651,6 +707,10 @@ impl NativeSpaceBackend for ExperimentalSkyLightBackend {
     }
 }
 
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn GetProcessForPID(pid: i32, psn: *mut ProcessSerialNumber) -> i32;
+}
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFRelease(value: CFRef);

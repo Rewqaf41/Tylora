@@ -164,6 +164,50 @@ pub fn bundle_identifier(pid: i32) -> Option<String> {
 /// geometry was left alone (kAXErrorCannotComplete).
 pub const INACTIVE_SPACE: i32 = -25204;
 
+/// Raises `window_id` of `pid` through Accessibility without scanning the
+/// app. Right after WindowServer made the window key it is the app's
+/// focused window, so one attribute read finds it; otherwise the app's
+/// window list is searched. A short timeout keeps a busy app from stalling;
+/// an app still busy with the move it just got (kAXErrorCannotComplete) is
+/// asked again a few times rather than given up on.
+pub fn raise_window(pid: i32, window_id: u32) -> Result<(), i32> {
+    let mut result = raise_window_once(pid, window_id);
+    for _ in 0..4 {
+        if result != Err(INACTIVE_SPACE) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(60));
+        result = raise_window_once(pid, window_id);
+    }
+    result
+}
+
+fn raise_window_once(pid: i32, window_id: u32) -> Result<(), i32> {
+    let app = OwnedCF(unsafe { AXUIElementCreateApplication(pid) });
+    if app.0.is_null() {
+        return Err(-1);
+    }
+    unsafe { AXUIElementSetMessagingTimeout(app.0, 0.15) };
+    let raise = |element: AXRef| {
+        let action = cf_string(c"AXRaise");
+        match unsafe { AXUIElementPerformAction(element, action.0) } {
+            0 => Ok(()),
+            code => Err(code),
+        }
+    };
+    if let Ok(focused) = ax_attribute(app.0, c"AXFocusedWindow") {
+        if crate::spaces::ax_cg_window(focused.0) == Some(window_id) {
+            return raise(focused.0);
+        }
+    }
+    let windows = ax_attribute(app.0, c"AXWindows")?;
+    let count = unsafe { CFArrayGetCount(windows.0) };
+    (0..count)
+        .map(|index| unsafe { CFArrayGetValueAtIndex(windows.0, index) })
+        .find(|element| crate::spaces::ax_cg_window(*element) == Some(window_id))
+        .map_or(Err(-25202), raise)
+}
+
 /// A regular application that currently owns at least one window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunningApplication {
