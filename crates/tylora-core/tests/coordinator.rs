@@ -165,6 +165,52 @@ fn geometry_mismatch_backs_off_then_can_recover() {
 }
 
 #[test]
+fn undersized_window_is_accepted_after_repeated_mismatch() {
+    let mut c = coordinator();
+    let window = id(1, 1);
+    c.handle(CoordinatorEvent::Observed(snapshot(window)));
+    let mut command = c.plan().pop().unwrap();
+    // The app keeps its window 14 pt shorter than its slot, every time.
+    let short = |target: Rect| {
+        Rect::new(
+            target.x,
+            target.y + 22.0,
+            target.width,
+            target.height - 14.0,
+        )
+        .unwrap()
+    };
+    for attempt in 1..=3 {
+        c.handle(CoordinatorEvent::Applied {
+            command,
+            result: Ok(short(command.target)),
+        });
+        assert_eq!(c.registry.get(window).unwrap().failed_attempts, attempt);
+        if attempt < 3 {
+            c.registry.get_mut(window).unwrap().retry_after = Some(Instant::now());
+            c.invalidate_plan();
+            command = c.plan().pop().unwrap();
+        }
+    }
+    let record = c.registry.get(window).unwrap();
+    assert_eq!(
+        record.accepted,
+        Some((command.target, short(command.target)))
+    );
+    assert!(record.retry_after.is_none());
+    c.invalidate_plan();
+    assert!(c.plan().is_empty());
+    // Moved away (e.g. dragged): the layout target applies again.
+    c.registry.get_mut(window).unwrap().observed.frame =
+        Rect::new(300.0, 300.0, 200.0, 200.0).unwrap();
+    c.invalidate_plan();
+    assert_eq!(
+        c.plan().pop().map(|retry| retry.target),
+        Some(command.target)
+    );
+}
+
+#[test]
 fn successful_retry_clears_geometry_failure() {
     let mut c = coordinator();
     let window = id(1, 1);

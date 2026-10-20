@@ -466,7 +466,15 @@ impl<L: LayoutPolicy> Coordinator<L> {
                                         record.failed_attempts.saturating_add(1);
                                     record.retry_after =
                                         Some(Instant::now() + retry_delay(record.failed_attempts));
-                                    if record.failed_attempts >= 3 {
+                                    let undersized = actual.width <= command.target.width + 1.0
+                                        && actual.height <= command.target.height + 1.0;
+                                    if record.failed_attempts >= 3 && undersized {
+                                        // The app caps its size below the slot
+                                        // (e.g. it keeps clear of a menu bar):
+                                        // retrying would only fight it.
+                                        record.accepted = Some((command.target, actual));
+                                        record.retry_after = None;
+                                    } else if record.failed_attempts >= 3 {
                                         minimum = Some((
                                             if actual.width > command.target.width + 1.0 {
                                                 actual.width.min(self.work_area.width)
@@ -751,8 +759,12 @@ impl<L: LayoutPolicy> Coordinator<L> {
                     record.failed_target = None;
                     record.failed_attempts = 0;
                     record.retry_after = None;
+                    record.accepted = None;
                 }
                 if record.pending_apply.is_some()
+                    || record.accepted.is_some_and(|(accepted, frame)| {
+                        accepted == target && record.observed.frame.near(frame, 1.0)
+                    })
                     || record.applied.is_some_and(|r| r.near(target, 1.0))
                     || record.observed.frame.near(target, 1.0)
                     || (record.failed_target == Some(target)

@@ -155,6 +155,10 @@ fn application_details(pid: i32) -> (Option<String>, bool, bool) {
     (identifier, regular, hidden)
 }
 
+/// `Applied` error: the window is not on any display's active Space, so its
+/// geometry was left alone (kAXErrorCannotComplete).
+pub const INACTIVE_SPACE: i32 = -25204;
+
 /// A regular application that currently owns at least one window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunningApplication {
@@ -802,7 +806,9 @@ impl Worker {
                                 {
                                     return;
                                 }
-                                self.scan_pid(command.id.process.pid);
+                                if code != INACTIVE_SPACE {
+                                    self.scan_pid(command.id.process.pid);
+                                }
                             }
                         }
                     }
@@ -2110,6 +2116,14 @@ impl Worker {
         let current = ax_rect(handle.element.0).map_err(|(_, code)| code)?;
         if current.near(command.target, 1.0) {
             return Ok(Some(current));
+        }
+        // Checked at write time: the user may have just left this window's
+        // Space, and WindowServer can switch straight back to a window whose
+        // geometry changes. The coordinator retries after its backoff.
+        if crate::spaces::ax_cg_window(handle.element.0)
+            .is_some_and(|window| !crate::spaces::window_on_active_space(window))
+        {
+            return Err(INACTIVE_SPACE);
         }
         if !settable(handle.element.0, c"AXSize") || !settable(handle.element.0, c"AXPosition") {
             return Err(-25205);

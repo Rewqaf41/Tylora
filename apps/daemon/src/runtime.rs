@@ -5181,6 +5181,11 @@ fn run_coordinator(
                                 })
                         });
                     match result {
+                        Err(tylora_macos::INACTIVE_SPACE) => debug!(
+                            pid = command.id.process.pid,
+                            token = command.id.token,
+                            "AX geometry deferred: window is on an inactive Space"
+                        ),
                         Err(code) => warn!(
                             pid = command.id.process.pid,
                             token = command.id.token,

@@ -185,7 +185,8 @@ pub use native::input::{
 #[cfg(target_os = "macos")]
 pub use native::managed::{
     running_applications, suppress_pointer_focus, work_areas, DisplayEvents, ManagedAdapter,
-    ManagedCommand, ManagedEvent, RunningApplication, WorkArea, VISIBILITY_ROLLBACK_FAILED,
+    ManagedCommand, ManagedEvent, RunningApplication, WorkArea, INACTIVE_SPACE,
+    VISIBILITY_ROLLBACK_FAILED,
 };
 
 #[cfg(target_os = "macos")]

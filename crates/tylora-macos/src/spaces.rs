@@ -264,6 +264,9 @@ pub use window_mover::{
 #[cfg(target_os = "macos")]
 pub(crate) use window_mover::ax_cg_window;
 
+#[cfg(target_os = "macos")]
+pub(crate) use macos::window_on_active_space;
+
 #[cfg(test)]
 mod tests {
     use super::*;

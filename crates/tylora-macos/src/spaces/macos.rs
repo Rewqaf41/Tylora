@@ -374,6 +374,21 @@ impl ExperimentalSkyLightBackend {
     }
 }
 
+/// Whether `window` is on a Space some display shows right now. Unknown
+/// membership counts as active, so a failing query never blocks layout.
+pub(crate) fn window_on_active_space(window: u32) -> bool {
+    let backend = ExperimentalSkyLightBackend::new();
+    let Ok(spaces) = backend.get_window_spaces(window) else {
+        return true;
+    };
+    let [space] = spaces.as_slice() else {
+        return true;
+    };
+    backend.display_order().map_or(true, |orders| {
+        orders.iter().any(|order| order.active == *space)
+    })
+}
+
 /// Bounded read-only polling for Mission Control, gestures and Desktop edits.
 /// It never calls AX or mutates window geometry.
 pub struct SpaceObserver {

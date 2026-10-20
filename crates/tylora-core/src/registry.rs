@@ -62,6 +62,10 @@ pub struct WindowRecord {
     pub failed_target: Option<Rect>,
     pub failed_attempts: u8,
     pub retry_after: Option<Instant>,
+    /// `(target, frame)`: the window repeatedly settled at `frame`, below
+    /// `target` (the app caps its size). While it stays there, the target is
+    /// not written again; once it moves, layout applies normally.
+    pub accepted: Option<(Rect, Rect)>,
 }
 
 #[derive(Default)]
@@ -136,6 +140,7 @@ impl Registry {
                 failed_target: None,
                 failed_attempts: 0,
                 retry_after: None,
+                accepted: None,
             },
         );
         true
