@@ -205,6 +205,9 @@ fn post_gesture(sign: f64) -> Result<(), SpaceError> {
     Ok(())
 }
 
+#[repr(C)]
+struct CFUUIDBytes([u8; 16]);
+
 struct OwnedCF(CFRef);
 impl Drop for OwnedCF {
     fn drop(&mut self) {
@@ -357,8 +360,10 @@ impl ExperimentalSkyLightBackend {
                     })
                 })
                 .collect();
+            let bytes = unsafe { CFUUIDGetUUIDBytes(uuid.0) };
             result.push(DisplaySpaceOrder {
                 display: display_id,
+                uuid: Some(u128::from_be_bytes(bytes.0)),
                 active: NativeSpaceId(active),
                 spaces,
             });
@@ -663,6 +668,7 @@ extern "C" {
     ) -> CFRef;
     static kCFTypeArrayCallBacks: c_void;
     fn CFUUIDCreateFromString(allocator: CFRef, string: CFRef) -> CFRef;
+    fn CFUUIDGetUUIDBytes(uuid: CFRef) -> CFUUIDBytes;
 }
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {

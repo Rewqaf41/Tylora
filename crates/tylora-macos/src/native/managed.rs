@@ -155,6 +155,11 @@ fn application_details(pid: i32) -> (Option<String>, bool, bool) {
     (identifier, regular, hidden)
 }
 
+/// Bundle identifier of a running process, if it has one.
+pub fn bundle_identifier(pid: i32) -> Option<String> {
+    application_details(pid).0
+}
+
 /// `Applied` error: the window is not on any display's active Space, so its
 /// geometry was left alone (kAXErrorCannotComplete).
 pub const INACTIVE_SPACE: i32 = -25204;
@@ -215,6 +220,8 @@ pub struct WorkArea {
     pub scale: f64,
     pub stable_uuid: Option<u128>,
     pub primary: bool,
+    /// The Mac's own panel; it disconnects only in clamshell mode.
+    pub builtin: bool,
 }
 
 /// Must be called on the process main thread. AppKit uses bottom-left coordinates;
@@ -286,6 +293,7 @@ pub fn work_areas() -> Vec<WorkArea> {
                 scale: screen.backingScaleFactor(),
                 stable_uuid,
                 primary: index == 0,
+                builtin: unsafe { CGDisplayIsBuiltin(id) } != 0,
             });
         }
     }
@@ -298,6 +306,10 @@ struct CFUUIDBytes {
 #[link(name = "ColorSync", kind = "framework")]
 extern "C" {
     fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> CFRef;
+}
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGDisplayIsBuiltin(display: u32) -> u32;
 }
 
 /// Public Core Graphics display reconfiguration notifications. The callback

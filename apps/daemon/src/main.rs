@@ -12,6 +12,8 @@ use tylora_macos::spaces::{
 
 #[cfg(target_os = "macos")]
 mod config_manager;
+#[cfg(target_os = "macos")]
+mod display_desktops;
 mod focus_follows_mouse;
 #[cfg(target_os = "macos")]
 mod runtime;

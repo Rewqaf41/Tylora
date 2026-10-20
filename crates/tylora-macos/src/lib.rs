@@ -143,6 +143,27 @@ pub fn add_desktops(display: tylora_core::DisplayId, count: u8) -> Result<u8, St
     }
 }
 
+/// Removes the Spaces at `positions` (Mission Control order, fullscreen
+/// Spaces included) from `display` through Mission Control's remove action.
+/// `expected` is the Spaces count the positions were planned against.
+/// Returns the number removed; verify through WindowServer.
+pub fn remove_spaces(
+    display: tylora_core::DisplayId,
+    positions: &[usize],
+    expected: usize,
+) -> Result<u8, String> {
+    #[cfg(target_os = "macos")]
+    {
+        native::mission_control::remove_spaces(display, positions, expected)
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (display, positions, expected);
+        Err("macOS only".into())
+    }
+}
+
 pub fn current_pointer() -> Option<(f64, f64)> {
     #[cfg(target_os = "macos")]
     {
@@ -184,8 +205,8 @@ pub use native::input::{
 };
 #[cfg(target_os = "macos")]
 pub use native::managed::{
-    running_applications, suppress_pointer_focus, work_areas, DisplayEvents, ManagedAdapter,
-    ManagedCommand, ManagedEvent, RunningApplication, WorkArea, INACTIVE_SPACE,
+    bundle_identifier, running_applications, suppress_pointer_focus, work_areas, DisplayEvents,
+    ManagedAdapter, ManagedCommand, ManagedEvent, RunningApplication, WorkArea, INACTIVE_SPACE,
     VISIBILITY_ROLLBACK_FAILED,
 };
 

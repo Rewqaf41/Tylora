@@ -315,10 +315,16 @@ pub struct DisplayAssignment {
     pub workspace: u8,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// What happens to an external display's Desktops when it disconnects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisconnectPolicy {
+    /// macOS default: the Desktops move to the remaining display.
     MoveToPrimary,
+    /// Move the windows into the matching workspaces of the remaining
+    /// display, remove the moved Desktops, and recreate them (with their
+    /// windows and workspace bindings) when the display returns.
+    RecreateDesktops,
 }
 
 impl Default for Config {

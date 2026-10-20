@@ -558,6 +558,15 @@ fn resolve_move_target(
 }
 
 enum NativeMoveEvent {
+    DisplayDetached {
+        uuid: String,
+        result: Result<(DisplayId, crate::display_desktops::Detached), String>,
+    },
+    DisplayReattached {
+        uuid: String,
+        display: DisplayId,
+        result: Result<crate::display_desktops::Reattached, String>,
+    },
     DisplayMoved {
         prepared: PreparedDisplayMove,
         response: Option<SyncSender<String>>,
@@ -1869,6 +1878,44 @@ fn load_scratchpads() -> ScratchpadRegistry {
 
 fn save_scratchpads(registry: &ScratchpadRegistry) {
     persist_state_json(&scratchpad_state_path(), registry, "scratchpads");
+}
+
+fn display_desktops_path() -> PathBuf {
+    workspace_state_path().with_file_name("display-desktops.json")
+}
+
+fn load_display_desktops() -> crate::display_desktops::DisplayDesktops {
+    fs::read(display_desktops_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_display_desktops(value: &crate::display_desktops::DisplayDesktops) {
+    persist_state_json(&display_desktops_path(), value, "display Desktops");
+}
+
+/// Points recorded scratchpad windows at the Space they were moved to.
+fn note_scratchpad_moves(
+    registry: &mut ScratchpadRegistry,
+    moves: impl IntoIterator<Item = (u32, u64)>,
+    display: DisplayId,
+) -> bool {
+    let mut changed = false;
+    for (window_id, space) in moves {
+        for entry in registry.entries.values_mut() {
+            if entry
+                .window
+                .as_ref()
+                .is_some_and(|window| window.cg_window_id == window_id)
+            {
+                entry.current_space = Some(space);
+                entry.current_display = Some(display);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 fn fullscreen_links_path() -> PathBuf {
@@ -4420,6 +4467,17 @@ fn run_coordinator(
         load_space_slots()
     };
     let mut space_focus: SpaceFocusHistory = HashMap::new();
+    // disconnect_policy = "recreate_desktops": remembered external Desktops,
+    // grace timers, and the single running remove/recreate job.
+    let mut display_desktops = if cfg!(test) {
+        Default::default()
+    } else {
+        load_display_desktops()
+    };
+    let mut display_absent_since: HashMap<String, Instant> = HashMap::new();
+    let mut display_present_since: HashMap<String, Instant> = HashMap::new();
+    let mut display_desktops_failed: HashSet<String> = HashSet::new();
+    let mut display_desktops_job = false;
     // Fullscreen Space -> Desktop it was entered from, learned from each
     // observed Space change; workspace hotkeys return into these Spaces.
     let mut space_orders = tylora_macos::spaces::ExperimentalSkyLightBackend::new()
@@ -4868,6 +4926,75 @@ fn run_coordinator(
                         }
                     }
                 },
+                NativeMoveEvent::DisplayDetached { uuid, result } => {
+                    display_desktops_job = false;
+                    match result {
+                        Ok((host, detached)) => {
+                            let removed = crate::display_desktops::removed_spaces(&detached);
+                            // Nothing may rebind a workspace to an unrelated
+                            // Desktop while these are gone.
+                            space_slots.retain(|_, slot| !removed.contains(&slot.space_id));
+                            save_space_slots(&space_slots);
+                            state.scratchpads.parking.remove(&uuid);
+                            note_scratchpad_moves(
+                                &mut state.scratchpads,
+                                detached
+                                    .windows
+                                    .iter()
+                                    .map(|window| (window.window_id, window.moved_to)),
+                                host,
+                            );
+                            save_scratchpads(&state.scratchpads);
+                            display_desktops.layouts.remove(&uuid);
+                            display_desktops.detached.insert(uuid, detached);
+                            save_display_desktops(&display_desktops);
+                        }
+                        Err(error) => {
+                            warn!(%error, %uuid, "cannot remove disconnected display's Desktops");
+                            display_desktops_failed.insert(uuid);
+                        }
+                    }
+                }
+                NativeMoveEvent::DisplayReattached {
+                    uuid,
+                    display,
+                    result,
+                } => {
+                    display_desktops_job = false;
+                    match result {
+                        Ok(reattached) => {
+                            if let Some(detached) = display_desktops.detached.remove(&uuid) {
+                                let current = pending_config.as_ref().unwrap_or(&config);
+                                let rebinds = crate::display_desktops::plan_rebinds(
+                                    current,
+                                    &detached.desktops,
+                                    &reattached.desktops,
+                                );
+                                if let Some(updated) = apply_space_rebinds(current, &rebinds) {
+                                    pending_config = Some(updated);
+                                }
+                                if let Some(space) = detached
+                                    .parking
+                                    .and_then(|index| reattached.desktops.get(index))
+                                {
+                                    state.scratchpads.parking.insert(uuid.clone(), *space);
+                                }
+                            }
+                            note_scratchpad_moves(
+                                &mut state.scratchpads,
+                                reattached.windows.iter().copied(),
+                                display,
+                            );
+                            save_scratchpads(&state.scratchpads);
+                            display_desktops.layouts.insert(uuid, reattached.desktops);
+                            save_display_desktops(&display_desktops);
+                        }
+                        Err(error) => {
+                            warn!(%error, %uuid, "cannot recreate reconnected display's Desktops");
+                            display_desktops_failed.insert(uuid);
+                        }
+                    }
+                }
                 NativeMoveEvent::ScratchpadMoved {
                     request,
                     window,
@@ -5127,6 +5254,101 @@ fn run_coordinator(
             if !rebinds.is_empty() {
                 if let Some(updated) = apply_space_rebinds(current, &rebinds) {
                     pending_config = Some(updated);
+                }
+            }
+        }
+        if config.disconnect_policy == tylora_config::DisconnectPolicy::RecreateDesktops {
+            // Remember each connected external display's Desktops, from
+            // WindowServer's own per-display list (keyed by display UUID).
+            let mut changed = false;
+            let mut connected: HashMap<String, DisplayId> = HashMap::new();
+            for order in &space_orders {
+                let Some(uuid) = order.uuid.map(|uuid| format!("{uuid:032x}")) else {
+                    continue;
+                };
+                connected.insert(uuid.clone(), order.display);
+                let builtin = state
+                    .areas
+                    .get(&order.display)
+                    .is_none_or(|area| area.builtin);
+                if builtin || display_desktops.detached.contains_key(&uuid) {
+                    continue;
+                }
+                let desktops: Vec<u64> = order
+                    .spaces
+                    .iter()
+                    .filter(|space| !space.fullscreen)
+                    .map(|space| space.id.0)
+                    .collect();
+                if !desktops.is_empty() && display_desktops.layouts.get(&uuid) != Some(&desktops) {
+                    display_desktops.layouts.insert(uuid, desktops);
+                    changed = true;
+                }
+            }
+            if changed {
+                save_display_desktops(&display_desktops);
+            }
+            let now = Instant::now();
+            display_absent_since.retain(|uuid, _| !connected.contains_key(uuid));
+            display_present_since.retain(|uuid, _| connected.contains_key(uuid));
+            // A failed attempt is retried after the display comes and goes.
+            display_desktops_failed.retain(|uuid| {
+                display_desktops.layouts.contains_key(uuid) != connected.contains_key(uuid)
+            });
+            let detach = display_desktops
+                .layouts
+                .iter()
+                .filter(|(uuid, _)| !connected.contains_key(*uuid))
+                .find(|(uuid, _)| {
+                    let since = *display_absent_since.entry((*uuid).clone()).or_insert(now);
+                    now.duration_since(since) >= crate::display_desktops::DETACH_GRACE
+                        && !display_desktops_failed.contains(*uuid)
+                })
+                .map(|(uuid, desktops)| (uuid.clone(), desktops.clone()));
+            let reattach = display_desktops
+                .detached
+                .iter()
+                .filter_map(|(uuid, detached)| Some((uuid, detached, *connected.get(uuid)?)))
+                .find(|(uuid, _, display)| {
+                    let since = *display_present_since.entry((*uuid).clone()).or_insert(now);
+                    now.duration_since(since) >= crate::display_desktops::REATTACH_GRACE
+                        && !display_desktops_failed.contains(*uuid)
+                        && state
+                            .native_spaces
+                            .iter()
+                            .any(|space| space.display == *display)
+                })
+                .map(|(uuid, detached, display)| (uuid.clone(), detached.clone(), display));
+            if !display_desktops_job && !connected.is_empty() {
+                if let Some((uuid, desktops)) = detach {
+                    display_desktops_job = true;
+                    let parking = state.scratchpads.parking.get(&uuid).copied();
+                    let parkings: Vec<u64> = state.scratchpads.parking.values().copied().collect();
+                    let configured = config.clone();
+                    let sender = native_move_tx.clone();
+                    info!(%uuid, desktops = desktops.len(), "display disconnected; removing its Desktops");
+                    thread::spawn(move || {
+                        let result = crate::display_desktops::detach(
+                            &configured,
+                            &desktops,
+                            parking,
+                            &parkings,
+                        );
+                        let _ = sender.send(NativeMoveEvent::DisplayDetached { uuid, result });
+                    });
+                } else if let Some((uuid, detached, display)) = reattach {
+                    display_desktops_job = true;
+                    let sender = native_move_tx.clone();
+                    let display_id = display.0;
+                    info!(%uuid, display_id, desktops = detached.desktops.len(), "display reconnected; recreating its Desktops");
+                    thread::spawn(move || {
+                        let result = crate::display_desktops::reattach(display, &detached);
+                        let _ = sender.send(NativeMoveEvent::DisplayReattached {
+                            uuid,
+                            display,
+                            result,
+                        });
+                    });
                 }
             }
         }
@@ -7947,6 +8169,7 @@ mod tests {
             scale: 1.0,
             stable_uuid: Some(id as u128),
             primary: id == 1,
+            builtin: id == 1,
         }
     }
     fn snapshot(token: u64, display: u32) -> WindowSnapshot {

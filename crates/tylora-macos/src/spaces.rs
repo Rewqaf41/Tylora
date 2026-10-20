@@ -142,6 +142,9 @@ impl SpaceRegistry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DisplaySpaceOrder {
     pub display: DisplayId,
+    /// The display's stable UUID; WindowServer drops a display from this
+    /// list the moment it disconnects, well before AppKit reports it.
+    pub uuid: Option<u128>,
     pub active: NativeSpaceId,
     pub spaces: Vec<OrderedSpace>,
 }
@@ -278,6 +281,7 @@ mod tests {
     fn order(active: u64, spaces: &[(u64, bool)]) -> DisplaySpaceOrder {
         DisplaySpaceOrder {
             display: DisplayId(1),
+            uuid: None,
             active: NativeSpaceId(active),
             spaces: spaces
                 .iter()
