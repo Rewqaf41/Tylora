@@ -11,7 +11,8 @@
     "test": "vitest run",
     "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
     "desktop:dev": "bun run prepare:sidecar && tauri dev",
-    "desktop:build": "bun run prepare:sidecar -- --release && tauri build --bundles app"
+    "verify:bundle": "sh scripts/verify-bundle.sh",
+    "desktop:build": "bun run prepare:sidecar -- --release && tauri build --bundles app,dmg"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.3",

@@ -7,10 +7,19 @@ use crate::ipc::BridgeError;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuiPreferences {
     pub version: u32,
+    /// Mirrors the SMAppService login item; never read from the file.
     pub launch_at_login: bool,
     pub start_daemon_automatically: bool,
     pub open_settings_at_launch: bool,
     pub show_menu_bar_icon: bool,
+    /// First-run onboarding was finished or skipped. Preference files written
+    /// before onboarding existed belong to configured installs, so it defaults
+    /// to done there; a fresh install has no file and starts with it.
+    #[serde(default = "onboarded_before")]
+    pub onboarding_completed: bool,
+}
+fn onboarded_before() -> bool {
+    true
 }
 impl Default for GuiPreferences {
     fn default() -> Self {
@@ -20,6 +29,7 @@ impl Default for GuiPreferences {
             start_daemon_automatically: false,
             open_settings_at_launch: true,
             show_menu_bar_icon: true,
+            onboarding_completed: false,
         }
     }
 }
@@ -35,6 +45,7 @@ fn home() -> Result<PathBuf, BridgeError> {
 fn prefs_path() -> Result<PathBuf, BridgeError> {
     Ok(home()?.join(".config/tylora/gui.json"))
 }
+/// LaunchAgent written by earlier Tylora builds; replaced by SMAppService.
 fn agent_path() -> Result<PathBuf, BridgeError> {
     Ok(home()?.join("Library/LaunchAgents/com.tylora.settings.plist"))
 }
@@ -44,11 +55,9 @@ fn legacy_prefs_path() -> Result<PathBuf, BridgeError> {
 fn legacy_agent_path() -> Result<PathBuf, BridgeError> {
     Ok(home()?.join("Library/LaunchAgents/com.fluxwm.settings.plist"))
 }
+/// Same resolver (and FluxWM migration) as the daemon, so both use one file.
 fn daemon_config_path() -> Result<PathBuf, BridgeError> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or(home()?.join(".config"));
-    Ok(base.join("tylora/config.toml"))
+    Ok(tylora_config::paths::resolve_config().0)
 }
 
 pub fn read() -> Result<GuiPreferences, BridgeError> {
@@ -73,8 +82,46 @@ pub fn read() -> Result<GuiPreferences, BridgeError> {
             })
         }
     };
-    prefs.launch_at_login = agent_path()?.exists() || legacy_agent_path()?.exists();
+    prefs.launch_at_login = matches!(
+        crate::system::login_item_status(),
+        crate::system::LoginItemStatus::Enabled | crate::system::LoginItemStatus::RequiresApproval
+    ) || agent_path()?.exists()
+        || legacy_agent_path()?.exists();
     Ok(prefs)
+}
+
+/// Removes a LaunchAgent plist written by an earlier build and unloads its
+/// job from this session (both are the user's own; no privileges needed).
+fn remove_agent(path: &PathBuf, label: &str) -> Result<bool, BridgeError> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            let uid = unsafe { libc::geteuid() };
+            let _ = Command::new("/bin/launchctl")
+                .args(["bootout", &format!("gui/{uid}/{label}")])
+                .output();
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(BridgeError {
+            code: "io",
+            message: error.to_string(),
+        }),
+    }
+}
+
+/// Moves a login LaunchAgent of an earlier build (Tylora or FluxWM) to an
+/// SMAppService login item. The old plist is removed only once the new item
+/// is registered, so login keeps working if registration fails.
+pub fn migrate_login_agent() -> Result<(), BridgeError> {
+    let tylora = agent_path()?;
+    let fluxwm = legacy_agent_path()?;
+    if !tylora.exists() && !fluxwm.exists() {
+        return Ok(());
+    }
+    crate::system::set_login_item(true)?;
+    remove_agent(&tylora, "com.tylora.settings")?;
+    remove_agent(&fluxwm, "com.fluxwm.settings")?;
+    Ok(())
 }
 
 fn write_private(path: &PathBuf, bytes: &[u8]) -> Result<(), BridgeError> {
@@ -107,15 +154,6 @@ fn write_private(path: &PathBuf, bytes: &[u8]) -> Result<(), BridgeError> {
     })
 }
 
-fn xml_escape(source: &str) -> String {
-    source
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 pub fn save(prefs: GuiPreferences, tray: &TrayIcon) -> Result<GuiPreferences, BridgeError> {
     if prefs.version != 1 {
         return Err(BridgeError {
@@ -129,26 +167,16 @@ pub fn save(prefs: GuiPreferences, tray: &TrayIcon) -> Result<GuiPreferences, Br
             message: "keep the settings window or menu bar icon visible at launch".into(),
         });
     }
-    if prefs.launch_at_login {
-        let binary = std::env::current_exe().map_err(|error| BridgeError {
-            code: "io",
-            message: error.to_string(),
-        })?;
-        let path = agent_path()?;
-        let plist = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>com.tylora.settings</string><key>ProgramArguments</key><array><string>{}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/></dict></plist>\n", xml_escape(&binary.to_string_lossy()));
-        write_private(&path, plist.as_bytes())?;
-    } else {
-        match fs::remove_file(agent_path()?) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(BridgeError {
-                    code: "io",
-                    message: error.to_string(),
-                })
-            }
-        }
+    let mut prefs = prefs;
+    let login = crate::system::set_login_item(prefs.launch_at_login)?;
+    if !prefs.launch_at_login {
+        remove_agent(&agent_path()?, "com.tylora.settings")?;
+        remove_agent(&legacy_agent_path()?, "com.fluxwm.settings")?;
     }
+    prefs.launch_at_login = matches!(
+        login,
+        crate::system::LoginItemStatus::Enabled | crate::system::LoginItemStatus::RequiresApproval
+    );
     write_private(
         &prefs_path()?,
         &serde_json::to_vec_pretty(&prefs).map_err(|error| BridgeError {
@@ -156,16 +184,6 @@ pub fn save(prefs: GuiPreferences, tray: &TrayIcon) -> Result<GuiPreferences, Br
             message: error.to_string(),
         })?,
     )?;
-    match fs::remove_file(legacy_agent_path()?) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(BridgeError {
-                code: "io",
-                message: error.to_string(),
-            })
-        }
-    }
     tray.set_visible(prefs.show_menu_bar_icon)
         .map_err(|error| BridgeError {
             code: "io",

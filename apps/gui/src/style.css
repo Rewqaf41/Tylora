@@ -314,12 +314,29 @@
   .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; }
   .muted { color:var(--muted); }.faint { color:var(--faint); }.good-text { color:var(--good); }.bad-text { color:var(--bad); }.warn-text { color:var(--warn); }
 
+  /* ── First-run setup: a modal sheet over the shell ── */
+  .onboarding { position:fixed; inset:0; z-index:50; display:grid; place-items:center; padding:24px; background:color-mix(in srgb, var(--bg) 82%, transparent); backdrop-filter:blur(14px); }
+  .onboarding-panel { width:min(720px,100%); max-height:100%; display:flex; flex-direction:column; background:var(--bg-elev); border:1px solid var(--border-strong); border-radius:20px; box-shadow:var(--menu-shadow); overflow:hidden; }
+  .onboarding-head { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:16px 28px; border-bottom:1px solid var(--border); }
+  .onboarding-head .brand { padding:0; flex:none; }
+  .onboarding-steps { display:flex; gap:4px; margin:0; padding:0; list-style:none; }
+  .onboarding-steps li { display:flex; align-items:center; gap:5px; padding:5px 9px; border-radius:999px; font-size:11.5px; color:var(--faint); }
+  .onboarding-steps li.done { color:var(--muted); }
+  .onboarding-steps li.current { background:var(--accent-soft); color:var(--accent-fg); font-weight:600; }
+  .onboarding-body { padding:24px 28px 8px; overflow-y:auto; display:flex; flex-direction:column; gap:14px; }
+  .onboarding-body h1 { margin:0; font-size:22px; letter-spacing:-.4px; font-weight:600; }
+  .onboarding-body > p { margin:0; }
+  .onboarding-list { margin:0; padding:4px 0 4px 18px; display:flex; flex-direction:column; gap:7px; }
+  .onboarding-foot { display:flex; justify-content:space-between; align-items:center; padding:16px 28px; border-top:1px solid var(--border); }
+  .link-button { background:none; border:0; padding:0; color:var(--accent-fg); font-weight:500; text-decoration:underline; text-underline-offset:2px; }
+  @media (max-width:900px) { .onboarding-steps span { display:none; } }
+
   /* ── Responsive (board 05): ≤1024 icon rail, metrics 2×2, sections stack ── */
   @media (max-width:1180px) { .two-col { grid-template-columns:minmax(0,1fr) minmax(280px,340px); } }
   @media (max-width:1024px) {
     .sidebar { width:64px; }
-    .brand { padding:22px 0 15px; justify-content:center; }
-    .brand > div:last-child,.sidebar-section,.nav-link span,.sidebar-bottom small,.sidebar-foot span:last-child { display:none; }
+    .sidebar > .brand { padding:22px 0 15px; justify-content:center; }
+    .sidebar > .brand > div:last-child,.sidebar-section,.nav-link span,.sidebar-bottom small,.sidebar-foot span:last-child { display:none; }
     .sidebar nav { padding:8px 13px; }
     .nav-link { justify-content:center; padding:0; height:38px; }
     .sidebar-bottom { align-items:center; padding:14px 0 16px; }

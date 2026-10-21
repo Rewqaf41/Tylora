@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- Hardened runtime without exceptions: no JIT, no unsigned memory, no
+     disabled library validation and no Apple Events. Accessibility and the
+     event tap are TCC permissions the user grants; they need no entitlement.
+     Not sandboxed: a window manager must reach other apps' windows. -->
+<dict/>
+</plist>

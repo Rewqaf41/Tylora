@@ -22,7 +22,7 @@ bun run desktop:build
 open "../../target/release/bundle/macos/Tylora.app"
 ```
 
-Copy the `.app` to `/Applications` for a stable location before enabling Launch at login. This locally built app is not notarized; macOS may require an explicit first launch from Finder. The CLI remains available as `../../target/release/tylora`.
+`desktop:build` also writes `target/release/bundle/dmg/Tylora_<version>_aarch64.dmg`; `bun run verify:bundle` checks both. The local build is ad-hoc signed with the hardened runtime and not notarized, and each rebuild changes its signature, so Accessibility must be re-enabled for it (see [RELEASE.md](../../RELEASE.md)). Launch at login uses `SMAppService` and follows the app when it is replaced. The CLI is `Tylora.app/Contents/MacOS/tylora`.
 
 ## Checks
 

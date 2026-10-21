@@ -20,3 +20,7 @@ serde_json.workspace = true
 tylora-config = { path = "../../../crates/tylora-config" }
 tylora-core = { path = "../../../crates/tylora-core" }
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Same version Tauri already uses; SMAppService (login item) calls.
+objc2 = "=0.6.5"

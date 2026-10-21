@@ -1,5 +1,6 @@
 mod ipc;
 mod preferences;
+mod system;
 
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
@@ -18,6 +19,9 @@ fn show_settings(app: &tauri::AppHandle) {
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
+            if let Err(error) = preferences::migrate_login_agent() {
+                eprintln!("login item migration failed: {}", error.message);
+            }
             let preferences = preferences::read().unwrap_or_default();
             let status = MenuItemBuilder::with_id("status", "Tylora — checking…")
                 .enabled(false)
@@ -25,19 +29,26 @@ fn main() {
             let workspace = MenuItemBuilder::with_id("workspace", "Workspace —")
                 .enabled(false)
                 .build(app)?;
-            let open = MenuItemBuilder::with_id("open", "Open Settings").build(app)?;
+            let open = MenuItemBuilder::with_id("open", "Open Tylora…").build(app)?;
+            let start = MenuItemBuilder::with_id("start", "Start Tylora").build(app)?;
             let reconcile =
                 MenuItemBuilder::with_id("reconcile", "Reconcile Windows").build(app)?;
-            let quit = MenuItemBuilder::with_id("quit", "Quit Settings").build(app)?;
+            let quit =
+                MenuItemBuilder::with_id("quit", "Quit App (Tiling Keeps Running)").build(app)?;
             let stop = MenuItemBuilder::with_id("stop", "Stop Tylora").build(app)?;
             let menu = MenuBuilder::new(app)
-                .items(&[&status, &workspace, &open, &reconcile, &quit, &stop])
+                .items(&[&status, &workspace, &open, &start, &reconcile, &stop, &quit])
                 .build()?;
             let tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().expect("bundle icon").clone())
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => show_settings(app),
+                    "start" => {
+                        std::thread::spawn(|| {
+                            let _ = ipc::control(ipc::Control::Start);
+                        });
+                    }
                     "reconcile" => {
                         std::thread::spawn(|| {
                             let _ = ipc::send("reconcile");
@@ -64,7 +75,7 @@ fn main() {
                 .build(app)?;
             tray.set_visible(preferences.show_menu_bar_icon)?;
             app.manage(tray);
-            if !preferences.open_settings_at_launch {
+            if !preferences.open_settings_at_launch && preferences.onboarding_completed {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
@@ -115,7 +126,10 @@ fn main() {
             preferences::config_location,
             preferences::open_config_file,
             preferences::macos_version,
-            preferences::export_diagnostics
+            preferences::export_diagnostics,
+            system::app_info,
+            system::request_accessibility,
+            system::open_system_pane
         ])
         .run(tauri::generate_context!())
         .expect("Tylora settings failed to start");

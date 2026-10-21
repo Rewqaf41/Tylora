@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { NavLink, Route, Routes, useLocation } from 'react-router'
 import { ChevronDown, Columns3, Ellipsis, Keyboard, LayoutDashboard, LayoutGrid, Languages, Layers, ListChecks, Monitor, MousePointer2, RefreshCcw, Settings, Sparkles, Stethoscope } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { useDaemon } from '../api/hooks'
+import { guiPreferences } from '../api/bridge'
+import { Onboarding } from '../features/Onboarding'
 import { useLang, useT, type LanguagePref, type MessageKey } from '../i18n'
 import { useUI } from './store'
 import { BrandMark } from '../shared/BrandMark'
@@ -42,6 +45,8 @@ export function App() {
   const setLanguage = useUI((state) => state.setLanguage)
   const [menuOpen, setMenuOpen] = useState(false)
   const scroller = useRef<HTMLDivElement>(null)
+  const client = useQueryClient()
+  const prefs = useQuery({ queryKey: ['gui-prefs'], queryFn: guiPreferences })
   const current = navigation.find((item) => item.path === location.pathname)
   const title = current ? t(current.title) : 'Tylora'
 
@@ -56,6 +61,7 @@ export function App() {
   useEffect(() => { scroller.current?.scrollTo(0, 0); setMenuOpen(false) }, [location.pathname])
 
   return <div className="app-shell">
+    {prefs.data && !prefs.data.onboarding_completed && <Onboarding prefs={prefs.data} onDone={(next) => client.setQueryData(['gui-prefs'], next)} />}
     <aside className="sidebar">
       <div className="brand"><BrandMark /><div><strong>Tylora</strong><small>{t('app.controlCenter')}</small></div></div>
       <div className="sidebar-section">{t('app.sectionWorkspace')}</div>
@@ -63,7 +69,7 @@ export function App() {
         <NavLink key={path} to={path} end={path === '/'} title={t(name)} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
           <Icon size={16} strokeWidth={1.8} /><span>{t(name)}</span>
         </NavLink>)}</nav>
-      <div className="sidebar-bottom"><div className="sidebar-foot"><span className={status.isSuccess ? 'live-dot' : 'off-dot'} /><span>{status.isSuccess ? t('app.daemonConnected') : t('app.daemonOffline')}</span></div><small>Tylora 0.1 · macOS</small></div>
+      <div className="sidebar-bottom"><div className="sidebar-foot"><span className={status.isSuccess ? 'live-dot' : 'off-dot'} /><span>{status.isSuccess ? t('app.daemonConnected') : t('app.daemonOffline')}</span></div><small>Tylora {__APP_VERSION__} · macOS</small></div>
     </aside>
     <div className="main-shell" ref={scroller}>
       <header className="topbar"><div className="breadcrumb"><span>Tylora</span><span>/</span><strong>{title}</strong></div>

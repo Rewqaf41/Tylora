@@ -20,7 +20,7 @@ pub struct BridgeError {
     pub message: String,
 }
 impl BridgeError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -412,7 +412,8 @@ pub fn mutate(action: Mutation) -> Result<Value, BridgeError> {
     }
 }
 
-fn daemon_binary() -> Result<PathBuf, BridgeError> {
+/// The daemon shipped next to this executable (`Tylora.app/Contents/MacOS/tylora`).
+pub(crate) fn daemon_binary() -> Result<PathBuf, BridgeError> {
     let current =
         std::env::current_exe().map_err(|error| BridgeError::new("io", error.to_string()))?;
     let path = current
@@ -456,7 +457,9 @@ pub fn control(op: Control) -> Result<Value, BridgeError> {
         Control::Restart => {
             if query(QueryKind::Status).is_ok() {
                 send("stop")?;
-                for _ in 0..30 {
+                // `stop` restores hidden and parked windows before the daemon
+                // releases its socket; the CLI allows it 20 seconds as well.
+                for _ in 0..200 {
                     if query(QueryKind::Status).is_err() {
                         break;
                     }

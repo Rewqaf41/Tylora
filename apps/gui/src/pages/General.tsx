@@ -1,14 +1,15 @@
 import { useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ExternalLink, RefreshCw, RotateCcw } from 'lucide-react'
+import { ExternalLink, RefreshCw, RotateCcw, ShieldCheck, Sparkles } from 'lucide-react'
+import { appInfo, guiPreferences, openSystemPane, requestAccessibility, saveGuiPreferences, type GuiPreferences } from '../api/bridge'
 import { useUI, type Theme } from '../app/store'
 import { useDaemon } from '../api/hooks'
 import { useT, type LanguagePref } from '../i18n'
 import { Badge, Button, Card, ConfirmButton, ErrorState, Loading, Notice, Segmented } from '../shared/ui'
 
-interface Preferences { version: 1; launch_at_login: boolean; start_daemon_automatically: boolean; open_settings_at_launch: boolean; show_menu_bar_icon: boolean }
-const defaults: Preferences = { version: 1, launch_at_login: false, start_daemon_automatically: false, open_settings_at_launch: true, show_menu_bar_icon: true }
+type Preferences = GuiPreferences
+const defaults: Omit<Preferences, 'onboarding_completed'> = { version: 1, launch_at_login: false, start_daemon_automatically: false, open_settings_at_launch: true, show_menu_bar_icon: true }
 
 export function General() {
   const t = useT()
@@ -18,11 +19,12 @@ export function General() {
   const setTheme = useUI((state) => state.setTheme)
   const setLanguage = useUI((state) => state.setLanguage)
   const client = useQueryClient()
-  const prefs = useQuery({ queryKey: ['gui-prefs'], queryFn: () => invoke<Preferences>('gui_preferences') })
+  const prefs = useQuery({ queryKey: ['gui-prefs'], queryFn: guiPreferences })
+  const info = useQuery({ queryKey: ['app-info'], queryFn: appInfo, refetchInterval: 5000 })
   const path = useQuery({ queryKey: ['config-path'], queryFn: () => invoke<string>('config_location'), staleTime: Infinity })
-  const save = useMutation({ mutationFn: (next: Preferences) => invoke<Preferences>('save_gui_preferences', { prefs: next }), onSuccess: (next) => client.setQueryData(['gui-prefs'], next) })
+  const save = useMutation({ mutationFn: saveGuiPreferences, onSuccess: (next) => { client.setQueryData(['gui-prefs'], next); void info.refetch() } })
   const [openError, setOpenError] = useState('')
-  const update = (key: keyof Omit<Preferences, 'version'>, checked: boolean) => { if (prefs.data) save.mutate({ ...prefs.data, [key]: checked }) }
+  const update = (key: keyof Omit<Preferences, 'version' | 'onboarding_completed'>, checked: boolean) => { if (prefs.data) save.mutate({ ...prefs.data, [key]: checked }) }
   const open = async () => { try { await invoke('open_config_file'); setOpenError('') } catch (error) { setOpenError(String(error)) } }
   return <><div className="page-heading"><div><span className="eyebrow">{t('general.eyebrow')}</span><h1>{t('general.title')}</h1><p>{t('general.intro')}</p></div></div>
     {prefs.isPending ? <Loading /> : prefs.isError ? <ErrorState message={String(prefs.error)} retry={() => void prefs.refetch()} /> : <>
@@ -39,12 +41,17 @@ export function General() {
           ['show_menu_bar_icon', t('general.menuBarIcon'), t('general.menuBarIconHint')],
         ] as const).map(([key, title, detail]) => <div className="row row-pad" key={key}><div><span className="row-title">{title}</span><span className="row-sub">{detail}</span></div><input aria-label={title} type="checkbox" checked={prefs.data[key]} disabled={save.isPending} onChange={(event) => update(key, event.target.checked)} /></div>)}
       </Card>
-      {save.isError && <p className="bad-text">{String(save.error)}</p>}{save.isSuccess && <p className="good-text">{t('general.saved')}</p>}
+      {info.data?.login_item === 'requires_approval' && <Notice tone="warn">{t('general.loginApproval')} <button className="link-button" onClick={() => void openSystemPane('login_items')}>{t('general.openLoginItems')}</button></Notice>}
+      {save.isError && <p className="bad-text">{save.error.message}</p>}{save.isSuccess && <p className="good-text">{t('general.saved')}</p>}
       </div><div>
       <Card title={t('general.configuration')} description={t('general.configurationHint')} className="padded"><div className="row row-pad"><div><span className="row-title">{t('general.configLocation')}</span><span className="row-sub mono">{path.data ?? t('common.loadingShort')}</span></div><Button size="sm" onClick={() => void open()}><ExternalLink size={13} /> {t('general.openFile')}</Button></div><div className="row row-pad"><div><span className="row-title">{t('general.logLevel')}</span><span className="row-sub">{t('general.logLevelHint')}</span></div><Badge tone="info">{t('general.requiresRestart')}</Badge></div></Card>
       {openError && <p className="bad-text">{openError}</p>}
-      <Card title={t('general.permissions')} description={t('general.permissionsHint')} className="padded"><div className="row row-pad"><div><span className="row-title">Accessibility</span><span className="row-sub">{daemon.isSuccess ? (daemon.data.accessibility_trusted ? t('general.axGranted') : t('general.axMissing')) : t('general.axStartDaemon')}</span></div><div className="list-actions">{daemon.isSuccess && <Badge tone={daemon.data.accessibility_trusted ? 'good' : 'bad'}>{daemon.data.accessibility_trusted ? t('common.granted') : t('dashboard.permissionNeeded')}</Badge>}<Button variant="ghost" size="sm" onClick={() => void daemon.refetch()}><RefreshCw size={13} /> {t('general.checkPermissions')}</Button></div></div></Card>
-      <Card title={t('general.reset')} description={t('general.resetHint')} className="padded"><div className="row row-pad"><div><span className="row-title">{t('general.resetApp')}</span><span className="row-sub">{t('general.resetAppHint')}</span></div><ConfirmButton size="sm" prompt={t('general.resetConfirm')} disabled={save.isPending} onConfirm={() => { setTheme('system'); setLanguage('system'); save.mutate(defaults) }}><RotateCcw size={13} /> {t('general.resetButton')}</ConfirmButton></div></Card>
+      <Card title={t('general.permissions')} description={t('general.permissionsHint')} className="padded">
+        <div className="row row-pad"><div><span className="row-title">Accessibility · {t('general.appTrust')}</span><span className="row-sub">{t('onboarding.axWho')}</span></div><div className="list-actions">{info.isSuccess && <Badge tone={info.data.accessibility_trusted ? 'good' : 'bad'}>{info.data.accessibility_trusted ? t('common.granted') : t('dashboard.permissionNeeded')}</Badge>}{info.isSuccess && !info.data.accessibility_trusted && <><Button size="sm" variant="primary" onClick={() => void requestAccessibility().then(() => info.refetch())}><ShieldCheck size={13} /> {t('general.axRequest')}</Button><Button size="sm" onClick={() => void openSystemPane('accessibility')}><ExternalLink size={13} /> {t('general.axOpen')}</Button></>}</div></div>
+        <div className="row row-pad"><div><span className="row-title">Accessibility · {t('dashboard.daemon')}</span><span className="row-sub">{daemon.isSuccess ? (daemon.data.accessibility_trusted ? t('general.axGranted') : t('general.axMissing')) : t('general.axStartDaemon')}</span></div><div className="list-actions">{daemon.isSuccess && <Badge tone={daemon.data.accessibility_trusted ? 'good' : 'bad'}>{daemon.data.accessibility_trusted ? t('common.granted') : t('dashboard.permissionNeeded')}</Badge>}<Button variant="ghost" size="sm" onClick={() => { void daemon.refetch(); void info.refetch() }}><RefreshCw size={13} /> {t('general.checkPermissions')}</Button></div></div>
+        <div className="row row-pad"><div><span className="row-title">{t('general.runSetup')}</span><span className="row-sub">{t('general.runSetupHint')}</span></div><Button size="sm" disabled={save.isPending} onClick={() => save.mutate({ ...prefs.data, onboarding_completed: false })}><Sparkles size={13} /> {t('general.runSetupButton')}</Button></div>
+      </Card>
+      <Card title={t('general.reset')} description={t('general.resetHint')} className="padded"><div className="row row-pad"><div><span className="row-title">{t('general.resetApp')}</span><span className="row-sub">{t('general.resetAppHint')}</span></div><ConfirmButton size="sm" prompt={t('general.resetConfirm')} disabled={save.isPending} onConfirm={() => { setTheme('system'); setLanguage('system'); save.mutate({ ...defaults, onboarding_completed: true }) }}><RotateCcw size={13} /> {t('general.resetButton')}</ConfirmButton></div></Card>
       </div></div>
       <Notice>{t('general.closingNotice')}</Notice>
     </>}

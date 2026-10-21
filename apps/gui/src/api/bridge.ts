@@ -96,3 +96,33 @@ export async function resumeHotkeys(): Promise<unknown> {
   try { return await invoke('daemon_mutate', { action: { kind: 'resume_hotkeys' } }) }
   catch (error) { throw normalize(error) }
 }
+
+export type LoginItemStatus = 'not_registered' | 'enabled' | 'requires_approval' | 'not_found' | 'unavailable'
+export interface AppInfo { version: string; bundled_daemon: string | null; accessibility_trusted: boolean; login_item: LoginItemStatus; daemon_version: string | null; daemon_executable: string | null }
+export interface GuiPreferences { version: 1; launch_at_login: boolean; start_daemon_automatically: boolean; open_settings_at_launch: boolean; show_menu_bar_icon: boolean; onboarding_completed: boolean }
+
+export async function appInfo(): Promise<AppInfo> {
+  try { return await invoke<AppInfo>('app_info') }
+  catch (error) { throw normalize(error) }
+}
+
+/** Shows the macOS Accessibility prompt; resolves to the current trust state. */
+export async function requestAccessibility(): Promise<boolean> {
+  try { return await invoke<boolean>('request_accessibility') }
+  catch (error) { throw normalize(error) }
+}
+
+export async function openSystemPane(pane: 'accessibility' | 'input_monitoring' | 'login_items'): Promise<void> {
+  try { await invoke('open_system_pane', { pane }) }
+  catch (error) { throw normalize(error) }
+}
+
+export async function guiPreferences(): Promise<GuiPreferences> {
+  try { return await invoke<GuiPreferences>('gui_preferences') }
+  catch (error) { throw normalize(error) }
+}
+
+export async function saveGuiPreferences(prefs: GuiPreferences): Promise<GuiPreferences> {
+  try { return await invoke<GuiPreferences>('save_gui_preferences', { prefs }) }
+  catch (error) { throw normalize(error) }
+}

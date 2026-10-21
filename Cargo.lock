@@ -3818,6 +3818,7 @@ name = "tylora-gui"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "objc2 0.6.5",
  "serde",
  "serde_json",
  "tauri",

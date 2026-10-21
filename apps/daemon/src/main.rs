@@ -46,6 +46,10 @@ fn main() -> ExitCode {
         return usage();
     }
     match args.as_slice() {
+        [command] if command == "--version" || command == "version" => {
+            println!("tylora {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         [command] if command == "list-windows" => list_windows(false),
         [command, flag] if command == "list-windows" && flag == "--ax" => list_windows(true),
         #[cfg(target_os = "macos")]
@@ -152,7 +156,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: tylora start [--display ID] | stop | recover-windows | status [--json] | windows | layout | reconcile | space list|current|capabilities|diagnostics|move-diagnostics|reconcile [--json] | space focus WORKSPACE [--json] | space focus-id NATIVE_ID [--json] | space move-window WORKSPACE [--window-id CG_ID] [--json] | space windows DESKTOP_NUMBER [--json] | display list [--json] | display focus next|DIR | window move-to-display next|previous|ID [--json] | hotkeys list [--json] | hotkeys pause|resume | list-windows [--ax] | focus DIR|next|previous | move DIR | resize DIR --amount N | floating toggle | zoom toggle | layout list|current [--json] | rules list|validate|reload|diagnostics [--json] | rules test|apply --window CG_ID [--json] | apps list [--json] | scratchpad list|capabilities|recover [--json] | scratchpad assign ID [--window CG_ID] [--force] [--json] | scratchpad unassign|toggle|show|hide ID [--json] | layout set bsp|dwindle|scrolling [--json] | layout cycle [--json] | scroll left|right | center | column cycle-width | column width DELTA");
+    eprintln!("usage: tylora --version | start [--display ID] | stop | recover-windows | status [--json] | windows | layout | reconcile | space list|current|capabilities|diagnostics|move-diagnostics|reconcile [--json] | space focus WORKSPACE [--json] | space focus-id NATIVE_ID [--json] | space move-window WORKSPACE [--window-id CG_ID] [--json] | space windows DESKTOP_NUMBER [--json] | display list [--json] | display focus next|DIR | window move-to-display next|previous|ID [--json] | hotkeys list [--json] | hotkeys pause|resume | list-windows [--ax] | focus DIR|next|previous | move DIR | resize DIR --amount N | floating toggle | zoom toggle | layout list|current [--json] | rules list|validate|reload|diagnostics [--json] | rules test|apply --window CG_ID [--json] | apps list [--json] | scratchpad list|capabilities|recover [--json] | scratchpad assign ID [--window CG_ID] [--force] [--json] | scratchpad unassign|toggle|show|hide ID [--json] | layout set bsp|dwindle|scrolling [--json] | layout cycle [--json] | scroll left|right | center | column cycle-width | column width DELTA");
     ExitCode::from(2)
 }
 

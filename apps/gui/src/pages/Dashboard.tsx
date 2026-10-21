@@ -29,6 +29,7 @@ export function Dashboard() {
       {action.isError && <p className="bad-text">{action.error.message}</p>}
       <ErrorState message={status.error.message} retry={() => void status.refetch()} />
     </> : <>
+      {status.data.daemon_version !== __APP_VERSION__ && <Notice tone="warn">{t('general.versionMismatch', { daemon: status.data.daemon_version ?? '< 0.1.0', app: __APP_VERSION__ })}</Notice>}
       <div className="metric-grid">
         <Metric icon={Activity} label={t('dashboard.daemon')} value={t('dashboard.running')} detail={t('dashboard.viaIpc')} detailIcon={CircleCheck} tone="good" />
         <Metric icon={LayoutGrid} label={t('dashboard.currentWorkspace')} value={currentWorkspace?.name ?? t('dashboard.unbound')} detail={activeSpace ? t('dashboard.nativeSpace', { id: activeSpace.id }) : t('dashboard.noActiveSpace')} detailIcon={Link2} />

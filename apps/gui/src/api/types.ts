@@ -160,6 +160,8 @@ export interface HotkeyState extends Hotkey { active: boolean }
 export interface DaemonStatus {
   version: 1; state: 'running'; displays: number; primary_display: number; windows: number; tiled: number; floating: number
   active_workspaces: { display: number; id: number }[]; layout: LayoutKind; accessibility_trusted: boolean
+  /** Absent on daemons older than 0.1 release builds. */
+  daemon_version?: string; pid?: number; executable?: string | null
   layouts?: CurrentLayout[]
   native_spaces: NativeSpace[]; degraded: number; stale_results: number
   layout_zoom: { display: number; native_space_id: number; window: { process: { pid: number; epoch: number }; token: number }; cg_window_id: number; confirmed: boolean }[]

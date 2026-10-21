@@ -15,6 +15,7 @@ pub use tylora_core::scratchpad::{
 };
 
 pub mod mutation;
+pub mod paths;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

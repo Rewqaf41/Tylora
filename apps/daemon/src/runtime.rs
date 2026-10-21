@@ -58,49 +58,42 @@ fn legacy_daemon_running() -> bool {
         && UnixStream::connect(path).is_ok()
 }
 fn migrate_legacy_file(new_path: &Path, old_path: &Path) {
-    if new_path.exists() || !old_path.is_file() {
-        return;
-    }
-    let result = (|| -> std::io::Result<()> {
-        let content = fs::read(old_path)?;
-        let parent = new_path
-            .parent()
-            .ok_or_else(|| std::io::Error::other("missing parent"))?;
-        fs::create_dir_all(parent)?;
-        let temporary = new_path.with_extension(format!("migration-{}.tmp", std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(&content)?;
-        file.sync_all()?;
-        let linked = fs::hard_link(&temporary, new_path);
-        let _ = fs::remove_file(&temporary);
-        linked.or_else(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })
-    })();
-    match result {
-        Ok(()) => {
+    log_migration(
+        new_path,
+        old_path,
+        tylora_config::paths::migrate_legacy_file(new_path, old_path),
+    );
+}
+fn log_migration(new_path: &Path, old_path: &Path, outcome: tylora_config::paths::Migration) {
+    use tylora_config::paths::Migration;
+    match outcome {
+        Migration::NotNeeded => {}
+        // Both exist: the Tylora file wins; nothing is merged.
+        Migration::BothExist => {}
+        Migration::Copied { problem: None } => {
             info!(old = %old_path.display(), new = %new_path.display(), "legacy data migrated")
         }
-        Err(error) => {
+        Migration::Copied {
+            problem: Some(error),
+        } => {
+            warn!(old = %old_path.display(), new = %new_path.display(), %error, "legacy configuration migrated but does not validate; defaults apply until the new file is fixed")
+        }
+        Migration::Failed(error) => {
             warn!(old = %old_path.display(), new = %new_path.display(), %error, "legacy data migration failed")
         }
     }
 }
 pub(crate) fn config_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| std::env::temp_dir().join("tylora-config"));
-    let path = base.join("tylora/config.toml");
-    migrate_legacy_file(&path, &base.join("fluxwm/config.toml"));
+    let base = tylora_config::paths::config_base();
+    let (path, legacy) = (
+        tylora_config::paths::config_file(&base),
+        tylora_config::paths::legacy_config_file(&base),
+    );
+    log_migration(
+        &path,
+        &legacy,
+        tylora_config::paths::migrate_legacy_config(&path, &legacy),
+    );
     path
 }
 fn load_config() -> Config {
@@ -4531,9 +4524,19 @@ struct IpcRequest {
 }
 
 fn ipc_loop(listener: UnixListener, requests: SyncSender<IpcRequest>, stopping: Arc<AtomicBool>) {
+    // A blocking accept keeps the idle daemon from waking 50 times a second.
+    // The thread is never joined: after `stop` it is left blocked until the
+    // process exits, and the socket file is already removed.
+    if let Err(error) = listener.set_nonblocking(false) {
+        warn!(%error, "IPC listener stays non-blocking");
+    }
     while !stopping.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                // macOS hands out accepted sockets with the listener's
+                // O_NONBLOCK; a client whose line was not there yet would get
+                // "invalid request" (seen with concurrent clients).
+                let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
                 let mut line = String::new();
                 let reply = if BufReader::new(&stream).read_line(&mut line).is_ok() {
@@ -8264,6 +8267,9 @@ fn handle_request(
         "status --json" => serde_json::to_string(&serde_json::json!({
             "version": 1,
             "state": "running",
+            "daemon_version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
+            "executable": std::env::current_exe().ok(),
             "displays": state.active.len(),
             "primary_display": state.primary,
             "windows": state.len(),
@@ -8317,6 +8323,7 @@ fn handle_request(
         "diagnostics --json" => serde_json::to_string(&serde_json::json!({
             "version":1,
             "daemon":"running",
+            "daemon_version": env!("CARGO_PKG_VERSION"),
             "accessibility_trusted":accessibility_trusted(),
             "native_spaces":state.native_spaces.len(),
             "managed_windows":state.len(),
@@ -8534,6 +8541,36 @@ mod tests {
         registry::{ManagementMode, WindowLifecycle},
         Rect,
     };
+    #[test]
+    fn ipc_reads_a_line_sent_after_connecting() {
+        let path =
+            std::env::temp_dir().join(format!("tylora-ipc-loop-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (requests, received) = mpsc::sync_channel::<IpcRequest>(4);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let server = {
+            let stopping = stopping.clone();
+            thread::spawn(move || ipc_loop(listener, requests, stopping))
+        };
+        let answer = thread::spawn(move || {
+            let request = received.recv().unwrap();
+            let _ = request.response.send(format!("echo {}\n", request.command));
+        });
+        let mut client = UnixStream::connect(&path).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        client.write_all(b"status --json\n").unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, "echo status --json\n");
+        answer.join().unwrap();
+        stopping.store(true, Ordering::Release);
+        // Wakes the blocking accept so the loop sees the flag.
+        drop(UnixStream::connect(&path));
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
     #[test]
     fn legacy_config_import_is_non_destructive() {
         let root = std::env::temp_dir().join(format!(
