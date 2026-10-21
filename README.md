@@ -6,12 +6,12 @@
 
 **A tiling window manager for macOS, built to keep your workspace in order.**
 
-[![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-22252c?style=flat-square&logo=apple&logoColor=white)](https://github.com/Rewqaf41/tylora#requirements)
+[![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-22252c?style=flat-square&logo=apple&logoColor=white)](https://github.com/Rewqaf41/Tylora#requirements)
 [![Rust](https://img.shields.io/badge/core-Rust-f26b16?style=flat-square&logo=rust&logoColor=white)](Cargo.toml)
 [![Tauri](https://img.shields.io/badge/settings-Tauri%20%2B%20React-22252c?style=flat-square&logo=tauri&logoColor=white)](apps/gui/README.md)
 [![Status](https://img.shields.io/badge/status-experimental-9b5b35?style=flat-square)](#project-status)
 
-[![Download DMG](https://img.shields.io/badge/Download-DMG%20for%20Apple%20Silicon-f26b16?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/Rewqaf41/tylora/releases/latest/download/Tylora_aarch64.dmg)
+[![Download DMG](https://img.shields.io/badge/Download-DMG%20for%20Apple%20Silicon-f26b16?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/Rewqaf41/Tylora/releases/latest/download/Tylora_aarch64.dmg)
 
 [Get started](#get-started) · [See the layouts](#see-the-layouts) · [Documentation](#documentation)
 
