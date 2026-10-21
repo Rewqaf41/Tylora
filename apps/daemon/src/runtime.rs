@@ -4537,7 +4537,7 @@ fn ipc_loop(listener: UnixListener, requests: SyncSender<IpcRequest>, stopping: 
                 // O_NONBLOCK; a client whose line was not there yet would get
                 // "invalid request" (seen with concurrent clients).
                 let _ = stream.set_nonblocking(false);
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                 let mut line = String::new();
                 let reply = if BufReader::new(&stream).read_line(&mut line).is_ok() {
                     let (tx, rx) = mpsc::sync_channel(1);
