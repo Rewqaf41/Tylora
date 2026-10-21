@@ -1,11 +1,11 @@
 import { useState } from 'react'
-import { Plus, Search } from 'lucide-react'
+import { Check, Plus, Search, X } from 'lucide-react'
 import { useConfigPatch, useDaemon } from '../api/hooks'
 import type { AnyStateCommand, StateCommand } from '../api/types'
 import { shortcutWarning } from '../shared/hotkey'
 import { HotkeyRecorder } from '../shared/HotkeyRecorder'
 import { useT, type MessageKey, type T, type Vars } from '../i18n'
-import { Badge, Button, Card, ErrorState, Loading, Notice, SectionHeader } from '../shared/ui'
+import { Appear, Badge, Button, Card, ErrorState, Keys, Loading, Notice, PageHeading } from '../shared/ui'
 
 const DIRECTIONS = ['left', 'right', 'up', 'down'] as const
 const actions: { label: MessageKey; vars?: Vars; command: StateCommand }[] = [
@@ -68,20 +68,28 @@ export function Hotkeys() {
   const conflict = chord && (definitions.some((binding, at) => at !== index && binding.enabled && binding.chord.toLowerCase() === chord.toLowerCase())
     || (config.data?.config.scratchpads ?? []).some((pad) => pad.hotkey?.toLowerCase() === chord.toLowerCase()))
   const save = () => { if (!config.data || !chord || conflict) return; patch.mutate({ revision: config.data.revision, patch: { kind: 'set_hotkey', index: index ?? null, chord, command, enabled } }) }
-  return <><div className="page-heading"><div><span className="eyebrow">{t('focus.eyebrow')}</span><h1>{t('nav.hotkeys')}</h1><p>{t('hotkeys.intro')}</p></div><Button variant="primary" onClick={() => open(null)}><Plus size={14} /> {t('hotkeys.new')}</Button></div>
+  const rows = definitions.map((binding, at) => ({ binding, at })).filter(({ binding }) => label(t, binding.command).toLowerCase().includes(search.toLowerCase()) || binding.chord.toLowerCase().includes(search.toLowerCase()))
+  return <><PageHeading eyebrow={t('focus.eyebrow')} title={t('nav.hotkeys')} intro={t('hotkeys.intro')} actions={<Button variant="primary" onClick={() => open(null)}><Plus size={14} /> {t('hotkeys.new')}</Button>} />
     {!online ? status.isPending ? <Loading /> : <ErrorState message={t('hotkeys.offline')} retry={() => void status.refetch()} /> : config.isPending || active.isPending ? <Loading /> : config.isError || active.isError ? <ErrorState message={config.error?.message ?? active.error?.message ?? t('common.unknownError')} /> : <>
-      <SectionHeader title={t('hotkeys.active')} description={t('hotkeys.configured', { count: definitions.length })} aside={<div style={{ width: 230, position: 'relative' }}><Search size={14} style={{ position: 'absolute', left: 10, top: 10 }} className="muted" /><input className="search-input" style={{ paddingLeft: 30 }} placeholder={t('hotkeys.search')} value={search} onChange={(event) => setSearch(event.target.value)} /></div>} />
-      <Card>{definitions.map((binding, at) => ({ binding, at })).filter(({ binding }) => label(t, binding.command).toLowerCase().includes(search.toLowerCase()) || binding.chord.toLowerCase().includes(search.toLowerCase())).map(({ binding, at }) => <div className="list-item" key={at}><div><div className="list-primary">{label(t, binding.command)}</div><div className="list-secondary">{binding.enabled ? (active.data.hotkeys[at]?.active ? t('hotkeys.installed') : t('hotkeys.unavailableHere')) : t('common.disabled')}</div></div><div className="list-actions"><span className="kbd">{binding.chord}</span><Badge tone={!binding.enabled ? 'neutral' : active.data.hotkeys[at]?.active ? 'good' : 'warn'}>{!binding.enabled ? t('common.disabled') : active.data.hotkeys[at]?.active ? t('common.active') : t('common.unavailable')}</Badge><Button variant="ghost" onClick={() => open(at)}>{t('common.edit')}</Button></div></div>)}</Card>
-      {index !== undefined && <><SectionHeader title={index === null ? t('hotkeys.new') : t('hotkeys.edit')} description={t('hotkeys.editHint')} /><Card className="padded"><div className="form-grid"><div className="field"><label htmlFor="action-select">{t('hotkeys.action')}</label><select id="action-select" value={JSON.stringify(command)} onChange={(event) => { const selected = actionChoices.find((item) => JSON.stringify(item.command) === event.target.value); if (selected) setCommand(selected.command) }}>
-        {!actionChoices.some((item) => JSON.stringify(item.command) === JSON.stringify(command)) && <option value={JSON.stringify(command)}>{label(t, command)}</option>}
-        {actionChoices.map((item) => <option key={`${item.label}-${JSON.stringify(item.command)}`} value={JSON.stringify(item.command)}>{item.label}</option>)}</select></div>
-        <div className="field"><label htmlFor="hotkey-recorder">{t('hotkeys.shortcut')}</label><HotkeyRecorder id="hotkey-recorder" value={chord || null} onChange={(next) => setChord(next ?? '')} /></div></div>
-        <div className="form-actions"><label className="row" style={{ marginRight: 'auto', gap: 7 }}><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /> {t('common.enabled')}</label><Button onClick={() => setIndex(undefined)}>{t('common.cancel')}</Button><Button variant="primary" disabled={patch.isPending || !chord || Boolean(conflict)} onClick={save}>{patch.isPending ? t('common.saving') : t('hotkeys.save')}</Button></div>
-        {conflict && <p className="bad-text">{t('hotkeys.conflict')}</p>}
-        {shortcutWarning(chord, t) && <div style={{ marginTop: 10 }}><Notice tone="warn">{shortcutWarning(chord, t)}</Notice></div>}
+      <div className="search-field" style={{ maxWidth: 300 }}><Search size={14} /><input className="search-input" placeholder={t('hotkeys.search')} aria-label={t('hotkeys.search')} value={search} onChange={(event) => setSearch(event.target.value)} /></div>
+      <div className={index !== undefined ? 'two-col' : 'stack'} style={{ gap: 18 }}><div>
+      <Card title={t('hotkeys.active')} description={t('hotkeys.configured', { count: definitions.length })}>{rows.map(({ binding, at }) => <div className="list-row" key={at}>
+        <div><div className="list-primary">{label(t, binding.command)}</div><div className="list-secondary">{binding.enabled ? (active.data.hotkeys[at]?.active ? t('hotkeys.installed') : t('hotkeys.unavailableHere')) : t('common.disabled')}</div></div>
+        <div className="list-actions"><Keys chord={binding.chord} /><Badge tone={!binding.enabled ? 'neutral' : active.data.hotkeys[at]?.active ? 'good' : 'warn'}>{!binding.enabled ? t('common.disabled') : active.data.hotkeys[at]?.active ? t('common.active') : t('common.unavailable')}</Badge><Button variant="ghost" size="sm" onClick={() => open(at)}>{t('common.edit')}</Button></div>
+      </div>)}</Card>
+      </div>
+      {index !== undefined && <Appear style={{ position: 'sticky', top: 72 }}><Card title={index === null ? t('hotkeys.new') : t('hotkeys.edit')} description={t('hotkeys.editHint')} aside={<button className="icon-button" aria-label={t('common.cancel')} onClick={() => setIndex(undefined)}><X size={14} /></button>} className="padded stack">
+        <div className="field"><label htmlFor="action-select">{t('hotkeys.action')}</label><select id="action-select" value={JSON.stringify(command)} onChange={(event) => { const selected = actionChoices.find((item) => JSON.stringify(item.command) === event.target.value); if (selected) setCommand(selected.command) }}>
+          {!actionChoices.some((item) => JSON.stringify(item.command) === JSON.stringify(command)) && <option value={JSON.stringify(command)}>{label(t, command)}</option>}
+          {actionChoices.map((item) => <option key={`${item.label}-${JSON.stringify(item.command)}`} value={JSON.stringify(item.command)}>{item.label}</option>)}</select></div>
+        <div className="field"><label htmlFor="hotkey-recorder">{t('hotkeys.shortcut')}</label><HotkeyRecorder id="hotkey-recorder" value={chord || null} onChange={(next) => setChord(next ?? '')} /></div>
+        {conflict && <Notice tone="bad">{t('hotkeys.conflict')}</Notice>}
+        {shortcutWarning(chord, t) && <Notice tone="warn">{shortcutWarning(chord, t)}</Notice>}
+        <div className="form-actions"><label className="row" style={{ marginRight: 'auto', gap: 9 }}><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /> {t('common.enabled')}</label><Button variant="ghost" onClick={() => setIndex(undefined)}>{t('common.cancel')}</Button><Button variant="primary" disabled={patch.isPending || !chord || Boolean(conflict)} onClick={save}><Check size={13} /> {patch.isPending ? t('common.saving') : t('hotkeys.save')}</Button></div>
         {patch.isError && <p className="bad-text">{patch.error.message}</p>}{patch.isSuccess && <p className="good-text">{t('hotkeys.saved')}</p>}
-      </Card></>}
-      <div style={{ marginTop: 18 }}><Notice>{t('hotkeys.notice')}</Notice></div>
+      </Card></Appear>}
+      </div>
+      <Notice>{t('hotkeys.notice')}</Notice>
     </>}
   </>
 }

@@ -1,13 +1,13 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { Crosshair, Eye, EyeOff, LifeBuoy, Plus, Repeat, Trash2, Unlink } from 'lucide-react'
+import { AppWindow, Crosshair, Eye, EyeOff, LifeBuoy, Pencil, Plus, Repeat, Trash2, Unlink } from 'lucide-react'
 import { assignScratchpad, recoverScratchpads, scratchpadAction, unassignScratchpad } from '../api/bridge'
 import { useConfigPatch, useDaemon } from '../api/hooks'
 import type { ConfigPatch, Rect, ScratchpadAlignment, ScratchpadDefinition, ScratchpadState, ScratchpadStatus } from '../api/types'
 import { shortcutWarning } from '../shared/hotkey'
 import { HotkeyRecorder } from '../shared/HotkeyRecorder'
 import { tEn, useT, type MessageKey, type T } from '../i18n'
-import { Badge, Button, Card, Empty, ErrorState, Loading, Notice, SectionHeader } from '../shared/ui'
+import { Badge, Button, Card, Empty, ErrorState, Keys, Loading, Notice, Range } from '../shared/ui'
 
 const ALIGNMENTS: ScratchpadAlignment[] = ['top_left', 'top', 'top_right', 'left', 'center', 'right', 'bottom_left', 'bottom', 'bottom_right']
 const ALIGNMENT_LABELS: Record<ScratchpadAlignment, MessageKey> = {
@@ -114,34 +114,37 @@ export function Scratchpads() {
   return <><div className="page-heading"><div><span className="eyebrow">{t('rules.eyebrow')}</span><h1>{t('nav.scratchpads')}</h1><p>{t('pads.intro')}</p></div>
     <div className="page-actions"><Button disabled={!online || recover.isPending} onClick={() => recover.mutate()}><LifeBuoy size={13} /> {t('dashboard.recover')}</Button><Button variant="primary" disabled={!online || !config.data} onClick={() => open(null)}><Plus size={14} /> {t('pads.new')}</Button></div></div>
     {!online ? status.isPending ? <Loading /> : <ErrorState message={t('pads.offline')} retry={() => void status.refetch()} /> : config.isPending ? <Loading /> : config.isError ? <ErrorState message={config.error.message} retry={() => void config.refetch()} /> : <>
-      <SectionHeader title={t('nav.scratchpads')} description={t('pads.listHint')} />
-      {pads.length === 0 ? <Empty title={t('pads.none')}>{t('pads.noneHint')}</Empty> : <Card>{pads.map((pad) => {
+      {pads.length === 0 ? <Empty title={t('pads.none')}>{t('pads.noneHint')}</Empty> : <Card title={t('nav.scratchpads')} description={t('pads.listHint')}>{pads.map((pad) => {
         const entry = states.get(pad.id)
         const state = entry?.state ?? 'unassigned'
         const busy = state === 'showing' || state === 'hiding' || action.isPending
-        return <div className="list-item" key={pad.id} style={{ flexWrap: 'wrap', gap: 8 }}>
-          <div style={{ minWidth: 240 }}><div className="list-primary">{pad.name || pad.id} <span className="muted mono">{pad.id}</span> <Badge tone={STATE_TONES[state]}>{t(STATE_LABELS[state])}</Badge></div>
-            <div className="list-secondary">{pad.hotkey ? <span className="kbd">{pad.hotkey}</span> : t('pads.noHotkey')} · {pad.scope === 'global' ? t('pads.global') : t('pads.local')} · {Math.round(pad.width * 100)}×{Math.round(pad.height * 100)}% · {pad.hide === 'minimize' ? t('pads.hidesMinimize') : t('pads.hidesPark')}</div>
-            <div className="list-secondary">{entry ? (entry.window || !pad.bundle_id ? windowLabel(t, entry) : t('pads.noWindowYet', { app: pad.bundle_id })) : t('pads.notLoaded')}{entry?.last_error ? <span className="bad-text"> · {entry.last_error}</span> : null}</div></div>
+        return <div className={`pad-row${state === 'visible' || state === 'showing' ? ' active' : ''}`} key={pad.id}>
+          <div className="ws-line">
+            <div><span className="list-primary">{pad.name || pad.id}</span><span className="faint mono">{pad.id}</span>{pad.hotkey ? <Keys chord={pad.hotkey} /> : <span className="faint">{t('pads.noHotkey')}</span>}<Badge tone={STATE_TONES[state]}>{t(STATE_LABELS[state])}</Badge><Badge>{pad.scope === 'global' ? t('pads.global') : t('pads.local')}</Badge></div>
+            <span className="row-sub" style={{ marginTop: 0 }}>{Math.round(pad.width * 100)}×{Math.round(pad.height * 100)}% · {pad.hide === 'minimize' ? t('pads.hidesMinimize') : t('pads.hidesPark')}</span>
+          </div>
+          <div className="ws-line">
+            <div className="list-secondary" style={{ marginTop: 0 }}><AppWindow size={13} />{entry ? (entry.window || !pad.bundle_id ? windowLabel(t, entry) : t('pads.noWindowYet', { app: pad.bundle_id })) : t('pads.notLoaded')}{entry?.last_error ? <span className="bad-text"> · {entry.last_error}</span> : null}</div>
           <div className="list-actions">
-            <Button disabled={(!entry?.window && !pad.bundle_id) || busy} title={!entry?.window && pad.bundle_id ? t('pads.toggleAdoptHint', { app: pad.bundle_id }) : undefined} onClick={() => action.mutate({ id: pad.id, verb: 'toggle' })}><Repeat size={13} /> {t('pads.toggle')}</Button>
-            <Button variant="ghost" aria-label={t('pads.show', { id: pad.id })} disabled={!entry?.window || busy} onClick={() => action.mutate({ id: pad.id, verb: 'show' })}><Eye size={13} /></Button>
-            <Button variant="ghost" aria-label={t('pads.hide', { id: pad.id })} disabled={!entry?.window || busy} onClick={() => action.mutate({ id: pad.id, verb: 'hide' })}><EyeOff size={13} /></Button>
-            <Button disabled={assign.isPending} title={t('pads.assignFocusedHint')} onClick={() => assign.mutate({ id: pad.id, window: null, force: true })}><Crosshair size={13} /> {t('pads.assignFocused')}</Button>
-            <select aria-label={t('pads.windowFor', { id: pad.id })} value={picked[pad.id] ?? ''} onChange={(event) => setPicked({ ...picked, [pad.id]: Number(event.target.value) })} style={{ maxWidth: 220 }}>
+            <Button size="sm" disabled={(!entry?.window && !pad.bundle_id) || busy} title={!entry?.window && pad.bundle_id ? t('pads.toggleAdoptHint', { app: pad.bundle_id }) : undefined} onClick={() => action.mutate({ id: pad.id, verb: 'toggle' })}><Repeat size={13} /> {t('pads.toggle')}</Button>
+            <Button variant="ghost" size="icon" aria-label={t('pads.show', { id: pad.id })} disabled={!entry?.window || busy} onClick={() => action.mutate({ id: pad.id, verb: 'show' })}><Eye size={13} /></Button>
+            <Button variant="ghost" size="icon" aria-label={t('pads.hide', { id: pad.id })} disabled={!entry?.window || busy} onClick={() => action.mutate({ id: pad.id, verb: 'hide' })}><EyeOff size={13} /></Button>
+            <Button variant="ghost" size="sm" disabled={assign.isPending} title={t('pads.assignFocusedHint')} onClick={() => assign.mutate({ id: pad.id, window: null, force: true })}><Crosshair size={13} /> {t('pads.assignFocused')}</Button>
+            <select aria-label={t('pads.windowFor', { id: pad.id })} value={picked[pad.id] ?? ''} onChange={(event) => setPicked({ ...picked, [pad.id]: Number(event.target.value) })} style={{ maxWidth: 200, height: 30 }}>
               <option value="">{t('pads.chooseWindow')}</option>
               {assignable.filter((window) => !pad.bundle_id || window.application_id === pad.bundle_id).map((window) => <option key={window.cg_window_id!} value={window.cg_window_id!}>{window.application_id ?? `pid ${window.pid}`} — {window.title || t('common.untitled')}</option>)}</select>
-            <Button disabled={!picked[pad.id] || assign.isPending} onClick={() => assign.mutate({ id: pad.id, window: picked[pad.id]!, force: true })}>{t('pads.assign')}</Button>
-            <Button variant="ghost" aria-label={t('pads.unassign', { id: pad.id })} disabled={!entry?.window || unassign.isPending} onClick={() => unassign.mutate(pad.id)}><Unlink size={13} /></Button>
-            <Button variant="ghost" onClick={() => open(pad)}>{t('common.edit')}</Button>
-            <Button variant="ghost" aria-label={t('common.deleteItem', { id: pad.id })} disabled={patch.isPending} onClick={() => send({ kind: 'remove_scratchpad', id: pad.id })}><Trash2 size={13} /></Button></div>
+            <Button size="sm" disabled={!picked[pad.id] || assign.isPending} onClick={() => assign.mutate({ id: pad.id, window: picked[pad.id]!, force: true })}>{t('pads.assign')}</Button>
+            <Button variant="ghost" size="icon" aria-label={t('pads.unassign', { id: pad.id })} disabled={!entry?.window || unassign.isPending} onClick={() => unassign.mutate(pad.id)}><Unlink size={13} /></Button>
+            <Button variant="ghost" size="icon" aria-label={t('common.editItem', { id: pad.id })} onClick={() => open(pad)}><Pencil size={13} /></Button>
+            <Button variant="ghost" size="icon" aria-label={t('common.deleteItem', { id: pad.id })} disabled={patch.isPending} onClick={() => send({ kind: 'remove_scratchpad', id: pad.id })}><Trash2 size={13} className="bad-text" /></Button></div>
+          </div>
         </div>
       })}</Card>}
       {error && <p className="bad-text">{error}</p>}
       {recover.isSuccess && <p className={recover.data.ok ? 'good-text' : 'bad-text'}>{recover.data.ok ? t('pads.recovered') : recover.data.problems.join(' · ')}</p>}
 
-      {editing !== undefined && <><SectionHeader title={editing === null ? t('pads.new') : t('common.editItem', { id: editing })} description={t('pads.editHint')} /><Card className="padded stack">
-        <div className="form-grid">
+      {editing !== undefined && <><Card title={editing === null ? t('pads.new') : t('common.editItem', { id: editing })} description={t('pads.editHint')} className="padded stack">
+        <div className="form-grid three">
           <div className="field"><label htmlFor="pad-name">{t('common.name')}</label><input id="pad-name" value={draft.name} maxLength={80} placeholder={t('pads.namePlaceholder')} onChange={(event) => setDraft({ ...draft, name: event.target.value, id: editing === null && (!draft.id || draft.id === scratchpadSlug(draft.name)) ? scratchpadSlug(event.target.value) : draft.id })} /></div>
           <div className="field"><label htmlFor="pad-id">ID</label><input id="pad-id" className="mono" value={draft.id} maxLength={32} onChange={(event) => setDraft({ ...draft, id: event.target.value })} /></div>
           <div className="field"><label htmlFor="pad-app">{t('pads.application')}</label><select id="pad-app" value={draft.bundle_id ?? ''} onChange={(event) => setDraft({ ...draft, bundle_id: event.target.value || null })}>
@@ -155,8 +158,8 @@ export function Scratchpads() {
             <option value="pointer">{t('pads.targetPointer')}</option><option value="focused">{t('pads.targetFocused')}</option>
             {displays.data?.displays.map((display) => <option key={display.id} value={`display-${display.id}`}>{t('pads.alwaysDisplay', { id: display.id })}{display.primary ? ` ${t('common.primaryMark')}` : ''}</option>)}</select></div>
           <div className="field"><label htmlFor="pad-alignment">{t('pads.position')}</label><select id="pad-alignment" value={draft.alignment} onChange={(event) => setDraft({ ...draft, alignment: event.target.value as ScratchpadAlignment })}>{ALIGNMENTS.map((value) => <option key={value} value={value}>{t(ALIGNMENT_LABELS[value])}</option>)}</select></div>
-          <div className="field"><label htmlFor="pad-width">{t('pads.width', { value: Math.round(draft.width * 100) })}</label><input id="pad-width" type="range" min={10} max={100} value={Math.round(draft.width * 100)} onChange={(event) => setDraft({ ...draft, width: Number(event.target.value) / 100 })} /></div>
-          <div className="field"><label htmlFor="pad-height">{t('pads.height', { value: Math.round(draft.height * 100) })}</label><input id="pad-height" type="range" min={10} max={100} value={Math.round(draft.height * 100)} onChange={(event) => setDraft({ ...draft, height: Number(event.target.value) / 100 })} /></div>
+          <div className="field"><label htmlFor="pad-width">{t('pads.width', { value: Math.round(draft.width * 100) })}</label><Range id="pad-width" min={10} max={100} value={Math.round(draft.width * 100)} onChange={(event) => setDraft({ ...draft, width: Number(event.target.value) / 100 })} /></div>
+          <div className="field"><label htmlFor="pad-height">{t('pads.height', { value: Math.round(draft.height * 100) })}</label><Range id="pad-height" min={10} max={100} value={Math.round(draft.height * 100)} onChange={(event) => setDraft({ ...draft, height: Number(event.target.value) / 100 })} /></div>
           <div className="field"><label htmlFor="pad-offset-x">{t('pads.offsetX')}</label><input id="pad-offset-x" type="number" min={-4000} max={4000} value={draft.offset_x} onChange={(event) => setDraft({ ...draft, offset_x: Number(event.target.value) })} /></div>
           <div className="field"><label htmlFor="pad-offset-y">{t('pads.offsetY')}</label><input id="pad-offset-y" type="number" min={-4000} max={4000} value={draft.offset_y} onChange={(event) => setDraft({ ...draft, offset_y: Number(event.target.value) })} /></div>
         </div>
@@ -165,20 +168,19 @@ export function Scratchpads() {
         {draft.hide === 'minimize' && <Notice tone="warn">{t('pads.minimizeNotice')}</Notice>}
         <div className="form-actions"><label className="row" style={{ marginRight: 12, gap: 7 }}><input type="checkbox" checked={draft.remember_position} onChange={(event) => setDraft({ ...draft, remember_position: event.target.checked })} /> {t('pads.rememberPosition')}</label>
           <label className="row" style={{ marginRight: 'auto', gap: 7 }}><input type="checkbox" checked={draft.remember_size} onChange={(event) => setDraft({ ...draft, remember_size: event.target.checked })} /> {t('pads.rememberSize')}</label>
-          <Button onClick={() => setEditing(undefined)}>{t('common.cancel')}</Button><Button variant="primary" disabled={problem !== null || patch.isPending} onClick={save}>{patch.isPending ? t('common.saving') : t('pads.save')}</Button></div>
+          <Button variant="ghost" onClick={() => setEditing(undefined)}>{t('common.cancel')}</Button><Button variant="primary" disabled={problem !== null || patch.isPending} onClick={save}>{patch.isPending ? t('common.saving') : t('pads.save')}</Button></div>
         {problem && <p className="bad-text">{problem}</p>}
       </Card></>}
       {patch.isError && <p className="bad-text">{patch.error.message}</p>}
 
-      <SectionHeader title={t('pads.backend')} description={t('pads.backendHint')} />
-      <Card className="padded stack">{capabilities.isPending ? <Loading /> : capabilities.data ? <>
-        <div className="row"><span>{t('pads.capPark')}</span><Badge tone={capabilities.data.park.available ? 'good' : 'bad'}>{capabilities.data.park.available ? t('common.available') : t('common.unavailable')}</Badge></div>
-        <div className="row"><span>{t('pads.capMinimize')}</span><Badge tone={capabilities.data.minimize.available ? 'good' : 'bad'}>{capabilities.data.minimize.available ? t('common.available') : t('common.unavailable')}</Badge></div>
-        <div className="row"><span>{t('pads.capSticky')}</span><Badge tone="neutral">{t('pads.notUsed')}</Badge></div>
-        <div className="row-sub">{t('pads.stickyReason')} {t('pads.parkingCount', { value: Object.keys(capabilities.data.park.parking_desktops).length || t('pads.parkingNone') })}{capabilities.data.reasons.length ? ` ${capabilities.data.reasons.join(' · ')}` : ''}</div>
+      <Card title={t('pads.backend')} description={t('pads.backendHint')} className="padded">{capabilities.isPending ? <Loading /> : capabilities.data ? <>
+        <div className="row row-pad"><span className="row-title">{t('pads.capPark')}</span><Badge tone={capabilities.data.park.available ? 'good' : 'bad'}>{capabilities.data.park.available ? t('common.available') : t('common.unavailable')}</Badge></div>
+        <div className="row row-pad"><span className="row-title">{t('pads.capMinimize')}</span><Badge tone={capabilities.data.minimize.available ? 'good' : 'bad'}>{capabilities.data.minimize.available ? t('common.available') : t('common.unavailable')}</Badge></div>
+        <div className="row row-pad"><span className="row-title">{t('pads.capSticky')}</span><Badge tone="bad">{t('pads.notUsed')}</Badge></div>
+        <div className="row-sub" style={{ marginTop: 12 }}>{t('pads.stickyReason')} {t('pads.parkingCount', { value: Object.keys(capabilities.data.park.parking_desktops).length || t('pads.parkingNone') })}{capabilities.data.reasons.length ? ` ${capabilities.data.reasons.join(' · ')}` : ''}</div>
         {live.data && <div className="row-sub">{t('pads.metrics', { toggles: live.data.metrics.toggles ?? 0, avg: Math.round((live.data.metrics.toggle_total_ms ?? 0) / Math.max(1, live.data.metrics.toggles ?? 0)), moves: live.data.metrics.moves ?? 0, errors: live.data.metrics.errors ?? 0 })}</div>}
       </> : <p className="bad-text">{capabilities.error?.message ?? t('common.unknownError')}</p>}</Card>
-      <div style={{ marginTop: 18 }}><Notice>{t('pads.notice')}</Notice></div>
+      <Notice>{t('pads.notice')}</Notice>
     </>}
   </>
 }

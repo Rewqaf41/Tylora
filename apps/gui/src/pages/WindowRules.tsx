@@ -5,7 +5,7 @@ import { applyRule, reloadRules, testRule } from '../api/bridge'
 import { useConfigPatch, useDaemon } from '../api/hooks'
 import type { ApplyPolicy, ConfigPatch, ListedRule, RuleCandidate, RuleDefinition, RuleModeKind, RuleTest, TitleMatch } from '../api/types'
 import { tEn, useT, type MessageKey, type T } from '../i18n'
-import { Badge, Button, Card, Empty, ErrorState, Loading, Notice, SectionHeader } from '../shared/ui'
+import { Badge, Button, Card, Empty, ErrorState, Loading, Notice } from '../shared/ui'
 
 const MODE_LABELS: Record<RuleModeKind, MessageKey> = { unchanged: 'rules.mode.unchanged', tiled: 'rules.mode.tiled', floating: 'rules.mode.floating', unmanaged: 'rules.mode.unmanaged' }
 const APPLY_LABELS: Record<ApplyPolicy, MessageKey> = { on_create: 'rules.apply.onCreate', on_first_seen: 'rules.apply.onFirstSeen', on_title_change: 'rules.apply.onTitleChange', manual: 'rules.apply.manual' }
@@ -147,25 +147,23 @@ export function WindowRules() {
     <div className="page-actions"><Button disabled={!online || reload.isPending} onClick={() => reload.mutate()}><RefreshCw size={13} /> {t('rules.reload')}</Button><Button variant="primary" disabled={!online || !config.data} onClick={() => open(null)}><Plus size={14} /> {t('rules.new')}</Button></div></div>
     {!online ? status.isPending ? <Loading /> : <ErrorState message={t('rules.offline')} retry={() => void status.refetch()} /> : config.isPending ? <Loading /> : config.isError ? <ErrorState message={config.error.message} retry={() => void config.refetch()} /> : <>
       {validation.data && !validation.data.ok && <Notice tone="warn">{validation.data.problems.join(' · ')}</Notice>}
-      <SectionHeader title={t('rules.list')} description={t('rules.listHint')} />
-      {rules.length === 0 ? <Empty title={t('rules.none')}>{t('rules.noneHint')}</Empty> : <Card>{rules.map((rule, index) => <div className="list-item" key={rule.id} draggable onDragStart={() => setDragged(rule.id)} onDragOver={(event) => event.preventDefault()} onDrop={() => drop(rule.id)} style={{ opacity: dragged === rule.id ? 0.5 : 1 }}>
-        <div className="row" style={{ gap: 10, justifyContent: 'flex-start' }}><GripVertical size={14} className="muted" aria-label={t('rules.drag')} /><div><div className="list-primary">{rule.name || rule.id} <span className="muted mono">#{rule.priority}</span></div>
+      {rules.length === 0 ? <Empty title={t('rules.none')}>{t('rules.noneHint')}</Empty> : <Card title={t('rules.list')} description={t('rules.listHint')} aside={<Badge tone="accent">{rules.filter((rule) => rule.enabled).length} / {rules.length}</Badge>}>{rules.map((rule, index) => <div className="list-row" key={rule.id} draggable onDragStart={() => setDragged(rule.id)} onDragOver={(event) => event.preventDefault()} onDrop={() => drop(rule.id)} style={{ opacity: dragged === rule.id ? 0.5 : 1 }}>
+        <div className="row" style={{ gap: 12, justifyContent: 'flex-start' }}><GripVertical size={14} className="faint" style={{ cursor: 'grab', flex: 'none' }} aria-label={t('rules.drag')} /><span className="rule-index">{index + 1}</span><div><div className="list-primary">{rule.name || rule.id} <span className="muted mono">#{rule.priority}</span></div>
           <div className="list-secondary"><span className="mono">{rule.bundle_id}</span>{rule.title ? ` · ${t('rules.titleCondition', { match: t(TITLE_LABELS[rule.title_match]), title: rule.title })}` : ''} · {describeActions(rule, t)} · {t(APPLY_LABELS[rule.apply])}{rule.stop ? '' : ` · ${t('rules.continues')}`}</div></div></div>
         <div className="list-actions">
-          <label className="row" style={{ gap: 5 }}><input type="checkbox" aria-label={t('rules.enable', { id: rule.id })} checked={rule.enabled} disabled={patch.isPending} onChange={(event) => send({ kind: 'set_rule', previous_id: rule.id, rule: { ...rule, enabled: event.target.checked } })} />{rule.enabled ? t('rules.on') : t('rules.off')}</label>
-          <Button variant="ghost" aria-label={t('rules.moveUp')} disabled={index === 0 || patch.isPending} onClick={() => move(index, -1)}><ArrowUp size={13} /></Button>
-          <Button variant="ghost" aria-label={t('rules.moveDown')} disabled={index === rules.length - 1 || patch.isPending} onClick={() => move(index, 1)}><ArrowDown size={13} /></Button>
+          <label className="row" style={{ gap: 8 }}><input type="checkbox" aria-label={t('rules.enable', { id: rule.id })} checked={rule.enabled} disabled={patch.isPending} onChange={(event) => send({ kind: 'set_rule', previous_id: rule.id, rule: { ...rule, enabled: event.target.checked } })} />{rule.enabled ? t('rules.on') : t('rules.off')}</label>
+          <Button variant="ghost" size="icon" aria-label={t('rules.moveUp')} disabled={index === 0 || patch.isPending} onClick={() => move(index, -1)}><ArrowUp size={13} /></Button>
+          <Button variant="ghost" size="icon" aria-label={t('rules.moveDown')} disabled={index === rules.length - 1 || patch.isPending} onClick={() => move(index, 1)}><ArrowDown size={13} /></Button>
           {!listedById.has(rule.id) && <Badge tone="warn">{t('rules.notLoaded')}</Badge>}
-          <Button variant="ghost" onClick={() => open(rule)}>{t('common.edit')}</Button>
-          <Button variant="ghost" aria-label={t('common.deleteItem', { id: rule.id })} disabled={patch.isPending} onClick={() => send({ kind: 'remove_rule', id: rule.id })}><Trash2 size={13} /></Button></div>
+          <Button variant="ghost" size="sm" onClick={() => open(rule)}>{t('common.edit')}</Button>
+          <Button variant="ghost" size="icon" aria-label={t('common.deleteItem', { id: rule.id })} disabled={patch.isPending} onClick={() => send({ kind: 'remove_rule', id: rule.id })}><Trash2 size={13} /></Button></div>
       </div>)}</Card>}
 
-      {legacy.length > 0 && <><SectionHeader title={t('rules.legacy')} description={t('rules.legacyHint')} />
-        <Card>{legacy.map((item, index) => <div className="list-item" key={`${index}-${item.application_id}`}><div><div className="list-primary mono">{item.application_id}</div><div className="list-secondary">{t('rules.legacyLine', { priority: item.priority, mode: item.mode, state: item.enabled ? t('common.enabled') : t('common.disabled') })}</div></div>
+      {legacy.length > 0 && <><Card title={t('rules.legacy')} description={t('rules.legacyHint')}>{legacy.map((item, index) => <div className="list-row" key={`${index}-${item.application_id}`}><div><div className="list-primary mono">{item.application_id}</div><div className="list-secondary">{t('rules.legacyLine', { priority: item.priority, mode: item.mode, state: item.enabled ? t('common.enabled') : t('common.disabled') })}</div></div>
           <div className="list-actions"><Button disabled={patch.isPending} onClick={() => send({ kind: 'convert_window_rule', index, id: slug(item.application_id) || `rule-${index + 1}` })}>{t('rules.convert')}</Button></div></div>)}</Card></>}
 
-      {editing !== undefined && <><SectionHeader title={editing === null ? t('rules.new') : t('common.editItem', { id: editing })} description={t('rules.editHint')} /><Card className="padded stack">
-        <div className="form-grid">
+      {editing !== undefined && <><Card title={editing === null ? t('rules.new') : t('common.editItem', { id: editing })} description={t('rules.editHint')} className="padded stack">
+        <div className="form-grid three">
           <div className="field"><label htmlFor="rule-name">{t('common.name')}</label><input id="rule-name" value={draft.name} maxLength={80} placeholder={t('rules.namePlaceholder')} onChange={(event) => setDraft({ ...draft, name: event.target.value, id: editing === null && (!draft.id || draft.id === slug(draft.name)) ? slug(event.target.value) : draft.id })} /></div>
           <div className="field"><label htmlFor="rule-id">ID</label><input id="rule-id" className="mono" value={draft.id} maxLength={64} onChange={(event) => setDraft({ ...draft, id: event.target.value })} /></div>
           <div className="field"><label htmlFor="rule-app">{t('rules.application')}</label><select id="rule-app" value={apps.data?.apps.some((app) => app.bundle_id === draft.bundle_id) ? draft.bundle_id : ''} onChange={(event) => setDraft({ ...draft, bundle_id: event.target.value })}>
@@ -190,8 +188,7 @@ export function WindowRules() {
       </Card></>}
       {patch.isError && <p className="bad-text">{patch.error.message}</p>}{reload.isError && <p className="bad-text">{reload.error.message}</p>}
 
-      <SectionHeader title={t('rules.preview')} description={t('rules.previewHint')} aside={<div style={{ width: 230, position: 'relative' }}><Search size={14} style={{ position: 'absolute', left: 10, top: 10 }} className="muted" /><input className="search-input" style={{ paddingLeft: 30 }} placeholder={t('rules.filterWindows')} value={filter} onChange={(event) => setFilter(event.target.value)} /></div>} />
-      <Card className="padded stack">
+      <Card title={t('rules.preview')} description={t('rules.previewHint')} aside={<div className="search-field" style={{ width: 230 }}><Search size={14} /><input className="search-input" placeholder={t('rules.filterWindows')} value={filter} onChange={(event) => setFilter(event.target.value)} /></div>} className="padded stack">
         <div className="field"><label htmlFor="preview-window">{t('rules.openWindow')}</label><select id="preview-window" value={previewWindow ?? ''} onChange={(event) => { const id = event.target.value === '' ? null : Number(event.target.value); setPreviewWindow(id); apply.reset(); if (id !== null) preview.mutate(id) }}>
           <option value="">{t('rules.chooseWindow')}</option>
           {previewable.map((window) => <option key={window.cg_window_id!} value={window.cg_window_id!}>{window.application_id ?? `pid ${window.pid}`} — {window.title || t('common.untitled')} · CG {window.cg_window_id}</option>)}</select></div>
@@ -199,11 +196,11 @@ export function WindowRules() {
       </Card>
       {preview.data && previewWindow !== null && <RulePreview test={preview.data} applying={apply.isPending} applyError={apply.isError ? apply.error.message : null} applied={apply.isSuccess ? apply.data.message : null} onApply={() => apply.mutate(previewWindow)} />}
 
-      {diagnostics.data && <><SectionHeader title={t('nav.diagnostics')} description={t('rules.diagHint')} /><Card className="padded stack">
+      {diagnostics.data && <><Card title={t('nav.diagnostics')} description={t('rules.diagHint')} className="padded stack">
         <div className="row-sub">{t('rules.diagLine', { rules: diagnostics.data.rules, tracked: diagnostics.data.tracked_windows, overrides: diagnostics.data.manual_overrides, evaluations: diagnostics.data.metrics.evaluations ?? 0, avg: Math.round((diagnostics.data.metrics.evaluation_total_us ?? 0) / Math.max(1, diagnostics.data.metrics.evaluations ?? 0)), moves: diagnostics.data.metrics.moves_applied ?? 0, modes: diagnostics.data.metrics.modes_applied ?? 0, errors: diagnostics.data.metrics.errors ?? 0 })}</div>
         {diagnostics.data.recent.slice(-6).reverse().map((entry, index) => <div key={index} className="row row-pad"><span className="mono">{entry.rule}</span><span className="row-sub">{entry.action}: {entry.detail} · pid {entry.pid}{entry.cg_window_id ? ` · CG ${entry.cg_window_id}` : ''}</span></div>)}
       </Card></>}
-      <div style={{ marginTop: 18 }}><Notice>{t('rules.notice')} <span className="mono">tylora rules apply --window</span>.</Notice></div>
+      <div><Notice>{t('rules.notice')} <span className="mono">tylora rules apply --window</span>.</Notice></div>
     </>}
   </>
 }

@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { NavLink, Route, Routes, useLocation } from 'react-router'
-import { Activity, AppWindow, Command, House, LayoutDashboard, Menu, Monitor, Settings2, SlidersHorizontal, Grid2X2, CircleHelp, RefreshCcw, MousePointer2, Layers, Languages, Sparkles } from 'lucide-react'
+import { ChevronDown, Columns3, Ellipsis, Keyboard, LayoutDashboard, LayoutGrid, Languages, Layers, ListChecks, Monitor, MousePointer2, RefreshCcw, Settings, Sparkles, Stethoscope } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { useDaemon } from '../api/hooks'
 import { useLang, useT, type LanguagePref, type MessageKey } from '../i18n'
 import { useUI } from './store'
+import { BrandMark } from '../shared/BrandMark'
 import { Dashboard } from '../pages/Dashboard'
 import { Workspaces } from '../pages/Workspaces'
 import { Hotkeys } from '../pages/Hotkeys'
@@ -18,17 +19,17 @@ import { FocusMouse } from '../pages/FocusMouse'
 import { Animations } from '../pages/Animations'
 
 const navigation: { path: string; title: MessageKey; icon: LucideIcon }[] = [
-  { path: '/', title: 'nav.dashboard', icon: House },
-  { path: '/workspaces', title: 'nav.workspaces', icon: Grid2X2 },
+  { path: '/', title: 'nav.dashboard', icon: LayoutDashboard },
+  { path: '/workspaces', title: 'nav.workspaces', icon: LayoutGrid },
   { path: '/displays', title: 'nav.displays', icon: Monitor },
-  { path: '/layouts', title: 'nav.layouts', icon: LayoutDashboard },
-  { path: '/hotkeys', title: 'nav.hotkeys', icon: Command },
-  { path: '/rules', title: 'nav.rules', icon: AppWindow },
+  { path: '/layouts', title: 'nav.layouts', icon: Columns3 },
+  { path: '/hotkeys', title: 'nav.hotkeys', icon: Keyboard },
+  { path: '/rules', title: 'nav.rules', icon: ListChecks },
   { path: '/scratchpads', title: 'nav.scratchpads', icon: Layers },
   { path: '/focus', title: 'nav.focus', icon: MousePointer2 },
   { path: '/animations', title: 'nav.animations', icon: Sparkles },
-  { path: '/diagnostics', title: 'nav.diagnostics', icon: Activity },
-  { path: '/general', title: 'nav.general', icon: Settings2 },
+  { path: '/diagnostics', title: 'nav.diagnostics', icon: Stethoscope },
+  { path: '/general', title: 'nav.general', icon: Settings },
 ]
 
 export function App() {
@@ -40,6 +41,7 @@ export function App() {
   const language = useUI((state) => state.language)
   const setLanguage = useUI((state) => state.setLanguage)
   const [menuOpen, setMenuOpen] = useState(false)
+  const scroller = useRef<HTMLDivElement>(null)
   const current = navigation.find((item) => item.path === location.pathname)
   const title = current ? t(current.title) : 'Tylora'
 
@@ -50,24 +52,26 @@ export function App() {
     return () => media.removeEventListener('change', apply)
   }, [theme])
   useEffect(() => { document.documentElement.lang = lang }, [lang])
+  // The content pane scrolls, not the window: start every page at its top.
+  useEffect(() => { scroller.current?.scrollTo(0, 0); setMenuOpen(false) }, [location.pathname])
 
   return <div className="app-shell">
     <aside className="sidebar">
-      <div className="brand"><div className="brand-mark"><span /><span /><span /></div><div><strong>Tylora</strong><small>{t('app.controlCenter')}</small></div></div>
+      <div className="brand"><BrandMark /><div><strong>Tylora</strong><small>{t('app.controlCenter')}</small></div></div>
       <div className="sidebar-section">{t('app.sectionWorkspace')}</div>
       <nav aria-label={t('app.mainNavigation')}>{navigation.map(({ path, title: name, icon: Icon }) =>
-        <NavLink key={path} to={path} end={path === '/'} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
-          <Icon size={17} strokeWidth={1.9} /><span>{t(name)}</span>
+        <NavLink key={path} to={path} end={path === '/'} title={t(name)} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+          <Icon size={16} strokeWidth={1.8} /><span>{t(name)}</span>
         </NavLink>)}</nav>
-      <div className="sidebar-bottom"><div className="sidebar-divider" /><div className="sidebar-foot"><span className={status.isSuccess ? 'live-dot' : 'off-dot'} />{status.isSuccess ? t('app.daemonConnected') : t('app.daemonOffline')}</div><small>Tylora 0.1 · macOS</small></div>
+      <div className="sidebar-bottom"><div className="sidebar-foot"><span className={status.isSuccess ? 'live-dot' : 'off-dot'} /><span>{status.isSuccess ? t('app.daemonConnected') : t('app.daemonOffline')}</span></div><small>Tylora 0.1 · macOS</small></div>
     </aside>
-    <div className="main-shell">
-      <header className="topbar"><div className="breadcrumb"><SlidersHorizontal size={15} /><span>Tylora</span><span className="slash">/</span><strong>{title}</strong></div>
+    <div className="main-shell" ref={scroller}>
+      <header className="topbar"><div className="breadcrumb"><span>Tylora</span><span>/</span><strong>{title}</strong></div>
         <div className="top-actions"><div className={`connection ${status.isSuccess ? 'connected' : 'disconnected'}`}><span />{status.isSuccess ? t('app.connected') : t('app.disconnected')}</div>
-          <label className="row" style={{ gap: 6 }} title={t('app.language')}><Languages size={15} className="muted" /><select aria-label={t('app.language')} className="search-input" style={{ width: 'auto', padding: '4px 8px' }} value={language} onChange={(event) => setLanguage(event.target.value as LanguagePref)}>
-            <option value="system">{t('language.system')}</option><option value="en">English</option><option value="ru">Русский</option></select></label>
-          <button className="icon-button" aria-label={t('app.moreActions')} onClick={() => setMenuOpen(!menuOpen)}><Menu size={18} /></button>
-          {menuOpen && <div className="top-menu"><button onClick={() => { void status.refetch(); setMenuOpen(false) }}><RefreshCcw size={15} /> {t('app.refreshStatus')}</button><NavLink to="/diagnostics" onClick={() => setMenuOpen(false)}><CircleHelp size={15} /> {t('nav.diagnostics')}</NavLink></div>}
+          <label className="pill-select" title={t('app.language')}><Languages size={14} /><select aria-label={t('app.language')} value={language} onChange={(event) => setLanguage(event.target.value as LanguagePref)}>
+            <option value="system">{t('language.system')}</option><option value="en">English</option><option value="ru">Русский</option></select><ChevronDown size={12} className="chev" /></label>
+          <button className="icon-button" aria-label={t('app.moreActions')} aria-expanded={menuOpen} onClick={() => setMenuOpen(!menuOpen)}><Ellipsis size={16} /></button>
+          {menuOpen && <div className="top-menu"><button onClick={() => { void status.refetch(); setMenuOpen(false) }}><RefreshCcw size={14} /> {t('app.refreshStatus')}</button><NavLink to="/diagnostics" onClick={() => setMenuOpen(false)}><Stethoscope size={14} /> {t('nav.diagnostics')}</NavLink></div>}
         </div>
       </header>
       <main className="page"><Routes>

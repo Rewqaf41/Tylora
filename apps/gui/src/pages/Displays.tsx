@@ -1,7 +1,8 @@
 import { useConfigPatch, useDaemon } from '../api/hooks'
 import type { Config } from '../api/types'
 import { useT, type MessageKey } from '../i18n'
-import { Badge, Card, Empty, ErrorState, Loading, Notice, SectionHeader } from '../shared/ui'
+import { Monitor } from 'lucide-react'
+import { Badge, Card, Empty, ErrorState, Keys, Loading, Notice } from '../shared/ui'
 
 const MOVEMENT: Record<keyof Config['window_movement'], [MessageKey, MessageKey]> = {
   focus_after_move: ['displays.focusMoved', 'displays.focusMovedHint'],
@@ -29,17 +30,43 @@ export function Displays() {
   const totalW = maxX - minX, totalH = maxY - minY
   return <><div className="page-heading"><div><span className="eyebrow">{t('displays.eyebrow')}</span><h1>{t('nav.displays')}</h1><p>{t('displays.intro')}</p></div></div>
     {!online ? status.isPending ? <Loading /> : <ErrorState message={t('displays.offline')} retry={() => void status.refetch()} /> : displays.isPending || spaces.isPending ? <Loading /> : displays.isError || spaces.isError ? <ErrorState message={displays.error?.message ?? spaces.error?.message ?? t('common.unknownError')} /> : all.length === 0 ? <Empty title={t('displays.none')}>{t('displays.noneHint')}</Empty> : <>
-      <SectionHeader title={t('displays.arrangement')} description={t('displays.arrangementHint')} />
-      <Card className="padded"><div className="monitor-map" style={{ height: 230 }}>{all.map((display) => <div key={display.id} className="monitor-visual" style={{ position: 'absolute', left: `${8 + (display.full_frame.x - minX) / totalW * 84}%`, top: `${8 + (display.full_frame.y - minY) / totalH * 84}%`, width: `${Math.max(15, display.full_frame.width / totalW * 84)}%`, height: `${Math.max(25, display.full_frame.height / totalH * 84)}%` }}>{display.primary ? t('common.primary') : t('common.display', { id: display.id })}</div>)}</div></Card>
-      <SectionHeader title={t('displays.connected')} description={t('displays.reported', { count: all.length })} />
-      <div className="stack">{all.map((display) => { const current = spaces.data?.spaces.find((space) => space.display === display.id && space.active); const count = spaces.data?.spaces.filter((space) => space.display === display.id).length ?? 0; return <Card key={display.id} className="padded"><div className="row"><div><strong>{display.primary ? t('displays.primaryDisplay') : t('common.display', { id: display.id })}</strong><span className="row-sub">CGDirectDisplayID {display.id} · {display.full_frame.width} × {display.full_frame.height} pt</span></div><Badge tone={display.primary ? 'good' : 'neutral'}>{display.primary ? t('common.primary') : t('displays.external')}</Badge></div><div className="form-grid" style={{ marginTop: 17 }}><div className="row row-pad"><span className="muted">{t('displays.scaling')}</span><strong>{display.scale.toFixed(2)}×</strong></div><div className="row row-pad"><span className="muted">{t('nav.workspaces')}</span><strong>{count}</strong></div><div className="row row-pad"><span className="muted">{t('displays.currentDesktop')}</span><strong>{current ? `${current.desktop} · ID ${current.id}` : t('common.unavailable')}</strong></div><div className="row row-pad"><span className="muted">{t('displays.assigned')}</span><strong>{config.data?.config.workspaces.filter((ws) => ws.display === display.id || ws.display === null).length ?? '—'}</strong></div></div></Card> })}</div>
-      <SectionHeader title={t('displays.moveTitle')} description={t('displays.moveHint')} /><Card className="padded stack">
-        <div className="row row-pad"><div><strong>{t('displays.moveNext')}</strong><span className="row-sub">{all.length < 2 ? t('displays.connectAnother') : t('displays.shortcut', { chord: moveHotkey?.chord ?? t('displays.notAssigned'), state: moveHotkey && !moveHotkey.active ? t('displays.unavailableSuffix') : '' })}</span></div></div>
-        {(Object.keys(MOVEMENT) as (keyof Config['window_movement'])[]).map((key) => <label key={key} className="row row-pad"><span><strong>{t(MOVEMENT[key][0])}</strong><span className="row-sub">{t(MOVEMENT[key][1])}</span></span><input type="checkbox" checked={movement[key]} disabled={patch.isPending} onChange={(event) => updateMovement({ ...movement, [key]: event.target.checked })} /></label>)}
-        {patch.isError && <p className="bad-text">{patch.error.message}</p>}
+      <Card title={t('displays.arrangement')} description={t('displays.arrangementHint')} aside={<Badge>{t('displays.reported', { count: all.length })}</Badge>} className="padded">
+        <div className="monitor-map" style={{ height: 210 }}>{all.map((display) => { const current = spaces.data?.spaces.find((space) => space.display === display.id && space.active); return <div key={display.id} className={`monitor-visual${display.primary ? ' primary' : ''}`} style={{ position: 'absolute', left: `${6 + (display.full_frame.x - minX) / totalW * 88}%`, top: `${8 + (display.full_frame.y - minY) / totalH * 84}%`, width: `${Math.max(15, display.full_frame.width / totalW * 88)}%`, height: `${Math.max(25, display.full_frame.height / totalH * 84)}%` }}>
+          <div className="row" style={{ gap: 8 }}><span>{t('common.display', { id: display.id })}</span>{display.primary && <Badge tone="accent">{t('common.primary')}</Badge>}</div>
+          <small>{current ? t('dashboard.desktop', { n: current.desktop }) : `${display.full_frame.width} × ${display.full_frame.height} pt`}</small>
+        </div> })}</div>
       </Card>
-      <SectionHeader title={t('displays.navigation')} description={t('displays.navigationHint')} /><Card className="padded"><div className="row row-pad"><div><strong>{t('displays.crossMonitor')}</strong><span className="row-sub">{t('displays.crossMonitorHint')}</span></div><Badge>{config.data?.config.cross_monitor_navigation ? t('common.enabled') : t('common.disabled')}</Badge></div><div className="row row-pad"><div><strong>{t('focus.followsMouse')}</strong><span className="row-sub">{t('displays.ffmHint')}</span></div><Badge tone="warn">{t('displays.unsupported')}</Badge></div><div className="row row-pad"><div><strong>{t('displays.disconnect')}</strong><span className="row-sub">{t('displays.disconnectHint')}</span></div><Badge>{t('displays.moveToPrimary')}</Badge></div></Card>
-      <div style={{ marginTop: 18 }}><Notice>{t('displays.notice')}</Notice></div>
+      <div className="two-col even">
+        <div>
+          <Card title={t('displays.connected')} description={t('displays.reported', { count: all.length })} className="padded">
+            {all.map((display) => { const current = spaces.data?.spaces.find((space) => space.display === display.id && space.active); const count = spaces.data?.spaces.filter((space) => space.display === display.id).length ?? 0; return <div key={display.id} className="row-pad stack" style={{ gap: 10 }}>
+              <div className="row"><span className="row-title" style={{ display: 'flex', gap: 9, alignItems: 'center' }}><Monitor size={15} className={display.primary ? '' : 'faint'} style={display.primary ? { color: 'var(--accent)' } : undefined} />{display.primary ? t('displays.primaryDisplay') : t('common.display', { id: display.id })}</span><Badge tone={display.primary ? 'accent' : 'neutral'}>{display.primary ? t('common.primary') : t('displays.external')}</Badge></div>
+              <div className="spec-grid">
+                <div><span>{t('displays.scaling')}</span>{display.scale.toFixed(2)}×</div>
+                <div><span>{t('nav.workspaces')}</span>{count}</div>
+                <div><span>{t('displays.currentDesktop')}</span>{current ? `${current.desktop} · ID ${current.id}` : t('common.unavailable')}</div>
+                <div><span>{t('displays.assigned')}</span>{config.data?.config.workspaces.filter((ws) => ws.display === display.id || ws.display === null).length ?? '—'}</div>
+              </div>
+              <span className="row-sub mono" style={{ marginTop: 0 }}>CGDirectDisplayID {display.id} · {display.full_frame.width} × {display.full_frame.height} pt</span>
+            </div> })}
+          </Card>
+          <Card title={t('displays.disconnect')} className="padded">
+            <div className="row row-pad"><div><span className="row-title">{t('displays.disconnect')}</span><span className="row-sub">{t('displays.disconnectHint')}</span></div><Badge>{t('displays.moveToPrimary')}</Badge></div>
+          </Card>
+        </div>
+        <div>
+          <Card title={t('displays.moveTitle')} description={t('displays.moveHint')} className="padded">
+            <div className="row row-pad"><div><span className="row-title">{t('displays.moveNext')}</span><span className="row-sub">{all.length < 2 ? t('displays.connectAnother') : t('displays.shortcut', { chord: moveHotkey?.chord ?? t('displays.notAssigned'), state: moveHotkey && !moveHotkey.active ? t('displays.unavailableSuffix') : '' })}</span></div>{moveHotkey && <Keys chord={moveHotkey.chord} />}</div>
+            {(Object.keys(MOVEMENT) as (keyof Config['window_movement'])[]).map((key) => <label key={key} className="row row-pad"><span><span className="row-title">{t(MOVEMENT[key][0])}</span><span className="row-sub">{t(MOVEMENT[key][1])}</span></span><input type="checkbox" checked={movement[key]} disabled={patch.isPending} onChange={(event) => updateMovement({ ...movement, [key]: event.target.checked })} /></label>)}
+            {patch.isError && <p className="bad-text">{patch.error.message}</p>}
+          </Card>
+          <Card title={t('displays.navigation')} description={t('displays.navigationHint')} className="padded">
+            <div className="row row-pad"><div><span className="row-title">{t('displays.crossMonitor')}</span><span className="row-sub">{t('displays.crossMonitorHint')}</span></div><Badge tone={config.data?.config.cross_monitor_navigation ? 'good' : 'neutral'}>{config.data?.config.cross_monitor_navigation ? t('common.enabled') : t('common.disabled')}</Badge></div>
+            <div className="row row-pad"><div><span className="row-title">{t('focus.followsMouse')}</span><span className="row-sub">{t('displays.ffmHint')}</span></div><Badge tone="bad">{t('displays.unsupported')}</Badge></div>
+          </Card>
+        </div>
+      </div>
+      <Notice>{t('displays.notice')}</Notice>
     </>}
   </>
 }

@@ -6,6 +6,6 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   clearScreen: false,
   server: { port: 1420, strictPort: true, host: '127.0.0.1' },
-  build: { target: 'safari13', outDir: 'dist' },
+  build: { target: 'safari16', outDir: 'dist' },
   test: { environment: 'jsdom' },
 })

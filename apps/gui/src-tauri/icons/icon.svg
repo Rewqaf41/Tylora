@@ -1,12 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
   <defs>
-    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#344550"/><stop offset=".54" stop-color="#172229"/><stop offset="1" stop-color="#0b1419"/></linearGradient>
-    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#02d4f3"/><stop offset=".57" stop-color="#00aef6"/><stop offset="1" stop-color="#086bf7"/></linearGradient>
-    <linearGradient id="silver" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#d4e0e8"/><stop offset="1" stop-color="#8da5b7"/></linearGradient>
-    <linearGradient id="stem" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#899da9"/><stop offset="1" stop-color="#40515d"/></linearGradient>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#2E343A"/><stop offset="1" stop-color="#14171B"/></linearGradient>
+    <linearGradient id="orange" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#FF9A4D"/><stop offset=".55" stop-color="#F26B16"/><stop offset="1" stop-color="#D4520A"/></linearGradient>
+    <linearGradient id="silver" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#DCE3E9"/><stop offset="1" stop-color="#9CA9B5"/></linearGradient>
+    <linearGradient id="stem" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#AEB8C1"/><stop offset="1" stop-color="#6D7A85"/></linearGradient>
   </defs>
-  <rect x="8" y="8" width="496" height="496" rx="115" fill="url(#background)"/>
-  <path d="M91 150c0-18 14-32 32-32h121c6 0 10 4 10 10v137c0 7-5 12-12 10L116 240c-15-4-25-17-25-33z" fill="url(#blue)"/>
-  <path d="M270 128c0-6 4-10 10-10h105c21 0 36 16 36 36v61c0 17-9 28-23 35l-118 55c-5 2-10-1-10-7z" fill="url(#silver)"/>
-  <path d="M210 277c0-8 6-13 14-11l42 13c5 1 8 5 8 10v127c0 8-7 13-14 10l-30-11c-13-5-20-16-20-29z" fill="url(#stem)"/>
+  <rect x="8" y="8" width="496" height="496" rx="112" fill="url(#tile)"/>
+  <g transform="translate(8 8) scale(.96875) translate(4 -32)">
+    <path fill="url(#orange)" d="M110 115H248Q256 115 256 123V261L105.2 206.7Q92 202 92 188V133Q92 115 110 115Z"/>
+    <path fill="url(#silver)" d="M274 115H394Q412 115 412 133V183Q412 197 399.5 203.3L266 270V123Q266 115 274 115Z"/>
+    <path fill="url(#stem)" d="M173.5 243.7L248.5 270.3Q256 273 256 281V454Q256 462 248.5 459.3L203.6 443.5Q166 430 166 390V249Q166 241 173.5 243.7Z"/>
+  </g>
 </svg>

@@ -16,6 +16,7 @@
   "dependencies": {
     "@tanstack/react-query": "^5.90.3",
     "@tauri-apps/api": "2.11.1",
+    "animejs": "^4.5.0",
     "lucide-react": "^0.548.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

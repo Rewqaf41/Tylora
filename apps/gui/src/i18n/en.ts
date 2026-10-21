@@ -105,6 +105,10 @@ export const en = {
   'dashboard.desktop': 'Desktop {n}',
   'dashboard.noDesktop': 'No active Desktop',
   'dashboard.spaceAndDisplay': 'Space ID {id} · Display {display}',
+  'dashboard.factDesktop': 'Desktop',
+  'dashboard.factSpace': 'Space ID',
+  'dashboard.factDisplay': 'Display',
+  'dashboard.openDiagnostics': 'Open Diagnostics',
   'dashboard.noObservation': 'Native Space observation is unavailable',
   'dashboard.degraded': '{count|# window geometry update|# window geometry updates} could not reach the requested frame. See Diagnostics.',
 

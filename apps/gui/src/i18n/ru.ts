@@ -104,6 +104,10 @@ export const ru: Messages = {
   'dashboard.desktop': 'Рабочий стол {n}',
   'dashboard.noDesktop': 'Нет активного рабочего стола',
   'dashboard.spaceAndDisplay': 'Space ID {id} · Дисплей {display}',
+  'dashboard.factDesktop': 'Рабочий стол',
+  'dashboard.factSpace': 'Space ID',
+  'dashboard.factDisplay': 'Дисплей',
+  'dashboard.openDiagnostics': 'Открыть диагностику',
   'dashboard.noObservation': 'Наблюдение за рабочими столами недоступно',
   'dashboard.degraded': '{count|# окно не получило|# окна не получили|# окон не получили} запрошенную геометрию. Подробности в разделе «Диагностика».',
 

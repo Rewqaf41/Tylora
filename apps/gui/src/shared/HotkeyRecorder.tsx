@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { Check, Keyboard } from 'lucide-react'
 import { pauseHotkeys, resumeHotkeys } from '../api/bridge'
 import { useT } from '../i18n'
@@ -70,9 +70,9 @@ export function HotkeyRecorder({ id, value, onChange, clearable = false }: { id?
 
   const shown = recording ? held : value
   return <div className="stack" style={{ gap: 6 }}>
-    <button ref={button} id={id} type="button" aria-label={t('recorder.record')} className={`button ${recording ? 'button-primary' : ''}`} onClick={() => (recording ? stop() : start())}>
+    <button ref={button} id={id} type="button" aria-label={t('recorder.record')} className={`recorder${recording ? ' recording' : ''}`} onClick={() => (recording ? stop() : start())}>
       {!recording && message?.tone === 'good' ? <Check size={14} /> : <Keyboard size={14} />}
-      {shown ? <span className="mono" data-chord={shown}>{chordKeys(shown).join(' ')}{recording ? ' …' : ''}</span>
+      {shown ? <span className="keys" data-chord={shown}>{chordKeys(shown).map((key, index) => <Fragment key={index}>{index > 0 && ' '}<kbd className="kbd">{key}</kbd></Fragment>)}{recording ? ' …' : ''}</span>
         : <span>{recording ? `${t('recorder.press')}${clearable ? t('recorder.clears') : ''}` : t('recorder.record')}</span>}
     </button>
     {recording ? <span className="row-sub">{t('recorder.paused')}</span>
