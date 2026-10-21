@@ -68,7 +68,7 @@ commit any.
    `.p12`.
 2. Create an App Store Connect API key (Users and Access → Integrations, role
    Developer) and download `AuthKey_<KEY_ID>.p8`.
-3. Add repository secrets:
+3. For a future notarized release, add repository secrets:
 
    | Secret | Value |
    | --- | --- |
@@ -79,11 +79,12 @@ commit any.
    | `APPLE_API_KEY` | the key ID |
    | `APPLE_API_KEY_P8` | the contents of the `.p8` file |
 
-Tauri signs every executable in the bundle (app and sidecar) with the
-hardened runtime and the entitlements, notarizes through `notarytool` and
-staples the ticket when these variables are set. Locally the same works with
-the variables exported in the shell, or with the certificate in the login
-keychain and `APPLE_SIGNING_IDENTITY` set.
+The current GitHub workflow deliberately builds ad-hoc signed releases and
+does not read Apple secrets. Before publishing a notarized release, update the
+workflow to pass valid signing credentials and run
+`verify-bundle.sh --release`. Locally, Tauri can use the variables exported in
+the shell, or a certificate in the login keychain with
+`APPLE_SIGNING_IDENTITY` set.
 
 The hardened runtime needs no exceptions: Accessibility and the Event Tap are
 TCC permissions, SkyLight is an Apple-signed system framework resolved with
@@ -154,10 +155,8 @@ Compatibility rules for every release:
 4. Manual checks on a disposable user account or clean Mac: [Technical guide](TECHNICAL.md#manual-macos-validation),
    first-run setup, Accessibility grant, launch at login on
    and off, update over the previous version, uninstall.
-5. Tag `vX.Y.Z` and push. The workflow publishes a release with a direct DMG
-   download. Without Apple credentials it is ad-hoc signed and unnotarized;
-   with credentials it must pass the Developer ID, notarization and Gatekeeper
-   gate before publication.
+5. Tag `vX.Y.Z` and push. The workflow publishes an ad-hoc signed,
+   unnotarized release with a direct DMG download.
 6. Install the published DMG on a second Mac. For an unnotarized build, check
    that the release notes' **Open Anyway** instructions match the actual
    macOS prompt.

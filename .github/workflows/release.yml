@@ -1,6 +1,6 @@
 # Release pipeline: a `v*` tag checks, builds and publishes a DMG.
-# Without Apple credentials the public release contains an ad-hoc signed,
-# unnotarized build; release notes explain the extra macOS opening step.
+# The public release is ad-hoc signed and unnotarized; release notes explain
+# the extra macOS opening step.
 name: release
 
 on:
@@ -50,51 +50,19 @@ jobs:
   build:
     needs: checks
     runs-on: macos-15
-    outputs:
-      signed: ${{ steps.signing.outputs.signed }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: oven-sh/setup-bun@v2
-      - name: Detect signing credentials
-        id: signing
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-        run: |
-          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_API_KEY" ]; then
-            echo "signed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "signed=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No Apple credentials: publishing an ad-hoc signed, unnotarized DMG."
-          fi
-      - name: Write App Store Connect key
-        if: steps.signing.outputs.signed == 'true'
-        env:
-          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/keys"
-          printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/keys/AuthKey_$APPLE_API_KEY.p8"
-          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/keys/AuthKey_$APPLE_API_KEY.p8" >> "$GITHUB_ENV"
       - name: Build Tylora.app and Tylora.dmg
         working-directory: apps/gui
-        env:
-          # Present only with secrets; Tauri then signs with the Developer ID
-          # identity (hardened runtime, Entitlements.plist) and notarizes.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: |
+          unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
+          unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
           bun install --frozen-lockfile || bun install
           bun run desktop:build
-      - name: Verify bundle (local gate)
+      - name: Verify bundle
         run: sh apps/gui/scripts/verify-bundle.sh
-      - name: Verify bundle (release gate)
-        if: steps.signing.outputs.signed == 'true'
-        run: sh apps/gui/scripts/verify-bundle.sh --release
       - name: Checksums
         run: |
           cd target/release/bundle/dmg
@@ -102,14 +70,11 @@ jobs:
           cat SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: tylora-${{ steps.signing.outputs.signed == 'true' && 'signed' || 'adhoc' }}-${{ github.sha }}
+          name: tylora-adhoc-${{ github.sha }}
           path: |
             target/release/bundle/dmg/Tylora_*.dmg
             target/release/bundle/dmg/SHA256SUMS.txt
           if-no-files-found: error
-      - name: Remove key material
-        if: always()
-        run: rm -rf "$RUNNER_TEMP/keys"
 
   publish:
     needs: build
@@ -120,7 +85,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: tylora-${{ needs.build.outputs.signed == 'true' && 'signed' || 'adhoc' }}-${{ github.sha }}
+          name: tylora-adhoc-${{ github.sha }}
           path: dist
       - name: Prepare stable download name and checksums
         run: |
@@ -128,20 +93,8 @@ jobs:
           cd dist
           sha256sum Tylora_*.dmg > SHA256SUMS.txt
       - name: Write release notes
-        env:
-          RELEASE_SIGNED: ${{ needs.build.outputs.signed }}
         run: |
-          if [ "$RELEASE_SIGNED" = 'true' ]; then
-            cat > release-notes.md <<'EOF'
-          Download `Tylora_aarch64.dmg` for an Apple Silicon Mac, then drag Tylora into Applications.
-
-          This build passed Developer ID signing, notarization and Gatekeeper checks. Grant Accessibility permission during first-run setup.
-
-          PolyForm Noncommercial License 1.0.0: https://polyformproject.org/licenses/noncommercial/1.0.0
-          Required Notice: Copyright (c) 2026 Rewqaf41
-          EOF
-          else
-            cat > release-notes.md <<'EOF'
+          cat > release-notes.md <<'EOF'
           Download `Tylora_aarch64.dmg` for an Apple Silicon Mac, then drag Tylora into Applications.
 
           **This build is ad-hoc signed and not notarized.** macOS may block it on first launch. After trying to open Tylora, go to System Settings → Privacy & Security and choose **Open Anyway** for Tylora. Grant Accessibility permission during first-run setup. Only install software from a source you trust.
@@ -149,7 +102,6 @@ jobs:
           PolyForm Noncommercial License 1.0.0: https://polyformproject.org/licenses/noncommercial/1.0.0
           Required Notice: Copyright (c) 2026 Rewqaf41
           EOF
-          fi
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
