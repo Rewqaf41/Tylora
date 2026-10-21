@@ -3,20 +3,29 @@
   <desc id="desc">Illustration of a macOS desktop with neatly tiled windows and three layout choices.</desc>
   <defs>
     <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#15171c"/><stop offset="1" stop-color="#090a0e"/></linearGradient>
-    <linearGradient id="glow" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#ff9d58"/><stop offset="1" stop-color="#ee6714"/></linearGradient>
+    <linearGradient id="logo-tile" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#2E343A"/><stop offset="1" stop-color="#14171B"/></linearGradient>
+    <linearGradient id="logo-orange" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#FF9A4D"/><stop offset=".55" stop-color="#F26B16"/><stop offset="1" stop-color="#D4520A"/></linearGradient>
+    <linearGradient id="logo-silver" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#DCE3E9"/><stop offset="1" stop-color="#9CA9B5"/></linearGradient>
+    <linearGradient id="logo-stem" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#AEB8C1"/><stop offset="1" stop-color="#6D7A85"/></linearGradient>
     <linearGradient id="panel" x1="0" x2="0" y1="0" y2="1"><stop stop-color="#252831"/><stop offset="1" stop-color="#191b22"/></linearGradient>
+    <clipPath id="canvas"><rect width="1200" height="590" rx="30"/></clipPath>
     <filter id="shadow"><feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#000" flood-opacity=".45"/></filter>
     <filter id="soft"><feGaussianBlur stdDeviation="60"/></filter>
   </defs>
+  <g clip-path="url(#canvas)">
   <rect width="1200" height="590" rx="30" fill="url(#bg)"/>
   <circle cx="1040" cy="75" r="190" fill="#e65f1e" opacity=".16" filter="url(#soft)"/>
   <circle cx="80" cy="550" r="150" fill="#397c80" opacity=".13" filter="url(#soft)"/>
   <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
     <g transform="translate(60 68)">
-      <rect width="48" height="48" rx="13" fill="#252830"/>
-      <path d="M11 12h15v15L10 21v-7a2 2 0 0 1 1-2Z" fill="url(#glow)"/>
-      <path d="M28 12h12v9l-12 7V12Z" fill="#d9e1e9"/>
-      <path d="m18 29 8 3v12l-5-2c-2-1-3-3-3-5v-8Z" fill="#aeb9c4"/>
+      <svg width="48" height="48" viewBox="0 0 512 512">
+        <rect x="8" y="8" width="496" height="496" rx="112" fill="url(#logo-tile)"/>
+        <g transform="translate(8 8) scale(.96875) translate(4 -32)">
+          <path fill="url(#logo-orange)" d="M110 115H248Q256 115 256 123V261L105.2 206.7Q92 202 92 188V133Q92 115 110 115Z"/>
+          <path fill="url(#logo-silver)" d="M274 115H394Q412 115 412 133V183Q412 197 399.5 203.3L266 270V123Q266 115 274 115Z"/>
+          <path fill="url(#logo-stem)" d="M173.5 243.7L248.5 270.3Q256 273 256 281V454Q256 462 248.5 459.3L203.6 443.5Q166 430 166 390V249Q166 241 173.5 243.7Z"/>
+        </g>
+      </svg>
       <text x="62" y="33" fill="#f6f4f0" font-size="28" font-weight="700">Tylora</text>
       <text x="0" y="100" fill="#ff9f62" font-size="13" font-weight="700" letter-spacing="2.6">MAKE SPACE FOR FOCUS</text>
       <text x="0" y="158" fill="#faf8f5" font-size="44" font-weight="700">Your windows,</text>
@@ -43,5 +52,6 @@
         <rect x="326" y="100" width="222" height="7" rx="3"/><rect x="326" y="118" width="170" height="7" rx="3"/><rect x="326" y="155" width="205" height="7" rx="3"/><rect x="326" y="273" width="184" height="7" rx="3"/><rect x="326" y="292" width="225" height="7" rx="3"/><rect x="326" y="329" width="139" height="7" rx="3"/></g>
       <rect x="36" y="310" width="112" height="26" rx="7" fill="#f26b1630"/><text x="48" y="328" fill="#ffae77" font-size="11">⌥ H  ·  focus left</text>
     </g>
+  </g>
   </g>
 </svg>
