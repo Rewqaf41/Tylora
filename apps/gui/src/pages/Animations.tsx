@@ -100,7 +100,7 @@ export function Animations() {
   const nativeBackend = animations.data?.backends.find((backend) => backend.name === 'native_experimental')
   const ready = status.isSuccess && !!draft && !config.isPending && !config.isError
   return <><PageHeading eyebrow={t('anim.eyebrow')} title={t('nav.animations')} intro={t('anim.intro')} actions={ready && <><Button variant="ghost" onClick={() => setDraft(structuredClone(saved ?? DEFAULT_ANIMATIONS))} disabled={!changed}>{t('common.cancel')}</Button><Button variant="primary" onClick={apply} disabled={!changed || !!problem || patch.isPending || !saved}><Check size={14} /> {patch.isPending ? t('common.applying') : t('anim.apply')}</Button></>} />
-    {!status.isSuccess ? status.isPending ? <Loading /> : <ErrorState message={t('anim.offline')} retry={() => void status.refetch()} /> : config.isError ? <ErrorState message={config.error.message} /> : config.isPending || !draft ? <Loading /> : <>
+    {!status.isSuccess ? !status.isFetched ? <Loading /> : <ErrorState message={t('anim.offline')} retry={() => void status.refetch()} /> : config.isError ? <ErrorState message={config.error.message} /> : config.isPending || !draft ? <Loading /> : <>
       {!saved && <Notice tone="warn">{t('anim.unsupportedDaemon')}</Notice>}
       {problem && <Notice tone="bad">{t(problem === 'duration' ? 'anim.invalidDuration' : 'anim.invalidFps')}</Notice>}
       {patch.isError && <Notice tone="bad">{patch.error.message}</Notice>}{patch.isSuccess && <p className="good-text">{t('anim.confirmed')}</p>}

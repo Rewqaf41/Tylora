@@ -113,7 +113,7 @@ export function Scratchpads() {
 
   return <><div className="page-heading"><div><span className="eyebrow">{t('rules.eyebrow')}</span><h1>{t('nav.scratchpads')}</h1><p>{t('pads.intro')}</p></div>
     <div className="page-actions"><Button disabled={!online || recover.isPending} onClick={() => recover.mutate()}><LifeBuoy size={13} /> {t('dashboard.recover')}</Button><Button variant="primary" disabled={!online || !config.data} onClick={() => open(null)}><Plus size={14} /> {t('pads.new')}</Button></div></div>
-    {!online ? status.isPending ? <Loading /> : <ErrorState message={t('pads.offline')} retry={() => void status.refetch()} /> : config.isPending ? <Loading /> : config.isError ? <ErrorState message={config.error.message} retry={() => void config.refetch()} /> : <>
+    {!online ? !status.isFetched ? <Loading /> : <ErrorState message={t('pads.offline')} retry={() => void status.refetch()} /> : config.isPending ? <Loading /> : config.isError ? <ErrorState message={config.error.message} retry={() => void config.refetch()} /> : <>
       {pads.length === 0 ? <Empty title={t('pads.none')}>{t('pads.noneHint')}</Empty> : <Card title={t('nav.scratchpads')} description={t('pads.listHint')}>{pads.map((pad) => {
         const entry = states.get(pad.id)
         const state = entry?.state ?? 'unassigned'

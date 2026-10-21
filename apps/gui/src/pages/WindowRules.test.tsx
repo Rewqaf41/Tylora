@@ -16,7 +16,7 @@ vi.mock('@tanstack/react-query', () => ({
 vi.mock('../api/bridge', () => ({ testRule: 'test_rule', applyRule: 'apply_rule', reloadRules: 'reload_rules' }))
 vi.mock('../api/hooks', () => ({
   useDaemon: (kind: string) => {
-    if (kind === 'status') return { isSuccess: !harness.offline, isPending: false, refetch: vi.fn() }
+    if (kind === 'status') return { isSuccess: !harness.offline, isPending: false, isFetched: true, refetch: vi.fn() }
     if (kind === 'config') return { isPending: false, isError: false, data: { revision: 'abc', config: { window_rules: [{ application_id: 'com.apple.calculator', mode: 'floating', priority: 0, enabled: true }], workspaces: [{ id: 2, name: 'Code', display: null, native_space_id: 4 }], rules: [rule('low', 10), rule('high', 100)] } } }
     if (kind === 'rules') return { data: { rules: [rule('low', 10), rule('high', 100)] } }
     if (kind === 'apps') return { isPending: false, data: { apps: [{ pid: 1, bundle_id: 'com.microsoft.VSCode', name: 'Code', windows: 2 }] } }

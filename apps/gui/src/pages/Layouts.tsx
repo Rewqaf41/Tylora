@@ -89,7 +89,7 @@ export function Layouts() {
     // in the spinner resized the card and made the whole page jump.
     placeholderData: (previous) => previous,
   })
-  if (!status.isSuccess) return <><Heading />{status.isPending ? <Loading /> : <ErrorState message={t('layouts.offline')} retry={() => void status.refetch()} />}</>
+  if (!status.isSuccess) return <><Heading />{!status.isFetched ? <Loading /> : <ErrorState message={t('layouts.offline')} retry={() => void status.refetch()} />}</>
   if (config.isPending) return <><Heading /><Loading /></>
   if (config.isError || !saved || !config.data) return <><Heading /><ErrorState message={config.error?.message ?? t('layouts.noConfig')} /></>
   const revision = config.data.revision

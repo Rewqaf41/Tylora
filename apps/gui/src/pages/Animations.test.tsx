@@ -6,7 +6,7 @@ import { animationProblem, Animations, DEFAULT_ANIMATIONS } from './Animations'
 const harness = vi.hoisted(() => ({ offline: false, legacy: false, mutate: vi.fn() }))
 vi.mock('../api/hooks', () => ({
   useDaemon: (kind: string) => {
-    if (kind === 'status') return { isSuccess: !harness.offline, isPending: false, refetch: vi.fn() }
+    if (kind === 'status') return { isSuccess: !harness.offline, isPending: false, isFetched: true, refetch: vi.fn() }
     if (kind === 'config') return { isPending: false, isError: false, data: { revision: 'rev1', config: harness.legacy ? {} : { animations: structuredClone(DEFAULT_ANIMATIONS) } } }
     if (kind === 'animations') return {
       isError: false,

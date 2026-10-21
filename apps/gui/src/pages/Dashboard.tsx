@@ -1,13 +1,17 @@
-import { Activity, AppWindow, CircleCheck, CircleDot, Link2, LayoutGrid, LifeBuoy, Monitor, Play, Power, RotateCcw, RotateCw, TrendingUp, Wand2 } from 'lucide-react'
+import { useMutation, useQuery } from '@tanstack/react-query'
+import { Activity, AppWindow, CircleCheck, CircleDot, ExternalLink, Link2, LayoutGrid, LifeBuoy, Monitor, Play, Power, RotateCcw, RotateCw, ShieldCheck, TrendingUp, Wand2 } from 'lucide-react'
 import { Link } from 'react-router'
+import { appInfo, openSystemPane, requestAccessibility } from '../api/bridge'
 import { useAction, useDaemon } from '../api/hooks'
 import { useT } from '../i18n'
-import { Badge, Button, Card, ConfirmButton, ErrorState, Loading, Metric, Notice, PageHeading } from '../shared/ui'
+import { Badge, Button, Card, ConfirmButton, Loading, Metric, Notice, PageHeading } from '../shared/ui'
 
 export function Dashboard() {
   const t = useT()
   const status = useDaemon('status')
   const connected = status.isSuccess
+  const info = useQuery({ queryKey: ['app-info'], queryFn: appInfo, enabled: !connected, refetchInterval: connected ? false : 5000 })
+  const prompt = useMutation({ mutationFn: requestAccessibility, onSettled: () => void info.refetch() })
   const config = useDaemon('config', connected)
   const capabilities = useDaemon('capabilities', connected)
   const action = useAction()
@@ -21,13 +25,19 @@ export function Dashboard() {
       <Button onClick={() => void status.refetch()}><RotateCcw size={14} /> {t('common.refresh')}</Button>
       {connected && <Button variant="primary" onClick={() => run({ kind: 'simple', action: 'reconcile' })} disabled={action.isPending}><Wand2 size={14} /> {t('dashboard.reconcile')}</Button>}
     </>} />
-    {status.isPending ? <Loading /> : status.isError ? <>
-      <Notice tone="warn">{t('dashboard.notConnected')}</Notice>
+    {!status.isFetched ? <Loading /> : !status.data ? <>
+      <Notice tone="warn">{info.data?.accessibility_trusted === false ? t('dashboard.accessibilityNeeded') : t('dashboard.notConnected')}</Notice>
       <Card title={t('dashboard.control')} description={t('dashboard.controlHint')} className="padded">
-        <div className="row row-pad"><div><span className="row-title">{t('dashboard.stopped')}</span><span className="row-sub">{t('dashboard.noState')}</span></div><Button variant="primary" disabled={action.isPending} onClick={() => run({ kind: 'control', op: 'start' })}><Play size={14} /> {t('dashboard.start')}</Button></div>
+        <div className="row row-pad"><div><span className="row-title">{t('dashboard.stopped')}</span><span className="row-sub">{t('dashboard.noState')}</span></div><div className="list-actions">
+          {info.data?.accessibility_trusted === false && <>
+            <Button disabled={prompt.isPending} onClick={() => prompt.mutate()}><ShieldCheck size={14} /> {t('general.axRequest')}</Button>
+            <Button onClick={() => void openSystemPane('accessibility')}><ExternalLink size={14} /> {t('dashboard.openAccessibility')}</Button>
+          </>}
+          <Button variant="primary" disabled={action.isPending || info.data?.accessibility_trusted === false} onClick={() => run({ kind: 'control', op: 'start' })}><Play size={14} /> {t('dashboard.start')}</Button>
+        </div></div>
       </Card>
-      {action.isError && <p className="bad-text">{action.error.message}</p>}
-      <ErrorState message={status.error.message} retry={() => void status.refetch()} />
+      {prompt.isError && <p className="bad-text">{prompt.error.message}</p>}
+      {action.isError && <p className="bad-text">{action.error.message.includes('Accessibility access is not available') ? t('dashboard.accessibilityNeeded') : action.error.message}</p>}
     </> : <>
       {status.data.daemon_version !== __APP_VERSION__ && <Notice tone="warn">{t('general.versionMismatch', { daemon: status.data.daemon_version ?? '< 0.1.0', app: __APP_VERSION__ })}</Notice>}
       <div className="metric-grid">

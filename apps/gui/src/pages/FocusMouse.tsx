@@ -25,7 +25,7 @@ export function FocusMouse() {
     setNewBundle('')
   }
   return <><div className="page-heading"><div><span className="eyebrow">{t('focus.eyebrow')}</span><h1>{t('nav.focus')}</h1><p>{t('focus.intro')}</p></div></div>
-    {!status.isSuccess ? status.isPending ? <Loading /> : <ErrorState message={t('focus.offline')} retry={() => void status.refetch()} /> : config.isError ? <ErrorState message={config.error.message} /> : config.isPending || !draft ? <Loading /> : <>
+    {!status.isSuccess ? !status.isFetched ? <Loading /> : <ErrorState message={t('focus.offline')} retry={() => void status.refetch()} /> : config.isError ? <ErrorState message={config.error.message} /> : config.isPending || !draft ? <Loading /> : <>
       <div className="two-col even"><div><Card title={t('focus.pointer')} description={t('focus.pointerHint')} className="padded stack">
         <div className="row row-pad"><div><strong>{t('focus.followsMouse')}</strong><span className="row-sub">{t('focus.followsMouseHint')}</span></div><input aria-label={t('focus.followsMouse')} type="checkbox" checked={draft.follows_mouse} onChange={(e) => change({ follows_mouse: e.target.checked })} /></div>
         <div className="row row-pad"><div><strong>{t('focus.mode')}</strong><span className="row-sub">{t('focus.modeHint')}</span></div><select className="search-input" aria-label={t('focus.mode')} value={draft.mode} disabled={!draft.follows_mouse} onChange={(e) => change({ mode: e.target.value as FocusSettings['mode'] })}><option value="instant">{t('focus.instant')}</option><option value="delayed">{t('focus.delayed')}</option><option value="disabled">{t('focus.off')}</option></select></div>

@@ -64,6 +64,8 @@ export const ru: Messages = {
   'dashboard.title': 'Рады вас видеть.',
   'dashboard.intro': 'Состояние оконного менеджера и рабочих столов macOS в реальном времени.',
   'dashboard.notConnected': 'Демон не подключён. Запустите его, чтобы видеть окна и рабочие столы.',
+  'dashboard.accessibilityNeeded': 'Разрешите Tylora доступ в Системных настройках → Конфиденциальность и безопасность → Универсальный доступ, затем перезапустите приложение и демон.',
+  'dashboard.openAccessibility': 'Открыть настройки доступа',
   'dashboard.control': 'Управление демоном',
   'dashboard.controlHint': 'Настройки можно не закрывать, пока демон остановлен.',
   'dashboard.stopped': 'Tylora остановлена',

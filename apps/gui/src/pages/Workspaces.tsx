@@ -63,7 +63,7 @@ export function Workspaces() {
   const hotkeys = useDaemon('hotkeys', online)
   const displays = [...new Set(spaces.data?.spaces.map((space) => space.display) ?? [])]
   return <><div className="page-heading"><div><span className="eyebrow">{t('ws.eyebrow')}</span><h1>{t('nav.workspaces')}</h1><p>{t('ws.intro')}</p></div></div>
-    {!online ? status.isPending ? <Loading /> : <ErrorState message={t('ws.offline')} retry={() => void status.refetch()} /> : spaces.isPending || config.isPending ? <Loading /> : spaces.isError || config.isError ? <ErrorState message={spaces.error?.message ?? config.error?.message ?? t('common.unknownError')} retry={() => { void spaces.refetch(); void config.refetch() }} /> : <>
+    {!online ? !status.isFetched ? <Loading /> : <ErrorState message={t('ws.offline')} retry={() => void status.refetch()} /> : spaces.isPending || config.isPending ? <Loading /> : spaces.isError || config.isError ? <ErrorState message={spaces.error?.message ?? config.error?.message ?? t('common.unknownError')} retry={() => { void spaces.refetch(); void config.refetch() }} /> : <>
       {spaces.data.spaces.length === 0 ? <Empty title={t('ws.none')}>{t('ws.noneHint')}</Empty> : displays.map((display) => <Card key={display} title={t('common.display', { id: display })} description={t('ws.desktopCount', { count: spaces.data.spaces.filter((space) => space.display === display).length })}>
         <div>{spaces.data.spaces.filter((space) => space.display === display).map((space) => {
           const workspace = config.data.config.workspaces.find((entry) => bindsSpace(entry, space.id))

@@ -20,7 +20,7 @@ vi.mock('../api/bridge', () => ({
 }))
 vi.mock('../api/hooks', () => ({
   useDaemon: (kind: string) => {
-    if (kind === 'status') return { isSuccess: !harness.offline, isPending: false, refetch: vi.fn() }
+    if (kind === 'status') return { isSuccess: !harness.offline, isPending: false, isFetched: true, refetch: vi.fn() }
     if (kind === 'config') return { isPending: false, isError: false, data: { revision: 'abc', config: { hotkeys: [{ chord: 'option+1', command: { command: 'focus_workspace', id: 1 }, enabled: true }], scratchpads: [pad('term'), pad('notes', { hotkey: null, scope: 'local' })] } } }
     if (kind === 'scratchpads') return { data: { version: 1, scratchpads: [{ id: 'term', name: 'term', state: 'hidden', manual: true, window: { process: { pid: 7, epoch: 1 }, cg_window_id: 900, bundle_id: 'com.apple.Terminal', title: 'zsh' }, last_error: null }, { id: 'notes', name: 'notes', state: 'unassigned', manual: false, window: null, last_error: null }], parking: {}, metrics: {} } }
     if (kind === 'scratchpad_capabilities') return { isPending: false, data: { version: 1, park: { available: true, mechanism: '', parking_desktops: {} }, global: { available: true, target: '' }, minimize: { available: true, mechanism: '' }, sticky: { available: false, reason: 'requires SIP changes' }, create_parking_desktop: { mechanism: '' }, reasons: [] } }

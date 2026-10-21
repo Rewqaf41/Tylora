@@ -65,6 +65,8 @@ export const en = {
   'dashboard.title': 'Good to see you.',
   'dashboard.intro': 'A live view of your window manager and native macOS Spaces.',
   'dashboard.notConnected': 'The daemon is not connected. Start it to see live windows and Spaces.',
+  'dashboard.accessibilityNeeded': 'Allow Tylora in System Settings → Privacy & Security → Accessibility, then restart the app and start the daemon.',
+  'dashboard.openAccessibility': 'Open Accessibility settings',
   'dashboard.control': 'Daemon control',
   'dashboard.controlHint': 'The settings app can stay open while the daemon is stopped.',
   'dashboard.stopped': 'Tylora is stopped',
