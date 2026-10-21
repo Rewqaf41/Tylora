@@ -35,6 +35,8 @@ jobs:
             [ "$version" = "$tag" ] || { echo "version $version does not match tag $tag"; exit 1; }
           done
       - run: cargo fmt --all --check
+      - name: Prepare Tauri sidecar for Rust checks
+        run: node apps/gui/scripts/prepare-sidecar.mjs
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - name: Frontend checks
@@ -64,7 +66,7 @@ jobs:
             echo "signed=true" >> "$GITHUB_OUTPUT"
           else
             echo "signed=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No Apple credentials: building an ad-hoc signed DMG; it will not be published."
+            echo "::warning::No Apple credentials: publishing an ad-hoc signed, unnotarized DMG."
           fi
       - name: Write App Store Connect key
         if: steps.signing.outputs.signed == 'true'
