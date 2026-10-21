@@ -3,7 +3,7 @@ name = "tylora-core"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 [dependencies]
 tracing.workspace = true

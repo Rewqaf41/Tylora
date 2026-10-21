@@ -134,12 +134,18 @@ jobs:
           Download `Tylora_aarch64.dmg` for an Apple Silicon Mac, then drag Tylora into Applications.
 
           This build passed Developer ID signing, notarization and Gatekeeper checks. Grant Accessibility permission during first-run setup.
+
+          PolyForm Noncommercial License 1.0.0: https://polyformproject.org/licenses/noncommercial/1.0.0
+          Required Notice: Copyright (c) 2026 Rewqaf41
           EOF
           else
             cat > release-notes.md <<'EOF'
           Download `Tylora_aarch64.dmg` for an Apple Silicon Mac, then drag Tylora into Applications.
 
           **This build is ad-hoc signed and not notarized.** macOS may block it on first launch. After trying to open Tylora, go to System Settings → Privacy & Security and choose **Open Anyway** for Tylora. Grant Accessibility permission during first-run setup. Only install software from a source you trust.
+
+          PolyForm Noncommercial License 1.0.0: https://polyformproject.org/licenses/noncommercial/1.0.0
+          Required Notice: Copyright (c) 2026 Rewqaf41
           EOF
           fi
       - name: Publish GitHub release

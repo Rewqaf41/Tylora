@@ -98,3 +98,4 @@ The former project name was FluxWM. Tylora can import an existing FluxWM configu
 - [Release guide](RELEASE.md) — packaging, signing, and notarization.
 - [Architecture](architecture.md) — internals, state ownership, and known limits.
 - [Example configuration](examples/config.toml) — a starting TOML file.
+- [License](LICENSE) — PolyForm Noncommercial 1.0.0, copyright © 2026 Rewqaf41. Commercial use and resale require permission from the author.

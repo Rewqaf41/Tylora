@@ -12,7 +12,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 rust-version = "1.82"
-license = "MIT"
+license-file = "LICENSE"
 
 [workspace.dependencies]
 tracing = "=0.1.40"

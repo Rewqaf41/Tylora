@@ -43,6 +43,9 @@
       "signingIdentity": "-",
       "hardenedRuntime": true,
       "entitlements": "./Entitlements.plist",
+      "files": {
+        "Resources/LICENSE": "../../../LICENSE"
+      },
       "dmg": {
         "windowSize": {
           "width": 660,
@@ -59,7 +62,7 @@
       }
     },
     "category": "public.app-category.utilities",
-    "copyright": "MIT License",
+    "copyright": "Copyright © 2026 Rewqaf41",
     "shortDescription": "Tiling window manager for macOS"
   }
 }
