@@ -23,6 +23,10 @@ pub enum ConfigPatch {
     SetMenuBar {
         menu_bar: crate::MenuBar,
     },
+    /// Replaces `[cheat_sheet]`.
+    SetCheatSheet {
+        cheat_sheet: crate::CheatSheet,
+    },
     SetWindowMovement {
         settings: WindowMovement,
     },
@@ -282,6 +286,17 @@ pub fn apply_patch(source: &str, patch: ConfigPatch) -> Result<(String, Config),
             }
             doc["menu_bar"]["enabled"] = value(menu_bar.enabled);
             doc["menu_bar"]["show_workspaces"] = value(menu_bar.show_workspaces);
+        }
+        ConfigPatch::SetCheatSheet { cheat_sheet } => {
+            if !doc
+                .as_table()
+                .get("cheat_sheet")
+                .is_some_and(Item::is_table)
+            {
+                doc["cheat_sheet"] = Item::Table(Table::new());
+            }
+            doc["cheat_sheet"]["enabled"] = value(cheat_sheet.enabled);
+            doc["cheat_sheet"]["hold_ms"] = value(i64::from(cheat_sheet.hold_ms));
         }
         ConfigPatch::SetZoom { respect_outer_gaps } => {
             if !doc.as_table().get("zoom").is_some_and(Item::is_table) {
@@ -710,6 +725,28 @@ mod tests {
         assert!(edited.contains("[menu_bar]"));
         assert!(!config.menu_bar.show_workspaces);
         assert!(config.menu_bar.enabled);
+    }
+
+    #[test]
+    fn cheat_sheet_patch_and_hold_limits() {
+        let (edited, config) = apply_patch(
+            "version = 1\n",
+            ConfigPatch::SetCheatSheet {
+                cheat_sheet: crate::CheatSheet {
+                    enabled: false,
+                    hold_ms: 1500,
+                },
+            },
+        )
+        .unwrap();
+        assert!(edited.contains("[cheat_sheet]"));
+        assert!(!config.cheat_sheet.enabled);
+        assert_eq!(config.cheat_sheet.hold_ms, 1500);
+        assert_eq!(
+            Config::parse("version = 1\n").unwrap().cheat_sheet.hold_ms,
+            3000
+        );
+        assert!(Config::parse("version = 1\n[cheat_sheet]\nhold_ms = 100\n").is_err());
     }
 
     #[test]

@@ -43,6 +43,25 @@ pub struct Config {
     pub animations: AnimationConfig,
     /// `[menu_bar]`: the daemon's own menu bar icon.
     pub menu_bar: MenuBar,
+    /// `[cheat_sheet]`: hotkey overview while Option is held alone.
+    pub cheat_sheet: CheatSheet,
+}
+
+/// Holding Option alone for `hold_ms` shows every active hotkey until
+/// Option is released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CheatSheet {
+    pub enabled: bool,
+    pub hold_ms: u32,
+}
+impl Default for CheatSheet {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hold_ms: 3000,
+        }
+    }
 }
 
 /// The daemon's menu bar item: a monochrome Tylora icon, optionally followed
@@ -413,6 +432,7 @@ impl Default for Config {
             gaps: Gaps::default(),
             zoom: Zoom::default(),
             menu_bar: MenuBar::default(),
+            cheat_sheet: CheatSheet::default(),
             default_layout: LayoutKind::Bsp,
             dwindle: DwindleSettings::default(),
             scrolling: ScrollingSettings::default(),
@@ -515,6 +535,9 @@ impl Config {
         let fail = |message: &str| Err(ConfigError::Invalid(message.into()));
         if self.version != 1 {
             return fail("unsupported schema version");
+        }
+        if !(500..=10_000).contains(&self.cheat_sheet.hold_ms) {
+            return fail("cheat_sheet.hold_ms must be between 500 and 10000");
         }
         if !self.gaps.inner.is_finite()
             || !self.gaps.outer.is_finite()
