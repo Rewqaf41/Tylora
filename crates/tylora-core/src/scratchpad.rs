@@ -474,6 +474,14 @@ pub fn plan_scratchpad(
     if !visible {
         return Ok(ScratchpadPlan::Nothing);
     }
+    // A local scratchpad belongs to its Space: it is minimized there rather
+    // than parked with the others on a parking Desktop.
+    if definition.scope == ScratchpadScope::Local {
+        return Ok(ScratchpadPlan::Hide {
+            park: None,
+            minimize: true,
+        });
+    }
     match definition.hide {
         HideStrategy::Minimize => Ok(ScratchpadPlan::Hide {
             park: None,
@@ -1005,6 +1013,48 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn local_scope_hides_on_its_own_space() {
+        let mut registry = registry();
+        registry
+            .assign(
+                "terminal",
+                window(10),
+                Some(4),
+                Some(DisplayId(1)),
+                false,
+                true,
+                false,
+            )
+            .unwrap();
+        let mut pad = ScratchpadDefinition::new("terminal");
+        pad.scope = ScratchpadScope::Local;
+        pad.hide = HideStrategy::Park;
+        let entry = registry.get("terminal").unwrap().clone();
+        let mut here = context(4, true);
+        here.home_active = true;
+        // Minimized where it is, never parked with the global ones.
+        assert_eq!(
+            plan_scratchpad(&pad, &entry, ScratchpadAction::Hide, here),
+            Ok(ScratchpadPlan::Hide {
+                park: None,
+                minimize: true
+            })
+        );
+        // Shown again on the same Space by unminimizing, without a move.
+        let mut minimized = here;
+        minimized.minimized = true;
+        assert_eq!(
+            plan_scratchpad(&pad, &entry, ScratchpadAction::Toggle, minimized),
+            Ok(ScratchpadPlan::Show {
+                display: DisplayId(1),
+                space: 4,
+                move_from: None,
+                unminimize: true
+            })
+        );
     }
 
     #[test]

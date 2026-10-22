@@ -857,6 +857,8 @@ struct DisplayState {
     /// Scratchpads whose application was launched to get a window:
     /// id -> (bundle ID, launched at).
     scratchpad_launches: HashMap<String, (String, Instant)>,
+    /// Displays whose parking Desktop is being created; never two at once.
+    parking_in_flight: HashSet<DisplayId>,
     /// Windows adopted for a launched scratchpad; assigned and shown by the
     /// main loop.
     scratchpad_adopted: Vec<(String, u32)>,
@@ -2161,10 +2163,13 @@ impl DisplayState {
         }
     }
 
-    fn parking_space(&self, display: DisplayId) -> Option<u64> {
+    /// The display's parking Desktop, if `spaces` still has it. Callers pass
+    /// a fresh WindowServer list: the Space observer lags behind a Desktop
+    /// that was just created, which used to create another one.
+    fn parking_space(&self, display: DisplayId, spaces: &[NativeSpace]) -> Option<u64> {
         let uuid = self.areas.get(&display)?.stable_uuid?;
         let space = *self.scratchpads.parking.get(&format!("{uuid:032x}"))?;
-        self.native_spaces
+        spaces
             .iter()
             .any(|native| native.id.0 == space && native.display == display)
             .then_some(space)
@@ -2323,11 +2328,22 @@ fn scratchpad_action(
         })
         .or(window_display)
         .unwrap_or(state.primary);
-    let target_space = live_spaces
+    // A display showing a fullscreen app has no active Desktop. A local
+    // scratchpad does not need one: the planner visits its home Space.
+    let target_space = match live_spaces
         .iter()
         .find(|space| space.display == target_display && space.active)
-        .map(|space| space.id.0)
-        .ok_or("target display has no active native Space")?;
+    {
+        Some(space) => space.id.0,
+        None => match (definition.scope, entry.home_space) {
+            (tylora_core::scratchpad::ScratchpadScope::Local, Some(home)) => home,
+            _ => {
+                return Err(
+                    "a fullscreen app is active on this display; a global scratchpad can only appear on a Desktop".into(),
+                )
+            }
+        },
+    };
     let context = ScratchpadContext {
         target_display,
         target_space,
@@ -2335,7 +2351,8 @@ fn scratchpad_action(
         window_display,
         window_space_active: window_native.is_some_and(|space| space.active),
         minimized,
-        parking_space: window_display.and_then(|display| state.parking_space(display)),
+        parking_space: window_display
+            .and_then(|display| state.parking_space(display, &live_spaces)),
         home_active: entry.home_space.is_some_and(|home| {
             live_spaces
                 .iter()
@@ -2396,6 +2413,9 @@ fn scratchpad_action(
         }
         ScratchpadPlan::NeedsParking(display) => {
             // Create the display's parking Desktop once, then hide again.
+            if !state.parking_in_flight.insert(display) {
+                return Err("the parking Desktop is still being created; try again".into());
+            }
             let uuid = state
                 .areas
                 .get(&display)
@@ -3581,6 +3601,7 @@ impl DisplayState {
             scratchpad_metrics: ScratchpadMetrics::default(),
             scratchpad_rule_queue: Vec::new(),
             scratchpad_launches: HashMap::new(),
+            parking_in_flight: HashSet::new(),
             scratchpad_adopted: Vec::new(),
             window_modes: HashMap::new(),
             rule_tracker: RuleTracker::default(),
@@ -5870,50 +5891,56 @@ fn run_coordinator(
                     display_uuid,
                     result,
                     response,
-                } => match result {
-                    Ok(space) => {
-                        info!(space, "scratchpad parking Desktop created");
-                        state
-                            .scratchpads
-                            .parking
-                            .insert(format!("{display_uuid:032x}"), space);
-                        save_scratchpads(&state.scratchpads);
-                        let io = ScratchpadIo {
-                            adapter: &adapter,
-                            native: &native_move_tx,
-                            focused: focus_trail.last().copied(),
-                            trail: &focus_trail,
-                        };
-                        if let Err(error) = scratchpad_action(
-                            &mut state,
-                            &io,
-                            &id,
-                            ScratchpadAction::Hide,
-                            response.clone(),
-                        ) {
+                } => {
+                    state.parking_in_flight.retain(|display| {
+                        state.areas.get(display).and_then(|area| area.stable_uuid)
+                            != Some(display_uuid)
+                    });
+                    match result {
+                        Ok(space) => {
+                            info!(space, "scratchpad parking Desktop created");
+                            state
+                                .scratchpads
+                                .parking
+                                .insert(format!("{display_uuid:032x}"), space);
+                            save_scratchpads(&state.scratchpads);
+                            let io = ScratchpadIo {
+                                adapter: &adapter,
+                                native: &native_move_tx,
+                                focused: focus_trail.last().copied(),
+                                trail: &focus_trail,
+                            };
+                            if let Err(error) = scratchpad_action(
+                                &mut state,
+                                &io,
+                                &id,
+                                ScratchpadAction::Hide,
+                                response.clone(),
+                            ) {
+                                if let Some(response) = response {
+                                    let _ = response.try_send(scratchpad_reply(
+                                        &id,
+                                        state.scratchpads.get(&id),
+                                        "park",
+                                        Err(error),
+                                    ));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, "cannot create a parking Desktop; scratchpad stays visible");
+                            state.scratchpad_metrics.errors += 1;
                             if let Some(response) = response {
                                 let _ = response.try_send(scratchpad_reply(
                                     &id,
                                     state.scratchpads.get(&id),
                                     "park",
-                                    Err(error),
+                                    Err(format!("cannot hide: {error}")),
                                 ));
                             }
                         }
                     }
-                    Err(error) => {
-                        warn!(%error, "cannot create a parking Desktop; scratchpad stays visible");
-                        state.scratchpad_metrics.errors += 1;
-                        if let Some(response) = response {
-                            let _ = response.try_send(scratchpad_reply(
-                                &id,
-                                state.scratchpads.get(&id),
-                                "park",
-                                Err(format!("cannot hide: {error}")),
-                            ));
-                        }
-                    }
-                },
+                }
                 NativeMoveEvent::RuleMoved {
                     operation,
                     key,
