@@ -33,6 +33,11 @@ fn main() -> ExitCode {
 
     let args: Vec<String> = env::args().skip(1).collect();
     #[cfg(target_os = "macos")]
+    if args.get(..2) == Some(&["space".to_owned(), "create".to_owned()]) {
+        // Mission Control is driven by the daemon, with its permission.
+        return runtime::request(&args.join(" "));
+    }
+    #[cfg(target_os = "macos")]
     if args.first().is_some_and(|word| word == "space") {
         return native_space_command(&args[1..]);
     }
@@ -166,7 +171,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: tylora --version | start [--display ID] | subscribe [--events workspace,focus,layout,window_opened,window_closed,display_added,display_removed,daemon] | stop | recover-windows | status [--json] | windows | layout | reconcile | space list|current|capabilities|diagnostics|move-diagnostics|reconcile [--json] | space focus WORKSPACE [--json] | space focus-id NATIVE_ID [--json] | space move-window WORKSPACE [--window-id CG_ID] [--json] | space windows DESKTOP_NUMBER [--json] | display list [--json] | display focus next|DIR | window move-to-display next|previous|ID [--json] | hotkeys list [--json] | hotkeys pause|resume|sheet | list-windows [--ax] | focus DIR|next|previous | move DIR | resize DIR --amount N | floating toggle | zoom toggle | layout list|current [--json] | rules list|validate|reload|diagnostics [--json] | rules test|apply --window CG_ID [--json] | apps list [--json] | scratchpad list|capabilities|recover [--json] | scratchpad assign ID [--window CG_ID] [--force] [--json] | scratchpad unassign|toggle|show|hide ID [--json] | layout set bsp|dwindle|scrolling [--json] | layout cycle [--json] | scroll left|right | center | column cycle-width | column width DELTA");
+    eprintln!("usage: tylora --version | start [--display ID] | subscribe [--events workspace,focus,layout,window_opened,window_closed,display_added,display_removed,daemon] | stop | recover-windows | status [--json] | windows | layout | reconcile | space list|current|capabilities|diagnostics|move-diagnostics|reconcile [--json] | space create [--display ID] [--json] | space focus WORKSPACE [--json] | space focus-id NATIVE_ID [--json] | space move-window WORKSPACE [--window-id CG_ID] [--json] | space windows DESKTOP_NUMBER [--json] | display list [--json] | display focus next|DIR | window move-to-display next|previous|ID [--json] | hotkeys list [--json] | hotkeys pause|resume|sheet | list-windows [--ax] | focus DIR|next|previous | move DIR | resize DIR --amount N | floating toggle | zoom toggle | layout list|current [--json] | rules list|validate|reload|diagnostics [--json] | rules test|apply --window CG_ID [--json] | apps list [--json] | scratchpad list|capabilities|recover [--json] | scratchpad assign ID [--window CG_ID] [--force] [--json] | scratchpad unassign|toggle|show|hide ID [--json] | layout set bsp|dwindle|scrolling [--json] | layout cycle [--json] | scroll left|right | center | column cycle-width | column width DELTA");
     ExitCode::from(2)
 }
 

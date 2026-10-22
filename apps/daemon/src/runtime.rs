@@ -7547,6 +7547,64 @@ fn run_coordinator(
                 let _ = request.response.try_send(reply.to_string());
                 continue;
             }
+            if let Some(rest) = request.command.strip_prefix("space create") {
+                // A new Desktop through Mission Control, off this thread; the
+                // reply names it once WindowServer lists it.
+                let mut words = rest.split_whitespace();
+                let mut display = tylora_macos::spaces::cursor_display()
+                    .filter(|display| state.active.contains(display))
+                    .unwrap_or(state.primary);
+                while let Some(word) = words.next() {
+                    if word == "--display" {
+                        if let Some(id) = words.next().and_then(|id| id.parse().ok()) {
+                            display = DisplayId(id);
+                        }
+                    }
+                }
+                if !state.active.contains(&display) {
+                    let _ = request.response.try_send(
+                        serde_json::json!({"version":1,"ok":false,"message":"unknown display"})
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let known: HashSet<u64> =
+                    state.native_spaces.iter().map(|space| space.id.0).collect();
+                let response = request.response;
+                thread::spawn(move || {
+                    use tylora_macos::spaces::{ExperimentalSkyLightBackend, NativeSpaceBackend};
+                    let created = tylora_macos::add_desktops(display, 1).and_then(|_| {
+                        let backend = ExperimentalSkyLightBackend::new();
+                        let deadline = Instant::now() + Duration::from_secs(3);
+                        loop {
+                            if let Some(space) = backend.list_spaces().ok().and_then(|spaces| {
+                                spaces
+                                    .into_iter()
+                                    .filter(|space| {
+                                        space.display == display && !known.contains(&space.id.0)
+                                    })
+                                    .max_by_key(|space| space.desktop.0)
+                            }) {
+                                return Ok(space);
+                            }
+                            if Instant::now() >= deadline {
+                                return Err("the new Desktop did not appear".to_string());
+                            }
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                    });
+                    let reply = match created {
+                        Ok(space) => {
+                            let (space_id, display_id) = (space.id.0, space.display.0);
+                            info!(space_id, display_id, "Desktop created");
+                            serde_json::json!({"version":1,"ok":true,"space":space})
+                        }
+                        Err(error) => serde_json::json!({"version":1,"ok":false,"message":error}),
+                    };
+                    let _ = response.try_send(reply.to_string());
+                });
+                continue;
+            }
             if request.command == "hotkeys sheet" {
                 let groups = cheat_sheet(&config);
                 let reply = if menu_bar.cheat_sheet.try_send(Some(groups)).is_ok() {

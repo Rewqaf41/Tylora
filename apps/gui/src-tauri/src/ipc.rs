@@ -86,6 +86,10 @@ pub enum Mutation {
         action: ScratchpadVerb,
     },
     RecoverScratchpads,
+    /// Adds a Desktop on `display` through Mission Control.
+    CreateDesktop {
+        display: u32,
+    },
     /// Releases global hotkeys while a shortcut is being recorded.
     PauseHotkeys,
     ResumeHotkeys,
@@ -376,6 +380,21 @@ pub fn mutate(action: Mutation) -> Result<Value, BridgeError> {
         Mutation::PauseHotkeys => scratchpad_result(&send("hotkeys pause")?),
         Mutation::ResumeHotkeys => scratchpad_result(&send("hotkeys resume")?),
         Mutation::RecoverScratchpads => scratchpad_result(&send("scratchpad recover --json")?),
+        Mutation::CreateDesktop { display } => {
+            let reply = send(&format!("space create --display {display} --json"))?;
+            let value: Value = serde_json::from_str(&reply)
+                .map_err(|_| BridgeError::new("protocol", "invalid Desktop response"))?;
+            if value.get("ok") != Some(&Value::Bool(true)) {
+                return Err(BridgeError::new(
+                    "daemon_error",
+                    value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the Desktop was not created"),
+                ));
+            }
+            Ok(value)
+        }
         Mutation::ReloadRules => {
             let value = json_reply("rules reload --json")?;
             if value.get("ok") != Some(&Value::Bool(true)) {
