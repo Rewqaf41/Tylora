@@ -859,6 +859,8 @@ struct DisplayState {
     scratchpad_launches: HashMap<String, (String, Instant)>,
     /// Displays whose parking Desktop is being created; never two at once.
     parking_in_flight: HashSet<DisplayId>,
+    /// Volume names of mounted disk images and when they were read.
+    disk_images: (HashSet<String>, Option<Instant>),
     /// Windows adopted for a launched scratchpad; assigned and shown by the
     /// main loop.
     scratchpad_adopted: Vec<(String, u32)>,
@@ -1180,6 +1182,17 @@ struct RuleOperation {
 /// Bundle identifier of the Tylora settings app.
 const SETTINGS_APP_ID: &str = "com.tylora.settings";
 
+/// Installers and setup assistants float unless the user tiles them: their
+/// fixed-size step pages only get stretched by a layout. Matches macOS
+/// Installer (`com.apple.installer`) and bundle IDs naming an installer or
+/// setup ("com.google.Chrome.installer", "…Setup…").
+fn floats_by_default(application_id: Option<&str>) -> bool {
+    application_id.is_some_and(|id| {
+        let id = id.to_ascii_lowercase();
+        id.contains("install") || id.contains("setup")
+    })
+}
+
 /// Rules from both `[[rules]]` and legacy `[[window_rules]]`, plus the
 /// built-in one that keeps the Tylora window floating (it centres itself).
 fn compile_rule_engine(config: &Config) -> Result<RuleEngine, String> {
@@ -1294,6 +1307,51 @@ fn resolve_rule_target(
 impl DisplayState {
     /// Evaluates rules for one observed window and decides its mode. Moves
     /// are only queued here; they run from the main loop.
+    /// A Finder window showing a mounted disk image, such as an app's DMG
+    /// installer window: it floats like other installers. `hdiutil` is asked
+    /// at most every five seconds, and only for a Finder window titled like
+    /// a mounted volume.
+    fn is_disk_image_window(&mut self, window: &WindowSnapshot, now: Instant) -> bool {
+        let (Some("com.apple.finder"), Some(title)) =
+            (window.application_id.as_deref(), window.title.as_deref())
+        else {
+            return false;
+        };
+        // A second copy of a volume mounts as "Name 2" but its window is
+        // still titled "Name".
+        let base = |mount: &str| -> String {
+            match mount.rsplit_once(' ') {
+                Some((name, number)) if number.parse::<u32>().is_ok() => name.to_owned(),
+                _ => mount.to_owned(),
+            }
+        };
+        let mounted = fs::read_dir("/Volumes").is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| base(&entry.file_name().to_string_lossy()) == title)
+        });
+        if title.is_empty() || !mounted {
+            return false;
+        }
+        let (names, checked) = &mut self.disk_images;
+        if checked.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(5)) {
+            *checked = Some(now);
+            *names = Command::new("/usr/bin/hdiutil")
+                .args(["info", "-plist"])
+                .output()
+                .map(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .split("<string>/Volumes/")
+                        .skip(1)
+                        .filter_map(|rest| rest.split("</string>").next())
+                        .map(base)
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        names.contains(title)
+    }
+
     fn apply_rules(&mut self, window: &mut WindowSnapshot, now: Instant) {
         use tylora_core::registry::ManagementMode;
         let key = rule_key(window);
@@ -3602,6 +3660,7 @@ impl DisplayState {
             scratchpad_rule_queue: Vec::new(),
             scratchpad_launches: HashMap::new(),
             parking_in_flight: HashSet::new(),
+            disk_images: (HashSet::new(), None),
             scratchpad_adopted: Vec::new(),
             window_modes: HashMap::new(),
             rule_tracker: RuleTracker::default(),
@@ -3921,6 +3980,12 @@ impl DisplayState {
             .collect();
         let now = Instant::now();
         for window in &mut windows {
+            if window.mode == tylora_core::registry::ManagementMode::Tiled
+                && (floats_by_default(window.application_id.as_deref())
+                    || self.is_disk_image_window(window, now))
+            {
+                window.mode = tylora_core::registry::ManagementMode::Floating;
+            }
             self.apply_rules(window, now);
             // The user's explicit choice outlives AX tokens and wins over rules.
             let chosen = window
@@ -9382,6 +9447,24 @@ mod tests {
             lifecycle: WindowLifecycle::Active,
             mode: ManagementMode::Tiled,
         }
+    }
+    #[test]
+    fn installers_float_by_default() {
+        for id in [
+            "com.apple.installer",
+            "com.google.Chrome.Installer",
+            "com.vendor.SetupAssistant",
+        ] {
+            assert!(floats_by_default(Some(id)), "{id}");
+        }
+        assert!(!floats_by_default(Some("com.apple.Safari")));
+        assert!(!floats_by_default(None));
+        let config = Config::default();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        let mut window = snapshot(1, 1);
+        window.application_id = Some("com.apple.installer".into());
+        state.handle_reconciled(window.id.process, vec![window.clone()]);
+        assert_eq!(state.coordinators[&DisplayId(1)].layout.len(), 0);
     }
     #[test]
     fn tylora_window_always_floats() {
