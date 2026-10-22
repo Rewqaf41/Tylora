@@ -752,6 +752,15 @@ export const en = {
   'updates.updatedHint': 'If tiling does not start, switch Tylora off and on in Privacy & Security → Accessibility: this build has a new signature.',
   'updates.whatsNew': 'What’s new',
   'updates.dismiss': 'Dismiss',
+
+  // Menu bar
+  'menuBar.title': 'Menu bar',
+  'menuBar.hint': 'The daemon’s own monochrome icon. It replaces the app’s icon while the daemon runs.',
+  'menuBar.enabled': 'Show the Tylora icon',
+  'menuBar.enabledHint': 'Open Tylora, switch workspaces, reconcile or stop from the menu bar.',
+  'menuBar.workspaces': 'Show workspace numbers',
+  'menuBar.workspacesHint': 'Bound workspaces next to the icon: ❶ active, plain digits hold windows, faint digits are empty.',
+  'menuBar.needsDaemon': 'Start the daemon to change these settings.',
 }
 
 export type Messages = { [K in keyof typeof en]: string }

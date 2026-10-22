@@ -41,6 +41,25 @@ pub struct Config {
     pub disconnect_policy: DisconnectPolicy,
     /// `[animations]`; files without it get the defaults.
     pub animations: AnimationConfig,
+    /// `[menu_bar]`: the daemon's own menu bar icon.
+    pub menu_bar: MenuBar,
+}
+
+/// The daemon's menu bar item: a monochrome Tylora icon, optionally followed
+/// by the workspace numbers, with a menu to open the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MenuBar {
+    pub enabled: bool,
+    pub show_workspaces: bool,
+}
+impl Default for MenuBar {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            show_workspaces: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -393,6 +412,7 @@ impl Default for Config {
             version: 1,
             gaps: Gaps::default(),
             zoom: Zoom::default(),
+            menu_bar: MenuBar::default(),
             default_layout: LayoutKind::Bsp,
             dwindle: DwindleSettings::default(),
             scrolling: ScrollingSettings::default(),

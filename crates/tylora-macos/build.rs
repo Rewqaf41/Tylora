@@ -4,24 +4,28 @@ fn main() {
         return;
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    let object = out.join("window_move_bridge.o");
     let archive = out.join("libtylora_window_move_bridge.a");
-    let status = Command::new("clang")
-        .args([
-            "-fno-objc-arc",
-            "-fvisibility=hidden",
-            "-c",
-            "src/spaces/window_move_bridge.m",
-            "-o",
-        ])
-        .arg(&object)
-        .status()
-        .expect("clang is required for the macOS bridge");
-    assert!(status.success(), "Objective-C bridge compilation failed");
+    let mut objects = Vec::new();
+    for source in [
+        "src/spaces/window_move_bridge.m",
+        "src/native/status_item.m",
+    ] {
+        let name = PathBuf::from(source).with_extension("o");
+        let object = out.join(name.file_name().expect("object name"));
+        let status = Command::new("clang")
+            .args(["-fno-objc-arc", "-fvisibility=hidden", "-c", source, "-o"])
+            .arg(&object)
+            .status()
+            .expect("clang is required for the macOS bridge");
+        assert!(status.success(), "Objective-C compilation failed: {source}");
+        println!("cargo:rerun-if-changed={source}");
+        objects.push(object);
+    }
+    let _ = std::fs::remove_file(&archive);
     let status = Command::new("ar")
         .arg("rcs")
         .arg(&archive)
-        .arg(&object)
+        .args(&objects)
         .status()
         .expect("ar is required for the macOS bridge");
     assert!(status.success(), "Objective-C bridge archive failed");
@@ -30,5 +34,5 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=ApplicationServices");
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
     println!("cargo:rustc-link-lib=framework=Foundation");
-    println!("cargo:rerun-if-changed=src/spaces/window_move_bridge.m");
+    println!("cargo:rustc-link-lib=framework=AppKit");
 }

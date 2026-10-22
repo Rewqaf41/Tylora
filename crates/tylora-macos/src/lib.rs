@@ -281,10 +281,16 @@ pub use native::managed::{
 };
 
 #[cfg(target_os = "macos")]
+pub use native::status_item::{
+    pump_events, MenuAction, StatusItem, StatusSnapshot, StatusWorkspace,
+};
+
+#[cfg(target_os = "macos")]
 mod native {
     pub mod input;
     pub mod managed;
     pub mod mission_control;
+    pub mod status_item;
     use super::*;
     use std::{
         collections::BTreeSet,

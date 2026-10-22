@@ -12,9 +12,26 @@ use tauri::{
 fn show_settings(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
+        // The daemon keeps this window floating; it always opens centred.
+        let _ = window.center();
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+/// The daemon draws its own menu bar item while it runs (unless turned off
+/// in `[menu_bar]`); the app's icon then stays hidden so there is only one.
+fn daemon_shows_menu_bar(status: &serde_json::Value) -> bool {
+    status
+        .pointer("/menu_bar/enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether the app keeps its own menu bar icon right now.
+fn app_tray_wanted() -> bool {
+    preferences::read().is_ok_and(|prefs| prefs.show_menu_bar_icon)
+        && !ipc::query(ipc::QueryKind::Status).is_ok_and(|status| daemon_shows_menu_bar(&status))
 }
 
 fn main() {
@@ -43,7 +60,10 @@ fn main() {
                 .items(&[&status, &workspace, &open, &start, &reconcile, &stop, &quit])
                 .build()?;
             let tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().expect("bundle icon").clone())
+                .icon(tauri::image::Image::from_bytes(include_bytes!(
+                    "../icons/tray-template.png"
+                ))?)
+                .icon_as_template(true)
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => show_settings(app),
@@ -77,6 +97,7 @@ fn main() {
                 })
                 .build(app)?;
             tray.set_visible(preferences.show_menu_bar_icon)?;
+            let tray_updates = tray.clone();
             app.manage(tray);
             if !preferences.open_settings_at_launch && preferences.onboarding_completed {
                 if let Some(window) = app.get_webview_window("main") {
@@ -90,7 +111,11 @@ fn main() {
             }
 
             std::thread::spawn(move || loop {
-                if let Ok(data) = ipc::query(ipc::QueryKind::Status) {
+                let status_data = ipc::query(ipc::QueryKind::Status);
+                let show = preferences::read().is_ok_and(|prefs| prefs.show_menu_bar_icon)
+                    && !status_data.as_ref().is_ok_and(daemon_shows_menu_bar);
+                let _ = tray_updates.set_visible(show);
+                if let Ok(data) = status_data {
                     let _ = status.set_text("Tylora — Running");
                     let label = data
                         .get("active_workspaces")
@@ -105,13 +130,16 @@ fn main() {
                     let _ = status.set_text("Tylora — Stopped");
                     let _ = workspace.set_text("Workspace —");
                 }
-                std::thread::sleep(std::time::Duration::from_secs(10));
+                std::thread::sleep(std::time::Duration::from_secs(2));
             });
             Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if preferences::read().is_ok_and(|prefs| prefs.show_menu_bar_icon) {
+                // Hidden only while its own menu bar icon can bring it back;
+                // otherwise closing quits the app (the daemon keeps running
+                // and its menu bar item reopens the app).
+                if app_tray_wanted() {
                     api.prevent_close();
                     let _ = window.hide();
                 } else {
@@ -137,6 +165,13 @@ fn main() {
             updater::install_update,
             updater::open_release_notes
         ])
-        .run(tauri::generate_context!())
-        .expect("Tylora settings failed to start");
+        .build(tauri::generate_context!())
+        .expect("Tylora settings failed to start")
+        .run(|app, event| {
+            // Reopening the running app (Dock, Finder, or the daemon's
+            // "Open Tylora…") shows the window again.
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_settings(app);
+            }
+        });
 }

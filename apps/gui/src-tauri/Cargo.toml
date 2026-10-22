@@ -10,7 +10,7 @@ build = "build.rs"
 tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
-tauri = { version = "=2.11.6", features = ["tray-icon"] }
+tauri = { version = "=2.11.6", features = ["tray-icon", "image-png"] }
 tauri-runtime = "=2.11.3"
 tauri-runtime-wry = "=2.11.4"
 tauri-macros = "=2.6.3"

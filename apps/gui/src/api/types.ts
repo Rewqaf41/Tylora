@@ -93,6 +93,8 @@ export interface Config {
   version: number
   gaps: { inner: number; outer: number }
   zoom: { respect_outer_gaps: boolean }
+  /** Absent on daemons before 0.1.3. */
+  menu_bar?: MenuBarConfig
   window_movement: { focus_after_move: boolean; wrap_around: boolean; preserve_floating_position: boolean }
   default_layout: LayoutKind
   dwindle: DwindleSettings
@@ -134,6 +136,7 @@ export interface ConfigSnapshot { version: 1; revision: string; config: Config }
 export type ConfigPatch =
   | { kind: 'set_gaps'; inner: number; outer: number }
   | { kind: 'set_zoom'; respect_outer_gaps: boolean }
+  | { kind: 'set_menu_bar'; menu_bar: MenuBarConfig }
   | { kind: 'set_window_movement'; settings: Config['window_movement'] }
   | { kind: 'set_workspace'; id: number; name: string; display: number | null; native_space_id: number | null; native_space_ids?: number[] }
   | { kind: 'set_hotkey'; index: number | null; chord: string; command: AnyStateCommand; enabled: boolean }
@@ -227,3 +230,6 @@ export interface QueryMap {
   animations: AnimationsStatus
 }
 export type QueryKind = keyof QueryMap
+
+/** `[menu_bar]`: the daemon's own menu bar icon. */
+export interface MenuBarConfig { enabled: boolean; show_workspaces: boolean }

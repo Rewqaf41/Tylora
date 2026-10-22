@@ -1,6 +1,6 @@
 # Tylora: technical guide
 
-An experimental Rust tiling window manager for macOS. A background daemon tiles ordinary windows on every display with three layouts (BSP, Dwindle and Scrolling), global hotkeys and modifier mouse drag; workspaces bind to native macOS Spaces; application rules, scratchpads and Accessibility-driven animations are built in. The Tylora app (Tauri + React) is the settings window and menu bar icon; it edits the daemon's TOML configuration over a local socket.
+An experimental Rust tiling window manager for macOS. A background daemon tiles ordinary windows on every display with three layouts (BSP, Dwindle and Scrolling), global hotkeys and modifier mouse drag; workspaces bind to native macOS Spaces; application rules, scratchpads and Accessibility-driven animations are built in. The Tylora app (Tauri + React) is the settings window; the daemon has its own menu bar icon; it edits the daemon's TOML configuration over a local socket.
 
 Tylora is experimental software. Native Space discovery, switching and window moves use **private** macOS interfaces (SkyLight) that Apple does not document and may change in any macOS update; Tylora checks them at runtime and fails closed, but behaviour on macOS releases other than the tested one is unknown. It never disables SIP, injects code into the Dock or WindowServer, or needs administrator rights.
 
@@ -32,6 +32,13 @@ macOS ties Accessibility to the app's code signature. After installing a build w
 
 - The daemon (`Tylora.app/Contents/MacOS/tylora serve`) runs on its own. Closing the window or choosing **Quit App** in the menu bar never stops it; **Stop Tylora** (menu bar or Dashboard) does, after restoring windows Tylora hid or parked.
 - Starting attaches to a running daemon instead of starting a second one; the socket is bound exclusively.
+- While the daemon runs it shows its own monochrome menu bar icon (no Dock icon). It can list the bound workspaces next to the icon (❶ active, plain digits hold windows, faint digits are empty; occupancy is read from WindowServer every two seconds) or show the icon alone: **Show Workspace Numbers** in its menu or General → Menu bar. The menu switches workspaces and offers **Open Tylora…**, **Reconcile Windows** and **Stop Tylora**. The app hides its own menu bar icon meanwhile, and closing the app window then quits the app. Settings live in the daemon configuration:
+
+  ```toml
+  [menu_bar]
+  enabled = true
+  show_workspaces = true
+  ```
 - **Restart daemon** stops the running daemon, waits until it has released its socket, and starts the bundled one. The Dashboard warns when the running daemon's version differs from the app's (for example after an update).
 - **Open Tylora at login** registers the app as a macOS login item (`SMAppService`, System Settings → General → Login Items) and removes it when switched off. Login LaunchAgents written by earlier builds (`com.tylora.settings`, `com.fluxwm.settings`) are converted on first launch and removed. No privileged helper is installed.
 
@@ -147,7 +154,7 @@ Space discovery and CGWindowID membership use runtime-resolved private SkyLight 
 
 The previous FluxWM build may have left a recovery journal for windows it minimized. Tylora copies that journal on first recovery access and retains the original; `tylora recover-windows` still matches windows conservatively. Restore unmatched windows manually from Dock. Legacy active workspace state from `~/.local/state/fluxwm/workspaces.json` is imported, but is not an authority for native Space IDs and must not be interpreted as a Desktop mapping.
 
-Core Graphics display callbacks trigger a debounced AppKit work-area refresh, with a 30-second safety refresh after missed events or sleep. On display disconnect, the old layout is suspended and managed windows are requested to move into the remaining work area. Apps may refuse AX geometry; macOS relocation is then the fallback. Automatic restoration to the original display is not implemented. `display list` includes a public ColorSync UUID, full bounds, work area, scale and primary flag.
+Core Graphics display callbacks trigger a debounced AppKit work-area refresh, with a 30-second safety refresh after missed events or sleep. On display disconnect, the old layout is suspended and managed windows are requested to move into the remaining work area. Apps may refuse AX geometry; macOS relocation is then the fallback. With the default `disconnect_policy = "move_to_primary"` the daemon remembers which windows left the display (by its UUID); two seconds after the same display reconnects it moves those still open and not already back to that display's active Space with the verified native mover, without focusing them. Windows closed meanwhile are skipped. `display list` includes a public ColorSync UUID, full bounds, work area, scale and primary flag.
 
 `disconnect_policy = "recreate_desktops"` (default `"move_to_primary"`, the macOS behavior) keeps an external display's Desktops off the remaining display. The daemon remembers each connected external display's Desktops by UUID (from WindowServer, which drops a display at once). Two seconds after that display disconnects, it moves the windows from the Desktops macOS appended to the remaining display: a workspace's windows go to the same workspace's Space there, parked scratchpads go to that display's parking Desktop, and other windows follow their application rule (bundle ID rules without a title) or land on the active Desktop. It then removes those Desktops through Mission Control. When the same display returns, it recreates as many Desktops, rebinds the workspaces and the parking Desktop to them by position, and returns the windows that still sit where they were moved. The built-in display is never handled this way, so clamshell mode keeps the Mac's Desktops. State is kept in `~/.local/state/tylora/display-desktops.json`; a failed attempt is retried after the display next changes.
 
@@ -253,6 +260,7 @@ mode = "floating"
 - **Moves** use the native Space bound to the workspace (`native_space_id`/`native_space_ids`) and the existing verified mover; Tylora updates its state only after WindowServer confirms the move. Nothing is minimized, placed off screen or chosen by Desktop order.
 - **When rules run**: `on_create` for windows opened while the daemon runs (windows open at startup are excluded), `on_first_seen` also for those, `on_title_change` again when the title changes, `manual` only through `rules apply`. A configuration reload never re-applies rules to open windows. A rule with a title condition waits briefly (a few observations, at most two seconds) for the title.
 - **Manual override**: once a rule moved a window, any later move to another Space (by you, a hotkey or Mission Control) marks an override and rules leave the window alone until it closes or you apply the rule again. Each window gets at most two automatic attempts.
+- The Tylora settings window itself is always floating (a built-in rule for `com.tylora.settings`, not part of your configuration) and opens centred.
 - Dialogs, sheets and other non-standard windows are never tiled or moved. Legacy `[[window_rules]]` keep working as mode-only rules applied on first sight.
 
 ```sh

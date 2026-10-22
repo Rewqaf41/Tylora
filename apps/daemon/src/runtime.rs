@@ -40,6 +40,7 @@ use tylora_macos::{
     DisplayEvents, HotkeyEvent, HotkeyManager, ManagedAdapter, ManagedCommand, ManagedEvent,
     MouseButton, MouseInput, MousePhase, MouseTarget, WorkArea, VISIBILITY_ROLLBACK_FAILED,
 };
+use tylora_macos::{pump_events, MenuAction, StatusItem, StatusSnapshot, StatusWorkspace};
 
 extern "C" {
     fn geteuid() -> u32;
@@ -873,6 +874,11 @@ struct DisplayState {
     applied_default_layout: Option<LayoutKind>,
     /// Native Space ID -> configured workspace bound to it.
     space_bindings: HashMap<u64, u8>,
+    /// Windows macOS moved off a display that disconnected, by that display's
+    /// UUID: (pid, CGWindowID). Returned when the same display reconnects.
+    display_returns: HashMap<u128, Vec<(i32, u32)>>,
+    /// Returns waiting for a reconnected display to settle.
+    pending_returns: Vec<PendingReturn>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1166,9 +1172,13 @@ struct RuleOperation {
     response: Option<SyncSender<String>>,
 }
 
-/// Rules from both `[[rules]]` and legacy `[[window_rules]]`.
+/// Bundle identifier of the Tylora settings app.
+const SETTINGS_APP_ID: &str = "com.tylora.settings";
+
+/// Rules from both `[[rules]]` and legacy `[[window_rules]]`, plus the
+/// built-in one that keeps the Tylora window floating (it centres itself).
 fn compile_rule_engine(config: &Config) -> Result<RuleEngine, String> {
-    let legacy: Vec<_> = config
+    let mut legacy: Vec<_> = config
         .window_rules
         .iter()
         .map(|rule| {
@@ -1183,6 +1193,7 @@ fn compile_rule_engine(config: &Config) -> Result<RuleEngine, String> {
             )
         })
         .collect();
+    legacy.push((SETTINGS_APP_ID.into(), RuleMode::Floating, i32::MAX, true));
     RuleEngine::compile(&config.rules, &legacy)
 }
 
@@ -3579,6 +3590,8 @@ impl DisplayState {
             applied_layouts: HashMap::new(),
             applied_default_layout: None,
             space_bindings: HashMap::new(),
+            display_returns: HashMap::new(),
+            pending_returns: Vec::new(),
         };
         let _ = state.update_areas(areas, config);
         state.sync_layout_config(config);
@@ -3603,7 +3616,34 @@ impl DisplayState {
             .or_else(|| areas.first())
             .copied();
         let mut rehome = Vec::new();
+        let remember_returns =
+            config.disconnect_policy == tylora_config::DisconnectPolicy::MoveToPrimary;
         for lost in self.active.difference(&next) {
+            // `recreate_desktops` returns windows through their Desktops.
+            if let (true, Some(uuid), Some(coordinator)) = (
+                remember_returns,
+                self.areas.get(lost).and_then(|area| area.stable_uuid),
+                self.coordinators.get(lost),
+            ) {
+                let windows: Vec<(i32, u32)> = coordinator
+                    .registry
+                    .iter()
+                    .filter(|(_, record)| {
+                        record.observed.mode != tylora_core::registry::ManagementMode::Unmanaged
+                    })
+                    .filter_map(|(id, record)| {
+                        record.observed.cg_window_id.map(|cg| (id.process.pid, cg))
+                    })
+                    .collect();
+                if !windows.is_empty() {
+                    info!(
+                        display = lost.0,
+                        windows = windows.len(),
+                        "windows remembered for the display's return"
+                    );
+                    self.display_returns.insert(uuid, windows);
+                }
+            }
             warn!(
                 display = lost.0,
                 "display disconnected; tiling suspended and reconciliation requested"
@@ -3632,6 +3672,23 @@ impl DisplayState {
                         rehome.push((*id, target));
                     }
                 }
+            }
+        }
+        for area in &areas {
+            if self.active.contains(&area.display) {
+                continue;
+            }
+            if let Some(windows) = area
+                .stable_uuid
+                .and_then(|uuid| self.display_returns.remove(&uuid))
+            {
+                // Its Spaces and work area settle first; macOS may also move
+                // some windows back by itself.
+                self.pending_returns.push((
+                    Instant::now() + Duration::from_secs(2),
+                    area.display,
+                    windows,
+                ));
             }
         }
         for area in areas {
@@ -4636,15 +4693,33 @@ pub fn serve(requested_display: Option<u32>) -> ExitCode {
         .map(|a| a.display)
         .unwrap_or(area.display);
     let (area_tx, area_rx) = mpsc::sync_channel(8);
+    // Menu bar item: the coordinator sends what to show, the main thread owns
+    // the item and forwards menu choices other than opening the app.
+    let (status_tx, status_rx) = mpsc::sync_channel::<StatusSnapshot>(1);
+    let (command_tx, command_rx) = mpsc::sync_channel::<MenuAction>(8);
+    let (menu_tx, menu_rx) = mpsc::sync_channel::<MenuAction>(8);
     let worker = thread::Builder::new()
         .name("tylora-coordinator".into())
-        .spawn(move || run_coordinator(areas, primary, listener, area_rx, config));
+        .spawn(move || {
+            run_coordinator(
+                areas,
+                primary,
+                listener,
+                area_rx,
+                config,
+                MenuBarLink {
+                    snapshots: status_tx,
+                    actions: command_rx,
+                },
+            )
+        });
     let Ok(worker) = worker else {
         error!("cannot spawn coordinator");
         let _ = fs::remove_file(socket_path());
         return ExitCode::FAILURE;
     };
     let display_events = DisplayEvents::start();
+    let mut status_item: Option<StatusItem> = None;
     let mut next_area_check = Instant::now() + Duration::from_secs(30);
     let mut display_change_due: Option<Instant> = None;
     let mut next_motion_check = Instant::now();
@@ -4664,9 +4739,145 @@ pub fn serve(requested_display: Option<u32>) -> ExitCode {
             next_area_check = Instant::now() + Duration::from_secs(30);
             display_change_due = None;
         }
-        thread::sleep(Duration::from_millis(50));
+        while let Ok(snapshot) = status_rx.try_recv() {
+            if !snapshot.enabled {
+                status_item = None;
+            } else {
+                if status_item.is_none() {
+                    status_item = StatusItem::new(menu_tx.clone());
+                }
+                if let Some(item) = &status_item {
+                    item.update(&snapshot);
+                }
+            }
+        }
+        while let Ok(action) = menu_rx.try_recv() {
+            match action {
+                MenuAction::OpenApp => open_settings_app(),
+                other => {
+                    let _ = command_tx.try_send(other);
+                }
+            }
+        }
+        // Waits like the former 50 ms sleep, but dispatches AppKit events:
+        // menu clicks, and screen changes that keep NSScreen current.
+        pump_events(Duration::from_millis(50));
     }
+    drop(status_item);
     worker.join().unwrap_or(ExitCode::FAILURE)
+}
+
+/// Windows to move back to a reconnected display once it has settled:
+/// (when, display, [(pid, CGWindowID)]).
+type PendingReturn = (Instant, DisplayId, Vec<(i32, u32)>);
+
+/// The coordinator's side of the menu bar item owned by the main thread.
+struct MenuBarLink {
+    snapshots: SyncSender<StatusSnapshot>,
+    actions: Receiver<MenuAction>,
+}
+
+/// What the menu bar item shows: bound workspaces in configuration order,
+/// which are active on a display and which hold windows.
+fn menu_bar_snapshot(
+    state: &DisplayState,
+    config: &Config,
+    elsewhere: &HashSet<u64>,
+) -> StatusSnapshot {
+    let mut occupied: HashSet<u64> = state
+        .coordinators
+        .values()
+        .flat_map(|coordinator| coordinator.registry.iter())
+        .filter_map(|(_, record)| record.observed.native_space_id)
+        .collect();
+    occupied.extend(elsewhere);
+    let workspaces = config
+        .workspaces
+        .iter()
+        .filter_map(|workspace| {
+            let ids: Vec<u64> = workspace
+                .space_ids()
+                .into_iter()
+                .filter(|id| state.native_spaces.iter().any(|space| space.id.0 == *id))
+                .collect();
+            if ids.is_empty() {
+                return None;
+            }
+            let active = state
+                .native_spaces
+                .iter()
+                .any(|space| space.active && ids.contains(&space.id.0));
+            let windows = ids.iter().any(|id| occupied.contains(id));
+            Some(StatusWorkspace {
+                id: workspace.id,
+                label: format!("{}  {}", workspace.id, workspace.name),
+                active,
+                occupied: windows,
+            })
+        })
+        .collect();
+    StatusSnapshot {
+        enabled: config.menu_bar.enabled,
+        show_workspaces: config.menu_bar.show_workspaces,
+        headline: format!(
+            "Tylora {} — {} tiled",
+            env!("CARGO_PKG_VERSION"),
+            state.tiled()
+        ),
+        workspaces,
+    }
+}
+
+/// Native Spaces holding ordinary windows, from WindowServer: the registry
+/// only knows windows on active Spaces. Polled every two seconds, and only
+/// while the menu bar shows workspace numbers.
+fn start_space_occupancy(wanted: Arc<AtomicBool>) -> Receiver<HashSet<u64>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let spawned = thread::Builder::new()
+        .name("tylora-occupancy".into())
+        .spawn(move || {
+            use tylora_macos::spaces::{ExperimentalSkyLightBackend, NativeSpaceBackend};
+            let backend = ExperimentalSkyLightBackend::new();
+            loop {
+                if wanted.load(Ordering::Acquire) {
+                    if let Ok(windows) = tylora_macos::discover_all_cg_windows() {
+                        let occupied: HashSet<u64> = windows
+                            .iter()
+                            .filter_map(|window| backend.get_window_spaces(window.id.0).ok())
+                            .flatten()
+                            .map(|space| space.0)
+                            .collect();
+                        if let Err(mpsc::TrySendError::Disconnected(_)) = sender.try_send(occupied)
+                        {
+                            return;
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_secs(2));
+            }
+        });
+    if let Err(error) = spawned {
+        warn!(%error, "workspace occupancy unavailable");
+    }
+    receiver
+}
+
+/// Opens the settings app this daemon belongs to: the enclosing Tylora.app,
+/// else whichever app has the bundle identifier.
+fn open_settings_app() {
+    let bundle = std::env::current_exe().ok().and_then(|exe| {
+        exe.ancestors()
+            .find(|path| path.extension().is_some_and(|ext| ext == "app"))
+            .map(Path::to_path_buf)
+    });
+    let mut command = Command::new("/usr/bin/open");
+    match bundle {
+        Some(app) => command.arg(app),
+        None => command.args(["-b", "com.tylora.settings"]),
+    };
+    if let Err(error) = command.spawn() {
+        warn!(%error, "cannot open Tylora");
+    }
 }
 
 fn run_coordinator(
@@ -4675,6 +4886,7 @@ fn run_coordinator(
     listener: UnixListener,
     area_rx: Receiver<Vec<WorkArea>>,
     mut config: Config,
+    menu_bar: MenuBarLink,
 ) -> ExitCode {
     let (ipc_tx, ipc_rx) = mpsc::sync_channel(64);
     let ipc_stopping = Arc::new(AtomicBool::new(false));
@@ -4772,7 +4984,77 @@ fn run_coordinator(
     // While Settings records a shortcut, global hotkeys are released so the
     // pressed combination reaches it; resumes on its own after a while.
     let mut hotkeys_paused_until: Option<Instant> = None;
+    // Idle pacing: the loop polls every 10 ms while anything happened in the
+    // last half second, then waits up to 50 ms. Either wait blocks on the
+    // input channel, so a hotkey or mouse event ends it at once.
+    let mut last_activity = Instant::now();
+    let mut early_input: Option<HotkeyEvent> = None;
+    let mut menu_shown: Option<StatusSnapshot> = None;
+    let mut next_menu_refresh = Instant::now();
+    let occupancy_wanted = Arc::new(AtomicBool::new(false));
+    let occupancy = start_space_occupancy(occupancy_wanted.clone());
+    let mut occupied_elsewhere: HashSet<u64> = HashSet::new();
     while !stopping {
+        while let Ok(action) = menu_bar.actions.try_recv() {
+            last_activity = Instant::now();
+            match action {
+                MenuAction::FocusWorkspace(id) => {
+                    early_input = Some(HotkeyEvent::Command {
+                        command: StateCommand::FocusWorkspace { id },
+                        pressed_at: Instant::now(),
+                    })
+                }
+                MenuAction::Reconcile => {
+                    early_input = Some(HotkeyEvent::Command {
+                        command: StateCommand::ReconcileWindows,
+                        pressed_at: Instant::now(),
+                    })
+                }
+                MenuAction::ToggleWorkspaces => {
+                    let menu = tylora_config::MenuBar {
+                        show_workspaces: !config.menu_bar.show_workspaces,
+                        ..config.menu_bar
+                    };
+                    let result = crate::config_manager::read(&config_path()).and_then(|snapshot| {
+                        crate::config_manager::patch(
+                            &config_path(),
+                            crate::config_manager::PatchRequest {
+                                version: 1,
+                                revision: snapshot.revision,
+                                patch: tylora_config::mutation::ConfigPatch::SetMenuBar {
+                                    menu_bar: menu,
+                                },
+                            },
+                        )
+                    });
+                    match result {
+                        Ok(snapshot) => config.menu_bar = snapshot.config.menu_bar,
+                        Err(error) => warn!(%error, "menu bar setting not saved"),
+                    }
+                }
+                MenuAction::Stop => {
+                    info!("stop requested from the menu bar");
+                    stopping = true;
+                }
+                MenuAction::OpenApp => {}
+            }
+        }
+        if Instant::now() >= next_menu_refresh {
+            next_menu_refresh = Instant::now() + Duration::from_millis(200);
+            occupancy_wanted.store(
+                config.menu_bar.enabled && config.menu_bar.show_workspaces,
+                Ordering::Release,
+            );
+            while let Ok(spaces) = occupancy.try_recv() {
+                occupied_elsewhere = spaces;
+            }
+            let snapshot = menu_bar_snapshot(&state, &config, &occupied_elsewhere);
+            if menu_shown.as_ref() != Some(&snapshot)
+                && menu_bar.snapshots.try_send(snapshot.clone()).is_ok()
+            {
+                menu_shown = Some(snapshot);
+            }
+        }
         let scratchpads_assigned = state
             .scratchpads
             .entries
@@ -4843,6 +5125,7 @@ fn run_coordinator(
             let Ok(event) = native_move_rx.try_recv() else {
                 break;
             };
+            last_activity = Instant::now();
             match event {
                 NativeMoveEvent::DisplayMoved {
                     prepared,
@@ -5475,9 +5758,11 @@ fn run_coordinator(
             let _ = adapter.commands.try_send(ManagedCommand::Reconcile);
         }
         while let Ok(updated) = config_watcher.updates.try_recv() {
+            last_activity = Instant::now();
             pending_config = Some(updated);
         }
         while let Ok(spaces) = space_observer.changes.try_recv() {
+            last_activity = Instant::now();
             if let Ok(orders) =
                 tylora_macos::spaces::ExperimentalSkyLightBackend::new().display_order()
             {
@@ -5696,7 +5981,11 @@ fn run_coordinator(
             bindings_dirty = false;
         }
         for _ in 0..64 {
-            match adapter.events.try_recv() {
+            match adapter
+                .events
+                .try_recv()
+                .inspect(|_| last_activity = Instant::now())
+            {
                 Ok(ManagedEvent::Reconciled { process, windows }) => {
                     // Focus is tracked for every layout: Dwindle/Scrolling use
                     // it, and so does choosing between a workspace's Spaces.
@@ -5928,34 +6217,7 @@ fn run_coordinator(
                                     pointer_focus_pause_until =
                                         Some(Instant::now() + Duration::from_secs(5));
                                     state.in_flight_display.insert(prepared.id);
-                                    let sender = native_move_tx.clone();
-                                    thread::spawn(move || {
-                                        let mut prepared = prepared;
-                                        if let Some((desktop, missing)) = prepared.create {
-                                            match create_target_desktop(
-                                                prepared.target_display,
-                                                desktop,
-                                                missing,
-                                            ) {
-                                                Ok(space) => prepared.target_space = space,
-                                                Err(error) => {
-                                                    // Fall back to the active Space chosen at prepare time.
-                                                    warn!(%error, "cannot create Desktop; moving to the active Space");
-                                                    prepared.create = None;
-                                                    prepared.bind_workspace = None;
-                                                }
-                                            }
-                                        }
-                                        let result = tylora_macos::spaces::NativeWindowSpaceMover::move_window_to_space(
-                                            prepared.cg_window_id,
-                                            tylora_macos::spaces::NativeSpaceId(prepared.target_space),
-                                        );
-                                        let _ = sender.send(NativeMoveEvent::DisplayMoved {
-                                            prepared,
-                                            response,
-                                            result,
-                                        });
-                                    });
+                                    spawn_display_move(prepared, native_move_tx.clone(), response);
                                 }
                                 Err(result) => {
                                     if let Some(response) = response {
@@ -6320,7 +6582,12 @@ fn run_coordinator(
             }
         }
         for _ in 0..32 {
-            match input.events.try_recv() {
+            match early_input
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| input.events.try_recv())
+                .inspect(|_| last_activity = Instant::now())
+            {
                 Ok(HotkeyEvent::Command {
                     command,
                     pressed_at,
@@ -6692,6 +6959,7 @@ fn run_coordinator(
             }
         }
         while let Ok(updated) = area_rx.try_recv() {
+            last_activity = Instant::now();
             let previous_display_count = state.active.len();
             let displays_changed = updated.len() != state.active.len()
                 || updated.iter().any(|area| {
@@ -6721,6 +6989,53 @@ fn run_coordinator(
             }
             bindings_dirty |= previous_display_count != state.active.len();
             let _ = adapter.commands.try_send(ManagedCommand::Reconcile);
+        }
+        let now = Instant::now();
+        let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut state.pending_returns)
+            .into_iter()
+            .partition(|(when, _, _)| *when <= now);
+        state.pending_returns = waiting;
+        for (_, display, windows) in due {
+            if !state.active.contains(&display) {
+                continue;
+            }
+            let mut returned = 0;
+            for (pid, cg) in windows {
+                // Still open, not already back, and not moving right now.
+                let Some((id, current)) = state.coordinators.iter().find_map(|(on, c)| {
+                    c.registry.iter().find_map(|(id, record)| {
+                        (id.process.pid == pid && record.observed.cg_window_id == Some(cg))
+                            .then_some((*id, *on))
+                    })
+                }) else {
+                    continue;
+                };
+                if current == display || state.in_flight_display.contains(&id) {
+                    continue;
+                }
+                let command = StateCommand::MoveWindowToDisplay {
+                    window: Some(id),
+                    display,
+                };
+                match prepare_display_move(&state, &config, &command, Some(id)) {
+                    Ok(mut prepared) => {
+                        prepared.focus_after_move = false;
+                        prepared.create = None;
+                        prepared.bind_workspace = None;
+                        state.in_flight_display.insert(prepared.id);
+                        spawn_display_move(prepared, native_move_tx.clone(), None);
+                        returned += 1;
+                    }
+                    Err(result) => {
+                        debug!(pid, cg, message = %result.message, "window not returned to its display")
+                    }
+                }
+            }
+            let display_id = display.0;
+            info!(
+                display_id,
+                returned, "windows returned to the reconnected display"
+            );
         }
         if stopping {
             break;
@@ -6831,6 +7146,7 @@ fn run_coordinator(
             let Ok(request) = ipc_rx.try_recv() else {
                 break;
             };
+            last_activity = Instant::now();
             let scratchpad_io = ScratchpadIo {
                 adapter: &adapter,
                 native: &native_move_tx,
@@ -7181,6 +7497,17 @@ fn run_coordinator(
                 entries.sort_by_key(|(display, _, workspace)| (display.0, workspace.id));
                 let workspaces: Vec<_> = entries.into_iter().map(|(display, engine, ws)| serde_json::json!({"id":ws.id,"name":ws.name,"display":display,"active":engine.active(display)==Some(ws.id),"windows":ws.windows.len()})).collect();
                 serde_json::to_string(&serde_json::json!({"version":1,"visibility_backend":"ax_minimized","workspaces":workspaces})).unwrap_or_default()
+            } else if request.command == "status --json" {
+                let mut value: serde_json::Value = serde_json::from_str(&handle_request(
+                    &request.command,
+                    &state,
+                    &adapter,
+                    &mut stopping,
+                ))
+                .unwrap_or_default();
+                // The app hides its own menu bar icon while this one shows.
+                value["menu_bar"] = serde_json::json!(config.menu_bar);
+                value.to_string()
             } else if request.command == "diagnostics --json" {
                 let mut value: serde_json::Value = serde_json::from_str(&handle_request(
                     &request.command,
@@ -7212,7 +7539,16 @@ fn run_coordinator(
             };
             let _ = request.response.try_send(reply);
         }
-        thread::sleep(Duration::from_millis(10));
+        let wait = if last_activity.elapsed() < Duration::from_millis(500) {
+            Duration::from_millis(10)
+        } else {
+            Duration::from_millis(50)
+        };
+        match input.events.recv_timeout(wait) {
+            Ok(event) => early_input = Some(event),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => thread::sleep(wait),
+        }
     }
     input.stop();
     suppress_pointer_focus(false);
@@ -7928,6 +8264,38 @@ fn floating_destination(
     tylora_core::Rect::new(x, y, width, height).expect("finite work areas")
 }
 
+/// Runs a prepared display move on its own thread (creating the target
+/// Desktop first when asked) and reports `NativeMoveEvent::DisplayMoved`.
+fn spawn_display_move(
+    prepared: PreparedDisplayMove,
+    sender: SyncSender<NativeMoveEvent>,
+    response: Option<SyncSender<String>>,
+) {
+    thread::spawn(move || {
+        let mut prepared = prepared;
+        if let Some((desktop, missing)) = prepared.create {
+            match create_target_desktop(prepared.target_display, desktop, missing) {
+                Ok(space) => prepared.target_space = space,
+                Err(error) => {
+                    // Fall back to the active Space chosen at prepare time.
+                    warn!(%error, "cannot create Desktop; moving to the active Space");
+                    prepared.create = None;
+                    prepared.bind_workspace = None;
+                }
+            }
+        }
+        let result = tylora_macos::spaces::NativeWindowSpaceMover::move_window_to_space(
+            prepared.cg_window_id,
+            tylora_macos::spaces::NativeSpaceId(prepared.target_space),
+        );
+        let _ = sender.send(NativeMoveEvent::DisplayMoved {
+            prepared,
+            response,
+            result,
+        });
+    });
+}
+
 fn prepare_display_move(
     state: &DisplayState,
     config: &Config,
@@ -8628,6 +8996,24 @@ mod tests {
         }
     }
     #[test]
+    fn tylora_window_always_floats() {
+        let config = Config::default();
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        let mut window = snapshot(1, 1);
+        window.application_id = Some(SETTINGS_APP_ID.into());
+        state.handle_reconciled(window.id.process, vec![window.clone()]);
+        assert_eq!(state.coordinators[&DisplayId(1)].layout.len(), 0);
+        assert_eq!(
+            state.coordinators[&DisplayId(1)]
+                .registry
+                .get(window.id)
+                .unwrap()
+                .observed
+                .mode,
+            tylora_core::registry::ManagementMode::Floating
+        );
+    }
+    #[test]
     fn window_rule_applies_to_new_window_and_survives_reconciliation() {
         let mut config = Config::default();
         config.window_rules.push(tylora_config::WindowRule {
@@ -8784,6 +9170,84 @@ mod tests {
         state.update_areas(vec![area(1, 1000.0), area(2, 1200.0)], &config);
         assert_eq!(state.coordinators[&DisplayId(2)].work_area.width, 1200.0);
         assert_eq!(state.plan().len(), 1);
+    }
+    #[test]
+    fn disconnected_display_windows_are_scheduled_back_on_reconnect() {
+        let config = Config::default();
+        let mut state = DisplayState::new(
+            vec![area(1, 1000.0), area(2, 1000.0)],
+            DisplayId(1),
+            &config,
+        );
+        let mut window = snapshot(1, 2);
+        window.cg_window_id = Some(55);
+        state.handle_reconciled(window.id.process, vec![window]);
+        state.update_areas(vec![area(1, 1000.0)], &config);
+        assert_eq!(state.display_returns.get(&2), Some(&vec![(100, 55)]));
+        assert!(state.pending_returns.is_empty());
+        state.update_areas(vec![area(1, 1000.0), area(2, 1000.0)], &config);
+        assert!(state.display_returns.is_empty());
+        assert_eq!(state.pending_returns.len(), 1);
+        assert_eq!(state.pending_returns[0].1, DisplayId(2));
+        assert_eq!(state.pending_returns[0].2, vec![(100, 55)]);
+    }
+    #[test]
+    fn recreate_desktops_policy_does_not_schedule_returns() {
+        let config = Config {
+            disconnect_policy: tylora_config::DisconnectPolicy::RecreateDesktops,
+            ..Config::default()
+        };
+        let mut state = DisplayState::new(
+            vec![area(1, 1000.0), area(2, 1000.0)],
+            DisplayId(1),
+            &config,
+        );
+        let mut window = snapshot(1, 2);
+        window.cg_window_id = Some(55);
+        state.handle_reconciled(window.id.process, vec![window]);
+        state.update_areas(vec![area(1, 1000.0)], &config);
+        assert!(state.display_returns.is_empty());
+    }
+    #[test]
+    fn menu_bar_lists_bound_workspaces_with_active_and_occupied() {
+        use tylora_macos::spaces::{DesktopNumber, NativeSpaceId};
+        let mut config = Config::default();
+        config.workspaces.truncate(3);
+        config.workspaces[0].native_space_id = Some(7);
+        config.workspaces[1].native_space_id = Some(8);
+        config.workspaces[2].native_space_id = Some(999); // deleted Space
+        let mut state = DisplayState::new(vec![area(1, 1000.0)], DisplayId(1), &config);
+        state.native_spaces = vec![
+            NativeSpace {
+                id: NativeSpaceId(7),
+                desktop: DesktopNumber(1),
+                display: DisplayId(1),
+                active: true,
+            },
+            NativeSpace {
+                id: NativeSpaceId(8),
+                desktop: DesktopNumber(2),
+                display: DisplayId(1),
+                active: false,
+            },
+        ];
+        let mut window = snapshot(1, 1);
+        window.native_space_id = Some(8);
+        state.handle_reconciled(window.id.process, vec![window]);
+        let menu = menu_bar_snapshot(&state, &config, &HashSet::from([8]));
+        assert!(menu.enabled && menu.show_workspaces);
+        let flags: Vec<_> = menu
+            .workspaces
+            .iter()
+            .map(|ws| (ws.id, ws.active, ws.occupied))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                (config.workspaces[0].id, true, false),
+                (config.workspaces[1].id, false, true)
+            ]
+        );
     }
     #[test]
     fn verified_display_move_reflows_source_and_reacquires_target_without_ghost() {

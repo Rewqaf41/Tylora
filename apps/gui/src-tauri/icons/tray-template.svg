@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="54 98 396 396">
+  <!-- Monochrome menu bar (template) version of icon.svg's "T"; macOS tints it. -->
+  <path fill="#000" d="M110 115H248Q256 115 256 123V261L105.2 206.7Q92 202 92 188V133Q92 115 110 115Z"/>
+  <path fill="#000" d="M274 115H394Q412 115 412 133V183Q412 197 399.5 203.3L266 270V123Q266 115 274 115Z"/>
+  <path fill="#000" d="M173.5 243.7L248.5 270.3Q256 273 256 281V454Q256 462 248.5 459.3L203.6 443.5Q166 430 166 390V249Q166 241 173.5 243.7Z"/>
+</svg>

@@ -19,6 +19,10 @@ pub enum ConfigPatch {
     SetZoom {
         respect_outer_gaps: bool,
     },
+    /// Replaces `[menu_bar]`.
+    SetMenuBar {
+        menu_bar: crate::MenuBar,
+    },
     SetWindowMovement {
         settings: WindowMovement,
     },
@@ -271,6 +275,13 @@ pub fn apply_patch(source: &str, patch: ConfigPatch) -> Result<(String, Config),
             doc["window_movement"]["wrap_around"] = value(settings.wrap_around);
             doc["window_movement"]["preserve_floating_position"] =
                 value(settings.preserve_floating_position);
+        }
+        ConfigPatch::SetMenuBar { menu_bar } => {
+            if !doc.as_table().get("menu_bar").is_some_and(Item::is_table) {
+                doc["menu_bar"] = Item::Table(Table::new());
+            }
+            doc["menu_bar"]["enabled"] = value(menu_bar.enabled);
+            doc["menu_bar"]["show_workspaces"] = value(menu_bar.show_workspaces);
         }
         ConfigPatch::SetZoom { respect_outer_gaps } => {
             if !doc.as_table().get("zoom").is_some_and(Item::is_table) {
@@ -674,6 +685,31 @@ mod tests {
         assert!(edited.contains("# personal comment"));
         assert!(edited.contains("future_key = 42"));
         assert_eq!(config.gaps.inner, 12.0);
+    }
+
+    #[test]
+    fn menu_bar_patch_writes_its_table_and_defaults_stay_on() {
+        assert_eq!(
+            Config::parse("version = 1\n").unwrap().menu_bar,
+            crate::MenuBar {
+                enabled: true,
+                show_workspaces: true
+            }
+        );
+        let (edited, config) = apply_patch(
+            "# keep\nversion = 1\n",
+            ConfigPatch::SetMenuBar {
+                menu_bar: crate::MenuBar {
+                    enabled: true,
+                    show_workspaces: false,
+                },
+            },
+        )
+        .unwrap();
+        assert!(edited.contains("# keep"));
+        assert!(edited.contains("[menu_bar]"));
+        assert!(!config.menu_bar.show_workspaces);
+        assert!(config.menu_bar.enabled);
     }
 
     #[test]

@@ -5,7 +5,7 @@ import { ArrowUpCircle, ExternalLink, RefreshCw, RotateCcw, ShieldCheck, Sparkle
 import { useInstallUpdate, useUpdateCheck } from '../features/Updates'
 import { appInfo, guiPreferences, openReleaseNotes, openSystemPane, requestAccessibility, saveGuiPreferences, type GuiPreferences } from '../api/bridge'
 import { useUI, type Theme } from '../app/store'
-import { useDaemon } from '../api/hooks'
+import { useConfigPatch, useDaemon } from '../api/hooks'
 import { useT, type LanguagePref } from '../i18n'
 import { Badge, Button, Card, ConfirmButton, ErrorState, Loading, Notice, Segmented } from '../shared/ui'
 
@@ -24,6 +24,12 @@ export function General() {
   const info = useQuery({ queryKey: ['app-info'], queryFn: appInfo, refetchInterval: 5000 })
   const path = useQuery({ queryKey: ['config-path'], queryFn: () => invoke<string>('config_location'), staleTime: Infinity })
   const save = useMutation({ mutationFn: saveGuiPreferences, onSuccess: (next) => { client.setQueryData(['gui-prefs'], next); void info.refetch() } })
+  const config = useDaemon('config', daemon.isSuccess)
+  const configPatch = useConfigPatch()
+  const menuBar = config.data?.config.menu_bar
+  const setMenuBar = (key: 'enabled' | 'show_workspaces', checked: boolean) => {
+    if (config.data && menuBar) configPatch.mutate({ revision: config.data.revision, patch: { kind: 'set_menu_bar', menu_bar: { ...menuBar, [key]: checked } } })
+  }
   const updates = useUpdateCheck(Boolean(prefs.data?.check_for_updates))
   const { install, percent } = useInstallUpdate()
   const [openError, setOpenError] = useState('')
@@ -43,6 +49,13 @@ export function General() {
           ['open_settings_at_launch', t('general.openAtLaunch'), t('general.openAtLaunchHint')],
           ['show_menu_bar_icon', t('general.menuBarIcon'), t('general.menuBarIconHint')],
         ] as const).map(([key, title, detail]) => <div className="row row-pad" key={key}><div><span className="row-title">{title}</span><span className="row-sub">{detail}</span></div><input aria-label={title} type="checkbox" checked={prefs.data[key]} disabled={save.isPending} onChange={(event) => update(key, event.target.checked)} /></div>)}
+      </Card>
+      <Card title={t('menuBar.title')} description={t('menuBar.hint')} className="padded">
+        {menuBar ? <>
+          <div className="row row-pad"><div><span className="row-title">{t('menuBar.enabled')}</span><span className="row-sub">{t('menuBar.enabledHint')}</span></div><input aria-label={t('menuBar.enabled')} type="checkbox" checked={menuBar.enabled} disabled={configPatch.isPending} onChange={(event) => setMenuBar('enabled', event.target.checked)} /></div>
+          <div className="row row-pad"><div><span className="row-title">{t('menuBar.workspaces')}</span><span className="row-sub">{t('menuBar.workspacesHint')}</span></div><input aria-label={t('menuBar.workspaces')} type="checkbox" checked={menuBar.show_workspaces} disabled={configPatch.isPending || !menuBar.enabled} onChange={(event) => setMenuBar('show_workspaces', event.target.checked)} /></div>
+          {configPatch.isError && <p className="bad-text">{configPatch.error.message}</p>}
+        </> : <div className="row row-pad"><span className="row-sub">{t('menuBar.needsDaemon')}</span></div>}
       </Card>
       {info.data?.login_item === 'requires_approval' && <Notice tone="warn">{t('general.loginApproval')} <button className="link-button" onClick={() => void openSystemPane('login_items')}>{t('general.openLoginItems')}</button></Notice>}
       {save.isError && <p className="bad-text">{save.error.message}</p>}{save.isSuccess && <p className="good-text">{t('general.saved')}</p>}
