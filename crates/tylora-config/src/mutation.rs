@@ -30,6 +30,19 @@ pub enum ConfigPatch {
     SetWindowMovement {
         settings: WindowMovement,
     },
+    /// Adds a workspace with the smallest free ID, bound to one Space, plus
+    /// Option+ID / Option+Shift+ID hotkeys when ID is a digit and those
+    /// chords are free.
+    CreateWorkspace {
+        name: String,
+        display: Option<u32>,
+        native_space_id: u64,
+    },
+    /// Removes a workspace with its focus/move hotkeys and display
+    /// assignments. Refused while a rule still targets it.
+    RemoveWorkspace {
+        id: u8,
+    },
     SetWorkspace {
         id: u8,
         name: String,
@@ -263,6 +276,39 @@ pub fn revision(source: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// Rules and hotkeys name workspaces; a rename takes them along.
+fn rename_workspace_references(doc: &mut DocumentMut, old: &str, new: &str) {
+    if let Some(rules) = doc
+        .as_table_mut()
+        .get_mut("rules")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        for rule in rules.iter_mut() {
+            if rule.get("workspace").and_then(Item::as_str) == Some(old) {
+                rule["workspace"] = value(new);
+            }
+        }
+    }
+    if let Some(hotkeys) = doc
+        .as_table_mut()
+        .get_mut("hotkeys")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        for hotkey in hotkeys.iter_mut() {
+            let Some(command) = hotkey.get_mut("command").and_then(Item::as_table_like_mut) else {
+                continue;
+            };
+            let named = matches!(
+                command.get("command").and_then(Item::as_str),
+                Some("focus_named_workspace" | "move_window_to_named_workspace")
+            );
+            if named && command.get("name").and_then(Item::as_str) == Some(old) {
+                command.insert("name", value(new));
+            }
+        }
+    }
+}
+
 pub fn apply_patch(source: &str, patch: ConfigPatch) -> Result<(String, Config), ConfigError> {
     let mut doc = DocumentMut::from_str(source)
         .map_err(|error| ConfigError::Invalid(format!("invalid TOML document: {error}")))?;
@@ -336,6 +382,12 @@ pub fn apply_patch(source: &str, patch: ConfigPatch) -> Result<(String, Config),
             let index = workspaces.iter().position(|table| {
                 table.get("id").and_then(Item::as_integer) == Some(i64::from(id))
             });
+            let old_name = index
+                .and_then(|index| workspaces.get(index))
+                .and_then(|table| table.get("name"))
+                .and_then(Item::as_str)
+                .map(str::to_owned);
+            let new_name = name.clone();
             if index.is_none() {
                 workspaces.push(Table::new());
             }
@@ -377,6 +429,171 @@ pub fn apply_patch(source: &str, patch: ConfigPatch) -> Result<(String, Config),
                     table["native_space_ids"] = value(array);
                 }
                 None => {}
+            }
+            if let Some(old) = old_name.filter(|old| *old != new_name) {
+                rename_workspace_references(&mut doc, &old, &new_name);
+            }
+        }
+        ConfigPatch::RemoveWorkspace { id } => {
+            let workspaces = doc
+                .as_table_mut()
+                .get_mut("workspaces")
+                .and_then(Item::as_array_of_tables_mut)
+                .ok_or_else(|| ConfigError::Invalid(format!("workspace {id} is not configured")))?;
+            let index = workspaces
+                .iter()
+                .position(|table| table.get("id").and_then(Item::as_integer) == Some(i64::from(id)))
+                .ok_or_else(|| ConfigError::Invalid(format!("workspace {id} is not configured")))?;
+            let name = workspaces
+                .get(index)
+                .and_then(|table| table.get("name"))
+                .and_then(Item::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let users: Vec<String> = doc
+                .as_table()
+                .get("rules")
+                .and_then(Item::as_array_of_tables)
+                .into_iter()
+                .flat_map(|rules| rules.iter())
+                .filter(|rule| {
+                    rule.get("workspace").and_then(|target| {
+                        target
+                            .as_str()
+                            .map(|text| text == name || text == id.to_string())
+                            .or_else(|| target.as_integer().map(|number| number == i64::from(id)))
+                    }) == Some(true)
+                })
+                .map(|rule| {
+                    rule.get("id")
+                        .and_then(Item::as_str)
+                        .unwrap_or("?")
+                        .to_owned()
+                })
+                .collect();
+            if !users.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "workspace {name:?} is used by rule {}; change or delete the rule first",
+                    users.join(", ")
+                )));
+            }
+            if let Some(workspaces) = doc
+                .as_table_mut()
+                .get_mut("workspaces")
+                .and_then(Item::as_array_of_tables_mut)
+            {
+                workspaces.remove(index);
+            }
+            if let Some(hotkeys) = doc
+                .as_table_mut()
+                .get_mut("hotkeys")
+                .and_then(Item::as_array_of_tables_mut)
+            {
+                hotkeys.retain(|hotkey| {
+                    let Some(command) = hotkey.get("command").and_then(Item::as_table_like) else {
+                        return true;
+                    };
+                    let field = |key: &str| command.get(key);
+                    let by_id =
+                        |key: &str| field(key).and_then(Item::as_integer) == Some(i64::from(id));
+                    let by_name = field("name").and_then(Item::as_str) == Some(name.as_str());
+                    !match field("command").and_then(Item::as_str) {
+                        Some("focus_workspace") => by_id("id"),
+                        Some("move_window_to_workspace") => by_id("workspace"),
+                        Some("focus_named_workspace" | "move_window_to_named_workspace") => by_name,
+                        _ => false,
+                    }
+                });
+            }
+            if let Some(displays) = doc
+                .as_table_mut()
+                .get_mut("displays")
+                .and_then(Item::as_array_of_tables_mut)
+            {
+                displays.retain(|table| {
+                    table.get("workspace").and_then(Item::as_integer) != Some(i64::from(id))
+                });
+            }
+        }
+        ConfigPatch::CreateWorkspace {
+            name,
+            display,
+            native_space_id,
+        } => {
+            let name = name.trim().to_owned();
+            if name.is_empty() {
+                return Err(ConfigError::Invalid("a workspace needs a name".into()));
+            }
+            if !doc
+                .as_table()
+                .get("workspaces")
+                .is_some_and(Item::is_array_of_tables)
+            {
+                doc["workspaces"] = Item::ArrayOfTables(ArrayOfTables::new());
+            }
+            let workspaces = doc["workspaces"]
+                .as_array_of_tables_mut()
+                .expect("array inserted");
+            let taken: Vec<i64> = workspaces
+                .iter()
+                .filter_map(|table| table.get("id").and_then(Item::as_integer))
+                .collect();
+            if workspaces.iter().any(|table| {
+                table
+                    .get("name")
+                    .and_then(Item::as_str)
+                    .is_some_and(|other| other.eq_ignore_ascii_case(&name))
+            }) {
+                return Err(ConfigError::Invalid(format!(
+                    "a workspace named {name:?} already exists"
+                )));
+            }
+            let id = (1..=99)
+                .find(|id| !taken.contains(id))
+                .ok_or_else(|| ConfigError::Invalid("no free workspace ID".into()))?;
+            let mut table = Table::new();
+            table["id"] = value(id);
+            table["name"] = value(name);
+            if let Some(display) = display {
+                table["display"] = value(i64::from(display));
+            }
+            table["native_space_id"] = value(i64::try_from(native_space_id).map_err(|_| {
+                ConfigError::Invalid("native Space ID exceeds TOML integer range".into())
+            })?);
+            workspaces.push(table);
+            if id <= 9 {
+                if !doc
+                    .as_table()
+                    .get("hotkeys")
+                    .is_some_and(Item::is_array_of_tables)
+                {
+                    doc["hotkeys"] = Item::ArrayOfTables(ArrayOfTables::new());
+                }
+                let hotkeys = doc["hotkeys"]
+                    .as_array_of_tables_mut()
+                    .expect("array inserted");
+                for (chord, command, field) in [
+                    (format!("option+{id}"), "focus_workspace", "id"),
+                    (
+                        format!("option+shift+{id}"),
+                        "move_window_to_workspace",
+                        "workspace",
+                    ),
+                ] {
+                    let used = hotkeys
+                        .iter()
+                        .any(|table| table.get("chord").and_then(Item::as_str) == Some(&chord));
+                    if used {
+                        continue;
+                    }
+                    let mut entry = Table::new();
+                    entry["chord"] = value(chord);
+                    let mut target = Table::new();
+                    target["command"] = value(command);
+                    target[field] = value(id);
+                    entry["command"] = Item::Table(target);
+                    hotkeys.push(entry);
+                }
             }
         }
         ConfigPatch::SetHotkey {
@@ -747,6 +964,126 @@ mod tests {
             3000
         );
         assert!(Config::parse("version = 1\n[cheat_sheet]\nhold_ms = 100\n").is_err());
+    }
+
+    #[test]
+    fn create_workspace_takes_free_id_and_adds_its_hotkeys() {
+        let source = "version = 1\n[[workspaces]]\nid = 1\nname = \"Web\"\nnative_space_id = 7\n";
+        let (edited, config) = apply_patch(
+            source,
+            ConfigPatch::CreateWorkspace {
+                name: " Docs ".into(),
+                display: None,
+                native_space_id: 9,
+            },
+        )
+        .unwrap();
+        let docs = config
+            .workspaces
+            .iter()
+            .find(|ws| ws.name == "Docs")
+            .unwrap();
+        assert_eq!((docs.id, docs.native_space_id), (2, Some(9)));
+        assert!(edited.contains("option+2"));
+        assert!(config
+            .hotkeys
+            .iter()
+            .any(|hotkey| hotkey.chord == "option+shift+2"
+                && hotkey.command
+                    == StateCommand::MoveWindowToWorkspace {
+                        window: None,
+                        workspace: 2
+                    }));
+        assert!(apply_patch(
+            &edited,
+            ConfigPatch::CreateWorkspace {
+                name: "docs".into(),
+                display: None,
+                native_space_id: 10,
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn renaming_a_workspace_updates_rules_and_named_hotkeys() {
+        let source = r#"version = 1
+[[workspaces]]
+id = 1
+name = "Browser"
+native_space_id = 7
+
+[[hotkeys]]
+chord = "option+1"
+[hotkeys.command]
+command = "focus_named_workspace"
+name = "Browser"
+
+[[rules]]
+id = "zen"
+bundle_id = "app.zen-browser.zen"
+workspace = "Browser"
+"#;
+        let (edited, config) = apply_patch(
+            source,
+            ConfigPatch::SetWorkspace {
+                id: 1,
+                name: "Web".into(),
+                display: None,
+                native_space_id: Some(7),
+                native_space_ids: None,
+            },
+        )
+        .unwrap();
+        assert!(!edited.contains("Browser"));
+        assert_eq!(config.rules[0].workspace.as_deref(), Some("Web"));
+        assert!(config.hotkeys.iter().any(
+            |hotkey| hotkey.command == StateCommand::FocusNamedWorkspace { name: "Web".into() }
+        ));
+    }
+
+    #[test]
+    fn removing_a_workspace_takes_its_hotkeys_and_respects_rules() {
+        let source = r#"version = 1
+[[workspaces]]
+id = 1
+name = "Web"
+native_space_id = 7
+
+[[workspaces]]
+id = 5
+name = "Desk"
+native_space_id = 9
+
+[[hotkeys]]
+chord = "option+5"
+[hotkeys.command]
+command = "focus_workspace"
+id = 5
+
+[[hotkeys]]
+chord = "option+shift+5"
+[hotkeys.command]
+command = "move_window_to_named_workspace"
+name = "Desk"
+
+[[hotkeys]]
+chord = "option+1"
+[hotkeys.command]
+command = "focus_named_workspace"
+name = "Web"
+
+[[rules]]
+id = "zen"
+bundle_id = "app.zen-browser.zen"
+workspace = "Web"
+"#;
+        let (edited, config) = apply_patch(source, ConfigPatch::RemoveWorkspace { id: 5 }).unwrap();
+        assert!(!edited.contains("Desk") && !edited.contains("option+5"));
+        assert_eq!(config.workspaces.len(), 1);
+        assert!(edited.contains("option+1"));
+        let refused = apply_patch(source, ConfigPatch::RemoveWorkspace { id: 1 }).unwrap_err();
+        assert!(refused.to_string().contains("zen"));
     }
 
     #[test]
