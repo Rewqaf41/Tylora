@@ -158,6 +158,44 @@ Core Graphics display callbacks trigger a debounced AppKit work-area refresh, wi
 
 `disconnect_policy = "recreate_desktops"` (default `"move_to_primary"`, the macOS behavior) keeps an external display's Desktops off the remaining display. The daemon remembers each connected external display's Desktops by UUID (from WindowServer, which drops a display at once). Two seconds after that display disconnects, it moves the windows from the Desktops macOS appended to the remaining display: a workspace's windows go to the same workspace's Space there, parked scratchpads go to that display's parking Desktop, and other windows follow their application rule (bundle ID rules without a title) or land on the active Desktop. It then removes those Desktops through Mission Control. When the same display returns, it recreates as many Desktops, rebinds the workspaces and the parking Desktop to them by position, and returns the windows that still sit where they were moved. The built-in display is never handled this way, so clamshell mode keeps the Mac's Desktops. State is kept in `~/.local/state/tylora/display-desktops.json`; a failed attempt is retried after the display next changes.
 
+## Event stream
+
+`tylora subscribe` keeps a connection to the daemon open and prints one JSON object per line as things change, for status bars (SketchyBar), Hammerspoon, Raycast or your own scripts. It ends when the daemon stops.
+
+```sh
+tylora subscribe                                  # every event
+tylora subscribe --events workspace,focus         # only these
+```
+
+The first lines are `subscribed` (with the event list) and the current state: `daemon`, then per display `display_added`, `workspace` and `layout`, and the focused window. After that each change is one line, within about 50 ms:
+
+| Event | Fields |
+| --- | --- |
+| `workspace` | `display`, `space_id`, `desktop`, `workspace` (`{id, name}` or `null` when the Space is not bound) |
+| `layout` | `display`, `space_id`, `layout` (`bsp`, `dwindle`, `scrolling`) |
+| `focus` | `pid`, `app` (bundle ID), `title`, `cg_window_id`, `display`, `workspace`; `pid: null` when no managed window has focus |
+| `window_opened`, `window_closed` | same fields as `focus` |
+| `display_added`, `display_removed` | `display`, `uuid` (added only) |
+| `daemon` | `state` (`running`, `stopped`), `daemon_version` |
+
+Every line also carries `"version": 1`. `space_id` and `desktop` are `null` while a display shows a fullscreen app. Windows that were open before the daemon started are state, not `window_opened`; a window moving to another Space is not reported as closed. A client that stops reading is disconnected rather than slowing the daemon down; at most 32 clients can subscribe.
+
+Example: switch to the English keyboard layout on the Code workspace with Hammerspoon (`~/.hammerspoon/init.lua`):
+
+```lua
+local tylora = "/Applications/Tylora.app/Contents/MacOS/tylora"
+events = hs.task.new(tylora, nil, function(_, out)
+  for line in out:gmatch("[^\n]+") do
+    local ok, event = pcall(hs.json.decode, line)
+    if ok and event.event == "workspace" and event.workspace and event.workspace.name == "Code" then
+      hs.keycodes.setLayout("ABC")
+    end
+  end
+  return true
+end, { "subscribe", "--events", "workspace" })
+events:start()
+```
+
 ## Layouts
 
 Every native Space keeps its own layout state: the BSP or Dwindle tree with its split ratios, or the Scrolling strip with its column order, widths and viewport. Switching Spaces restores exactly that state, including for Spaces no workspace is bound to.
