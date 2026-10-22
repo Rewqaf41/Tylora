@@ -54,13 +54,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: oven-sh/setup-bun@v2
-      - name: Build Tylora.app and Tylora.dmg
+      - name: Build Tylora.app, Tylora.dmg and the signed update archive
         working-directory: apps/gui
+        env:
+          # minisign key of the in-app updater (not an Apple credential); its
+          # public half is plugins.updater.pubkey in tauri.conf.json.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
           unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
           bun install --frozen-lockfile || bun install
-          bun run desktop:build
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            bun run desktop:build -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
+          else
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set: no in-app update archive; a tag release will fail."
+            bun run desktop:build
+          fi
       - name: Verify bundle
         run: sh apps/gui/scripts/verify-bundle.sh
       - name: Checksums
@@ -74,6 +84,8 @@ jobs:
           path: |
             target/release/bundle/dmg/Tylora_*.dmg
             target/release/bundle/dmg/SHA256SUMS.txt
+            target/release/bundle/macos/Tylora.app.tar.gz
+            target/release/bundle/macos/Tylora.app.tar.gz.sig
           if-no-files-found: error
 
   publish:
@@ -87,11 +99,26 @@ jobs:
         with:
           name: tylora-adhoc-${{ github.sha }}
           path: dist
-      - name: Prepare stable download name and checksums
+      - name: Prepare stable download names, checksums and latest.json
         run: |
-          cp dist/Tylora_*_aarch64.dmg dist/Tylora_aarch64.dmg
+          # upload-artifact keeps paths below the common root (target/release/bundle).
+          find dist -type f | sort
+          cp dist/dmg/Tylora_*_aarch64.dmg dist/
+          cp dist/dmg/Tylora_*_aarch64.dmg dist/Tylora_aarch64.dmg
+          [ -f dist/macos/Tylora.app.tar.gz ] && [ -f dist/macos/Tylora.app.tar.gz.sig ] \
+            || { echo "missing the signed update archive; set TAURI_SIGNING_PRIVATE_KEY"; exit 1; }
+          cp dist/macos/Tylora.app.tar.gz dist/Tylora_aarch64.app.tar.gz
+          cp dist/macos/Tylora.app.tar.gz.sig dist/Tylora_aarch64.app.tar.gz.sig
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/Tylora_aarch64.app.tar.gz"
+          jq -n --arg version "${GITHUB_REF_NAME#v}" \
+            --arg notes "See https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg signature "$(cat dist/Tylora_aarch64.app.tar.gz.sig)" --arg url "$url" \
+            '{version: $version, notes: $notes, pub_date: $date,
+              platforms: {"darwin-aarch64": {signature: $signature, url: $url}}}' > dist/latest.json
+          cat dist/latest.json
           cd dist
-          sha256sum Tylora_*.dmg > SHA256SUMS.txt
+          sha256sum Tylora_*.dmg Tylora_aarch64.app.tar.gz > SHA256SUMS.txt
       - name: Write release notes
         run: |
           cat > release-notes.md <<'EOF'
@@ -107,5 +134,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/Tylora_*.dmg dist/SHA256SUMS.txt \
+            dist/Tylora_aarch64.app.tar.gz dist/Tylora_aarch64.app.tar.gz.sig dist/latest.json \
             --repo "$GITHUB_REPOSITORY" --title "Tylora $GITHUB_REF_NAME" \
             --notes-file release-notes.md

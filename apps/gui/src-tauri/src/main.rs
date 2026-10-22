@@ -1,6 +1,7 @@
 mod ipc;
 mod preferences;
 mod system;
+mod updater;
 
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
@@ -18,6 +19,8 @@ fn show_settings(app: &tauri::AppHandle) {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updater::PendingUpdate::default())
         .setup(|app| {
             if let Err(error) = preferences::migrate_login_agent() {
                 eprintln!("login item migration failed: {}", error.message);
@@ -129,7 +132,10 @@ fn main() {
             preferences::export_diagnostics,
             system::app_info,
             system::request_accessibility,
-            system::open_system_pane
+            system::open_system_pane,
+            updater::check_update,
+            updater::install_update,
+            updater::open_release_notes
         ])
         .run(tauri::generate_context!())
         .expect("Tylora settings failed to start");

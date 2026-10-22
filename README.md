@@ -60,6 +60,8 @@ Each native macOS Space keeps its own layout state, including split ratios or sc
 
 The daemon keeps running when you close the settings window. Use **Stop Tylora** from the menu bar or Dashboard to stop managing windows.
 
+From 0.1.2 on, Tylora checks GitHub Releases for a newer version and shows a banner; **Install and restart** downloads the signed update, restarts the daemon and the app. Turn the check off in General → Updates. If tiling does not start after an update, switch Tylora off and on in Privacy & Security → Accessibility (each unnotarized build has a new signature).
+
 ### Build from source
 
 Install Rust stable, Xcode Command Line Tools, and Bun. On a Mac:

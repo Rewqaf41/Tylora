@@ -6,6 +6,7 @@ import type { LucideIcon } from 'lucide-react'
 import { useDaemon } from '../api/hooks'
 import { guiPreferences } from '../api/bridge'
 import { Onboarding } from '../features/Onboarding'
+import { UpdateBanner } from '../features/Updates'
 import { useLang, useT, type LanguagePref, type MessageKey } from '../i18n'
 import { useUI } from './store'
 import { BrandMark } from '../shared/BrandMark'
@@ -80,6 +81,7 @@ export function App() {
           {menuOpen && <div className="top-menu"><button onClick={() => { void status.refetch(); setMenuOpen(false) }}><RefreshCcw size={14} /> {t('app.refreshStatus')}</button><NavLink to="/diagnostics" onClick={() => setMenuOpen(false)}><Stethoscope size={14} /> {t('nav.diagnostics')}</NavLink></div>}
         </div>
       </header>
+      {prefs.data && <UpdateBanner prefs={prefs.data} />}
       <main className="page"><Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/workspaces" element={<Workspaces />} />

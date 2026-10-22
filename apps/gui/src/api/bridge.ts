@@ -99,7 +99,7 @@ export async function resumeHotkeys(): Promise<unknown> {
 
 export type LoginItemStatus = 'not_registered' | 'enabled' | 'requires_approval' | 'not_found' | 'unavailable'
 export interface AppInfo { version: string; bundled_daemon: string | null; accessibility_trusted: boolean; login_item: LoginItemStatus; daemon_version: string | null; daemon_executable: string | null }
-export interface GuiPreferences { version: 1; launch_at_login: boolean; start_daemon_automatically: boolean; open_settings_at_launch: boolean; show_menu_bar_icon: boolean; onboarding_completed: boolean }
+export interface GuiPreferences { version: 1; launch_at_login: boolean; start_daemon_automatically: boolean; open_settings_at_launch: boolean; show_menu_bar_icon: boolean; onboarding_completed: boolean; check_for_updates: boolean; last_seen_version: string | null }
 
 export async function appInfo(): Promise<AppInfo> {
   try { return await invoke<AppInfo>('app_info') }
@@ -124,5 +124,24 @@ export async function guiPreferences(): Promise<GuiPreferences> {
 
 export async function saveGuiPreferences(prefs: GuiPreferences): Promise<GuiPreferences> {
   try { return await invoke<GuiPreferences>('save_gui_preferences', { prefs }) }
+  catch (error) { throw normalize(error) }
+}
+
+export interface UpdateCheck { current: string; available: { version: string; notes: string | null; date: string | null } | null }
+
+/** Asks GitHub Releases for a newer signed build; nothing is downloaded yet. */
+export async function checkUpdate(): Promise<UpdateCheck> {
+  try { return await invoke<UpdateCheck>('check_update') }
+  catch (error) { throw normalize(error) }
+}
+
+/** Downloads, verifies and installs the update found by the last check, restarts a running daemon and relaunches the app. */
+export async function installUpdate(): Promise<void> {
+  try { await invoke('install_update') }
+  catch (error) { throw normalize(error) }
+}
+
+export async function openReleaseNotes(version?: string): Promise<void> {
+  try { await invoke('open_release_notes', { version: version ?? null }) }
   catch (error) { throw normalize(error) }
 }

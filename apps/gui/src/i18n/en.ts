@@ -730,6 +730,28 @@ export const en = {
   'general.axOpen': 'Open Accessibility',
   'general.appTrust': 'This app (Tylora)',
   'general.versionMismatch': 'The running daemon is version {daemon}, this app is {app}. Restart the daemon to use the bundled one.',
+
+  // Updates
+  'updates.title': 'Updates',
+  'updates.hint': 'Tylora {version}. New releases come from GitHub and are verified with Tylora’s update key before they are installed.',
+  'updates.auto': 'Check for updates automatically',
+  'updates.autoHint': 'When the app opens and every six hours; nothing downloads without your click.',
+  'updates.status': 'Latest version',
+  'updates.checking': 'Checking GitHub…',
+  'updates.never': 'Not checked yet.',
+  'updates.upToDate': 'Tylora {version} is up to date.',
+  'updates.checkNow': 'Check now',
+  'updates.available': 'Tylora {version} is available',
+  'updates.availableHint': 'You have {current}. Installing restarts the app and a running daemon; hidden windows are restored first.',
+  'updates.downloading': 'Downloading… {percent}%',
+  'updates.installing': 'Installing…',
+  'updates.install': 'Install and restart',
+  'updates.notes': 'Release notes',
+  'updates.later': 'Later',
+  'updates.updated': 'Tylora was updated to {version}',
+  'updates.updatedHint': 'If tiling does not start, switch Tylora off and on in Privacy & Security → Accessibility: this build has a new signature.',
+  'updates.whatsNew': 'What’s new',
+  'updates.dismiss': 'Dismiss',
 }
 
 export type Messages = { [K in keyof typeof en]: string }

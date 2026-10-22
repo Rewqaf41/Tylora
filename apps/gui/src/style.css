@@ -331,6 +331,15 @@
   .link-button { background:none; border:0; padding:0; color:var(--accent-fg); font-weight:500; text-decoration:underline; text-underline-offset:2px; }
   @media (max-width:900px) { .onboarding-steps span { display:none; } }
 
+  /* ── Update notices above the page ── */
+  .update-banner { display:flex; align-items:center; gap:10px; margin:14px 28px 0; padding:10px 12px 10px 14px; border:1px solid var(--accent-soft); border-radius:14px; background:var(--accent-soft); color:var(--accent-fg); }
+  .update-banner.done { border-color:var(--good-soft); background:var(--good-soft); color:var(--good); }
+  .update-banner > svg { flex:none; }
+  .update-text { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
+  .update-text strong { color:var(--text); font-weight:600; }
+  .update-text span { color:var(--muted); font-size:12px; }
+  @media (max-width:1024px) { .update-banner { margin:14px 22px 0; } }
+
   /* ── Responsive (board 05): ≤1024 icon rail, metrics 2×2, sections stack ── */
   @media (max-width:1180px) { .two-col { grid-template-columns:minmax(0,1fr) minmax(280px,340px); } }
   @media (max-width:1024px) {

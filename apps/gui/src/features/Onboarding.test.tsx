@@ -19,7 +19,7 @@ vi.mock('../api/hooks', () => ({
     : { isSuccess: false, data: undefined },
 }))
 
-const prefs: GuiPreferences = { version: 1, launch_at_login: false, start_daemon_automatically: false, open_settings_at_launch: true, show_menu_bar_icon: true, onboarding_completed: false }
+const prefs: GuiPreferences = { version: 1, launch_at_login: false, start_daemon_automatically: false, open_settings_at_launch: true, show_menu_bar_icon: true, onboarding_completed: false, check_for_updates: true, last_seen_version: null }
 
 describe('Onboarding', () => {
   let host: HTMLDivElement

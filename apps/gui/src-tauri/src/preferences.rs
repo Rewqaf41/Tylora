@@ -17,6 +17,16 @@ pub struct GuiPreferences {
     /// to done there; a fresh install has no file and starts with it.
     #[serde(default = "onboarded_before")]
     pub onboarding_completed: bool,
+    /// Look for a newer release on GitHub when the app opens.
+    #[serde(default = "check_by_default")]
+    pub check_for_updates: bool,
+    /// App version the user last saw; a different running version means the
+    /// app was updated and the "updated" notice is shown once.
+    #[serde(default)]
+    pub last_seen_version: Option<String>,
+}
+fn check_by_default() -> bool {
+    true
 }
 fn onboarded_before() -> bool {
     true
@@ -30,6 +40,8 @@ impl Default for GuiPreferences {
             open_settings_at_launch: true,
             show_menu_bar_icon: true,
             onboarding_completed: false,
+            check_for_updates: true,
+            last_seen_version: None,
         }
     }
 }

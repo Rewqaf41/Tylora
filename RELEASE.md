@@ -113,12 +113,42 @@ instead.
 
 ## Updates
 
-There is no automatic updater. The Tauri updater stays off until releases
-are signed and an update signing key exists; turning it on later needs
-`tauri-plugin-updater`, a `TAURI_SIGNING_PRIVATE_KEY` secret and a published
-`latest.json`.
+Tylora updates itself from GitHub Releases with the Tauri updater
+(`tauri-plugin-updater`, `apps/gui/src-tauri/src/updater.rs`):
 
-Manual update with the DMG:
+- The app reads `https://github.com/Rewqaf41/Tylora/releases/latest/download/latest.json`
+  when it opens and every six hours (General → Updates; switchable off), and
+  shows a banner when a newer version exists. Nothing downloads before the
+  user clicks **Install and restart**.
+- The archive `Tylora_aarch64.app.tar.gz` is signed with the updater's
+  minisign key. The app installs it only when the signature matches
+  `plugins.updater.pubkey` in `tauri.conf.json`. This key is independent of
+  Apple signing; it does not make the build notarized.
+- Installing replaces the bundle in place, restarts a running daemon from the
+  new bundle (stop restores hidden and parked windows first), and relaunches
+  the app. The next launch shows "Tylora was updated to X" once.
+- An ad-hoc signed update has a new code signature, so macOS may treat it as
+  a new app for Accessibility; the notice tells the user to toggle Tylora off
+  and on in Privacy & Security → Accessibility if tiling does not start.
+- Releases before 0.1.2 have no updater; those installs update once by DMG.
+
+Updater key (one time, already generated for this repository on the
+maintainer's Mac at `~/.tauri/tylora-updater.key`, outside the repository):
+
+```sh
+bunx tauri signer generate -w ~/.tauri/tylora-updater.key   # only for a new key
+gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/tylora-updater.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --body ""   # the key's password
+```
+
+Keep a backup of the private key. Losing it means existing installs can no
+longer verify updates and must reinstall from a DMG; replacing it requires
+changing `pubkey` and shipping that build by DMG. The release workflow builds
+the archive with `--config '{"bundle":{"createUpdaterArtifacts":true}}'`,
+publishes `latest.json`, the archive and its `.sig`, and fails a tag release
+without the key. Local `desktop:build` does not need the key.
+
+Manual update with the DMG (always possible):
 
 1. Choose **Stop Tylora** in the menu bar (windows hidden or parked by Tylora
    are restored), then **Quit App**.
@@ -156,7 +186,10 @@ Compatibility rules for every release:
    first-run setup, Accessibility grant, launch at login on
    and off, update over the previous version, uninstall.
 5. Tag `vX.Y.Z` and push. The workflow publishes an ad-hoc signed,
-   unnotarized release with a direct DMG download.
-6. Install the published DMG on a second Mac. For an unnotarized build, check
+   unnotarized release with a direct DMG download, the signed update archive
+   and `latest.json`.
+6. From the previous release, check that the update banner appears, installs
+   and relaunches, and that the daemon comes back.
+7. Install the published DMG on a second Mac. For an unnotarized build, check
    that the release notes' **Open Anyway** instructions match the actual
    macOS prompt.
