@@ -71,6 +71,9 @@ pub enum HotkeyEvent {
     TapDisabled,
     QueueOverflow,
     Stopped,
+    /// Option alone went down (`true`), or that ended: Option released,
+    /// another modifier joined, or a key or mouse button was pressed.
+    OptionHold(bool),
 }
 
 pub struct HotkeyManager {
@@ -152,6 +155,15 @@ struct Context {
     latest_pointer: PointerSlot,
     follow_mouse: bool,
     pointer_button_down: bool,
+    option_hold: bool,
+}
+
+/// Reports Option-alone transitions; the receiver times the hold.
+fn set_option_hold(state: &mut Context, held: bool) {
+    if state.option_hold != held {
+        state.option_hold = held;
+        let _ = state.sender.try_send(HotkeyEvent::OptionHold(held));
+    }
 }
 
 fn modifier_flag(name: &str) -> u64 {
@@ -267,6 +279,7 @@ extern "C" fn callback(
     // SAFETY: the run-loop thread owns Context and keeps it alive through tap teardown.
     let state = unsafe { &mut *(user as *mut Context) };
     if kind == 0xffff_fffe || kind == 0xffff_ffff {
+        set_option_hold(state, false);
         let _ = state.sender.try_send(HotkeyEvent::TapDisabled);
         state.consumed.clear();
         state.pointer_button_down = false;
@@ -277,6 +290,7 @@ extern "C" fn callback(
         return event;
     }
     if event.is_null() || unsafe { IsSecureEventInputEnabled() } != 0 {
+        set_option_hold(state, false);
         state.consumed.clear();
         state.pointer_button_down = false;
         if let Some(mut drag) = state.drag.take() {
@@ -300,6 +314,7 @@ extern "C" fn callback(
     }
     if matches!(kind, 1 | 2 | 3 | 4 | 6 | 7) {
         if matches!(kind, 1 | 3) {
+            set_option_hold(state, false);
             state.pointer_button_down = true;
             if state.follow_mouse {
                 let _ = state.sender.try_send(HotkeyEvent::PointerButton);
@@ -310,6 +325,9 @@ extern "C" fn callback(
         return mouse_callback(state, kind, event);
     }
     if kind == 12 {
+        // Shift, Control, Option, Command; Caps Lock and Fn do not count.
+        let modifiers = unsafe { CGEventGetFlags(event) } & 0x001e_0000;
+        set_option_hold(state, modifiers == 0x0008_0000);
         if state.drag.is_some() && unsafe { CGEventGetFlags(event) } & state.mouse_modifier == 0 {
             if let Some(mut drag) = state.drag.take() {
                 drag.phase = MousePhase::Cancel;
@@ -329,6 +347,7 @@ extern "C" fn callback(
     if kind != 10 {
         return event;
     }
+    set_option_hold(state, false);
     let mask = 0x001e_0000;
     let modifiers = unsafe { CGEventGetFlags(event) } & mask;
     let Some(binding) = state
@@ -379,6 +398,7 @@ fn run(
         latest_pointer: pointer.slot,
         follow_mouse: pointer.enabled,
         pointer_button_down: false,
+        option_hold: false,
     });
     // kCGSessionEventTap=1, kCGHeadInsertEventTap=0, kCGEventTapOptionDefault=0.
     let mask = (1u64 << 10)
