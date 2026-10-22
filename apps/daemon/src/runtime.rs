@@ -10817,7 +10817,8 @@ mod tests {
         // A rule for an already open window arrives by hot reload.
         let reloaded = rules_config();
         state.apply_live_config(&reloaded);
-        assert_eq!(state.rule_engine.len(), 2);
+        // Two configured rules plus the built-in one for the Tylora window.
+        assert_eq!(state.rule_engine.len(), 3);
         state.handle_reconciled(calculator.id.process, vec![calculator.clone()]);
         assert_eq!(
             state.coordinators[&DisplayId(1)]
