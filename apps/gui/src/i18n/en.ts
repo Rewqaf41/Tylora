@@ -761,6 +761,8 @@ export const en = {
   'menuBar.workspaces': 'Show workspace numbers',
   'menuBar.workspacesHint': 'Bound workspaces next to the icon: ❶ active, plain digits hold windows, faint digits are empty.',
   'menuBar.needsDaemon': 'Start the daemon to change these settings.',
+  'menuBar.cheatSheet': 'Hotkey cheat sheet',
+  'menuBar.cheatSheetHint': 'Hold ⌥ alone for {seconds} s to see every active shortcut; release to close.',
 }
 
 export type Messages = { [K in keyof typeof en]: string }

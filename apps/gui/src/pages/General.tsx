@@ -27,6 +27,7 @@ export function General() {
   const config = useDaemon('config', daemon.isSuccess)
   const configPatch = useConfigPatch()
   const menuBar = config.data?.config.menu_bar
+  const sheet = config.data?.config.cheat_sheet
   const setMenuBar = (key: 'enabled' | 'show_workspaces', checked: boolean) => {
     if (config.data && menuBar) configPatch.mutate({ revision: config.data.revision, patch: { kind: 'set_menu_bar', menu_bar: { ...menuBar, [key]: checked } } })
   }
@@ -56,6 +57,7 @@ export function General() {
           <div className="row row-pad"><div><span className="row-title">{t('menuBar.workspaces')}</span><span className="row-sub">{t('menuBar.workspacesHint')}</span></div><input aria-label={t('menuBar.workspaces')} type="checkbox" checked={menuBar.show_workspaces} disabled={configPatch.isPending || !menuBar.enabled} onChange={(event) => setMenuBar('show_workspaces', event.target.checked)} /></div>
           {configPatch.isError && <p className="bad-text">{configPatch.error.message}</p>}
         </> : <div className="row row-pad"><span className="row-sub">{t('menuBar.needsDaemon')}</span></div>}
+        {sheet && <div className="row row-pad"><div><span className="row-title">{t('menuBar.cheatSheet')}</span><span className="row-sub">{t('menuBar.cheatSheetHint', { seconds: sheet.hold_ms / 1000 })}</span></div><input aria-label={t('menuBar.cheatSheet')} type="checkbox" checked={sheet.enabled} disabled={configPatch.isPending} onChange={(event) => { if (config.data) configPatch.mutate({ revision: config.data.revision, patch: { kind: 'set_cheat_sheet', cheat_sheet: { ...sheet, enabled: event.target.checked } } }) }} /></div>}
       </Card>
       {info.data?.login_item === 'requires_approval' && <Notice tone="warn">{t('general.loginApproval')} <button className="link-button" onClick={() => void openSystemPane('login_items')}>{t('general.openLoginItems')}</button></Notice>}
       {save.isError && <p className="bad-text">{save.error.message}</p>}{save.isSuccess && <p className="good-text">{t('general.saved')}</p>}
