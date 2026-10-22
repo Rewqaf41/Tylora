@@ -40,7 +40,10 @@ use tylora_macos::{
     DisplayEvents, HotkeyEvent, HotkeyManager, ManagedAdapter, ManagedCommand, ManagedEvent,
     MouseButton, MouseInput, MousePhase, MouseTarget, WorkArea, VISIBILITY_ROLLBACK_FAILED,
 };
-use tylora_macos::{pump_events, MenuAction, StatusItem, StatusSnapshot, StatusWorkspace};
+use tylora_macos::{
+    hide_cheat_sheet, pump_events, show_cheat_sheet, CheatSheet, MenuAction, StatusItem,
+    StatusSnapshot, StatusWorkspace,
+};
 
 extern "C" {
     fn geteuid() -> u32;
@@ -4759,6 +4762,7 @@ pub fn serve(requested_display: Option<u32>) -> ExitCode {
     let (status_tx, status_rx) = mpsc::sync_channel::<StatusSnapshot>(1);
     let (command_tx, command_rx) = mpsc::sync_channel::<MenuAction>(8);
     let (menu_tx, menu_rx) = mpsc::sync_channel::<MenuAction>(8);
+    let (sheet_tx, sheet_rx) = mpsc::sync_channel::<Option<CheatSheet>>(4);
     let worker = thread::Builder::new()
         .name("tylora-coordinator".into())
         .spawn(move || {
@@ -4771,6 +4775,7 @@ pub fn serve(requested_display: Option<u32>) -> ExitCode {
                 MenuBarLink {
                     snapshots: status_tx,
                     actions: command_rx,
+                    cheat_sheet: sheet_tx,
                 },
             )
         });
@@ -4810,6 +4815,12 @@ pub fn serve(requested_display: Option<u32>) -> ExitCode {
                 if let Some(item) = &status_item {
                     item.update(&snapshot);
                 }
+            }
+        }
+        while let Ok(sheet) = sheet_rx.try_recv() {
+            match sheet {
+                Some(groups) => show_cheat_sheet(&groups),
+                None => hide_cheat_sheet(),
             }
         }
         while let Ok(action) = menu_rx.try_recv() {
@@ -4932,6 +4943,36 @@ fn event_state(
 struct MenuBarLink {
     snapshots: SyncSender<StatusSnapshot>,
     actions: Receiver<MenuAction>,
+    /// `Some` shows the hotkey cheat sheet, `None` hides it.
+    cheat_sheet: SyncSender<Option<CheatSheet>>,
+}
+
+/// The cheat sheet for the hotkeys that are active right now.
+fn cheat_sheet(config: &Config) -> CheatSheet {
+    let hotkeys: Vec<Hotkey> = effective_hotkeys(config)
+        .into_iter()
+        .filter(|hotkey| hotkey.enabled && hotkey_supported(&hotkey.command, config))
+        .collect();
+    let scratchpad = |id: &str| {
+        config
+            .scratchpads
+            .iter()
+            .find(|pad| pad.id == id)
+            .map(|pad| {
+                if pad.name.is_empty() {
+                    pad.id.clone()
+                } else {
+                    pad.name.clone()
+                }
+            })
+            .unwrap_or_else(|| id.to_owned())
+    };
+    crate::cheatsheet::build(
+        hotkeys
+            .iter()
+            .map(|hotkey| (hotkey.chord.as_str(), &hotkey.command)),
+        &scratchpad,
+    )
 }
 
 /// What the menu bar item shows: bound workspaces in configuration order,
@@ -5155,6 +5196,11 @@ fn run_coordinator(
     let mut last_activity = Instant::now();
     let mut early_input: Option<HotkeyEvent> = None;
     let mut menu_shown: Option<StatusSnapshot> = None;
+    // Option held alone since; whether the cheat sheet is up.
+    let mut option_held_since: Option<Instant> = None;
+    let mut cheat_sheet_shown = false;
+    // `tylora hotkeys sheet`: shown without holding Option until then.
+    let mut sheet_preview_until: Option<Instant> = None;
     let mut next_menu_refresh = Instant::now();
     let mut event_snapshot = crate::events::EventState::default();
     let mut next_event_check = Instant::now();
@@ -5207,6 +5253,34 @@ fn run_coordinator(
                     stopping = true;
                 }
                 MenuAction::OpenApp => {}
+            }
+        }
+        // The tap reports releases, but a reinstalled tap starts without
+        // the hold; the hardware state settles it.
+        if let Some(until) = sheet_preview_until {
+            if Instant::now() >= until {
+                sheet_preview_until = None;
+                if !option_held_since.is_some_and(|_| tylora_macos::option_held_alone()) {
+                    cheat_sheet_shown = false;
+                    let _ = menu_bar.cheat_sheet.try_send(None);
+                }
+            }
+        }
+        if cheat_sheet_shown && sheet_preview_until.is_none() && !tylora_macos::option_held_alone()
+        {
+            cheat_sheet_shown = false;
+            option_held_since = None;
+            let _ = menu_bar.cheat_sheet.try_send(None);
+        }
+        if let Some(since) = option_held_since {
+            if !cheat_sheet_shown
+                && config.cheat_sheet.enabled
+                && since.elapsed() >= Duration::from_millis(u64::from(config.cheat_sheet.hold_ms))
+            {
+                let groups = cheat_sheet(&config);
+                if !groups.is_empty() && menu_bar.cheat_sheet.try_send(Some(groups)).is_ok() {
+                    cheat_sheet_shown = true;
+                }
             }
         }
         if Instant::now() >= next_event_check {
@@ -6930,6 +7004,13 @@ fn run_coordinator(
                     follow_mouse.cancel();
                     follow_mouse.requested = None;
                 }
+                Ok(HotkeyEvent::OptionHold(held)) => {
+                    option_held_since = held.then(Instant::now);
+                    if !held && cheat_sheet_shown {
+                        cheat_sheet_shown = false;
+                        let _ = menu_bar.cheat_sheet.try_send(None);
+                    }
+                }
                 Ok(HotkeyEvent::TapDisabled) => warn!("event tap disabled; attempting recovery"),
                 Ok(HotkeyEvent::QueueOverflow) => warn!("hotkey queue overflow"),
                 Ok(HotkeyEvent::Stopped) => warn!("hotkey event tap stopped"),
@@ -7437,6 +7518,18 @@ fn run_coordinator(
                     }
                 };
                 let _ = request.response.try_send(reply.to_string());
+                continue;
+            }
+            if request.command == "hotkeys sheet" {
+                let groups = cheat_sheet(&config);
+                let reply = if menu_bar.cheat_sheet.try_send(Some(groups)).is_ok() {
+                    cheat_sheet_shown = true;
+                    sheet_preview_until = Some(Instant::now() + Duration::from_secs(4));
+                    "{\"version\":1,\"ok\":true,\"message\":\"cheat sheet shown for 4 seconds\"}"
+                } else {
+                    "{\"version\":1,\"ok\":false,\"message\":\"menu bar thread busy\"}"
+                };
+                let _ = request.response.try_send(reply.into());
                 continue;
             }
             if request.command == "recover-windows" {
