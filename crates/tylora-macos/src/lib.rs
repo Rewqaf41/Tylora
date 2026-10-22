@@ -166,6 +166,23 @@ pub fn remove_spaces(
 
 /// The system "Reduce motion" accessibility setting. Read only; Tylora never
 /// changes it.
+/// Whether Option is the only modifier held right now (hardware state).
+pub fn option_held_alone() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventSourceFlagsState(state: i32) -> u64;
+        }
+        // kCGEventSourceStateHIDSystemState = 1.
+        (unsafe { CGEventSourceFlagsState(1) } & 0x001e_0000) == 0x0008_0000
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Makes this process a background (accessory) app: no Dock icon and no
 /// menu bar, although the daemon's executable sits inside Tylora.app and so
 /// would otherwise show the app's icon a second time. Call it on the main
@@ -282,7 +299,8 @@ pub use native::managed::{
 
 #[cfg(target_os = "macos")]
 pub use native::status_item::{
-    pump_events, MenuAction, StatusItem, StatusSnapshot, StatusWorkspace,
+    hide_cheat_sheet, pump_events, show_cheat_sheet, CheatSheet, MenuAction, StatusItem,
+    StatusSnapshot, StatusWorkspace,
 };
 
 #[cfg(target_os = "macos")]

@@ -51,6 +51,46 @@ extern "C" {
     );
     fn tylora_status_destroy(handle: *mut c_void);
     fn tylora_pump_events(seconds: f64);
+    fn tylora_cheat_sheet_show(
+        group_count: i32,
+        titles: *const *const c_char,
+        row_counts: *const i32,
+        chords: *const *const c_char,
+        labels: *const *const c_char,
+    );
+    fn tylora_cheat_sheet_hide();
+}
+
+/// Groups of (chord, label) rows for the hotkey cheat sheet.
+pub type CheatSheet = Vec<(String, Vec<(String, String)>)>;
+
+fn c_text(text: &str) -> CString {
+    CString::new(text.replace('\0', "")).unwrap_or_default()
+}
+
+/// Shows the hotkey cheat sheet on the display under the pointer.
+pub fn show_cheat_sheet(groups: &CheatSheet) {
+    let titles: Vec<CString> = groups.iter().map(|(title, _)| c_text(title)).collect();
+    let counts: Vec<i32> = groups.iter().map(|(_, rows)| rows.len() as i32).collect();
+    let rows = groups.iter().flat_map(|(_, rows)| rows);
+    let chords: Vec<CString> = rows.clone().map(|(chord, _)| c_text(chord)).collect();
+    let labels: Vec<CString> = rows.map(|(_, label)| c_text(label)).collect();
+    let pointers = |texts: &[CString]| texts.iter().map(|text| text.as_ptr()).collect::<Vec<_>>();
+    let (titles_ptr, chords_ptr, labels_ptr) =
+        (pointers(&titles), pointers(&chords), pointers(&labels));
+    unsafe {
+        tylora_cheat_sheet_show(
+            groups.len() as i32,
+            titles_ptr.as_ptr(),
+            counts.as_ptr(),
+            chords_ptr.as_ptr(),
+            labels_ptr.as_ptr(),
+        )
+    }
+}
+
+pub fn hide_cheat_sheet() {
+    unsafe { tylora_cheat_sheet_hide() }
 }
 
 extern "C" fn on_menu(context: *mut c_void, action: i32, argument: i32) {

@@ -9,6 +9,7 @@ fn main() {
     for source in [
         "src/spaces/window_move_bridge.m",
         "src/native/status_item.m",
+        "src/native/cheat_sheet.m",
     ] {
         let name = PathBuf::from(source).with_extension("o");
         let object = out.join(name.file_name().expect("object name"));
