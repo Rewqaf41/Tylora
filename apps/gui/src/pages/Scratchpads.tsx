@@ -59,7 +59,7 @@ function GeometryPreview({ pad, area }: { pad: ScratchpadDefinition; area: Rect 
   const t = useT()
   const frame = previewFrame(pad, area)
   const scale = 260 / area.width
-  return <svg role="img" aria-label={t('pads.previewLabel')} width={260} height={Math.round(area.height * scale)} style={{ border: '1px solid var(--border)', borderRadius: 6, background: 'var(--surface-2, transparent)' }}>
+  return <svg role="img" aria-label={t('pads.previewLabel')} width={260} height={Math.round(area.height * scale)} viewBox={`0 0 260 ${Math.round(area.height * scale)}`} style={{ flex: 'none', border: '1px solid var(--border)', borderRadius: 6, background: 'var(--surface-2, transparent)' }}>
     <rect x={(frame.x - area.x) * scale} y={(frame.y - area.y) * scale} width={frame.width * scale} height={frame.height * scale} rx={4} fill="var(--accent, #5b8def)" fillOpacity={0.3} stroke="var(--accent, #5b8def)" />
     <text x={6} y={14} fontSize={10} fill="currentColor" opacity={0.6}>{Math.round(frame.width)}×{Math.round(frame.height)} pt</text>
   </svg>
@@ -153,7 +153,7 @@ export function Scratchpads() {
             {apps.data?.apps.map((app) => <option key={app.bundle_id} value={app.bundle_id}>{app.name ?? app.bundle_id} — {app.bundle_id}</option>)}</select></div>
           <div className="field"><label htmlFor="pad-hotkey">{t('pads.hotkey')}</label><HotkeyRecorder id="pad-hotkey" clearable value={draft.hotkey ?? null} onChange={(hotkey) => setDraft((current) => ({ ...current, hotkey }))} /></div>
           <div className="field"><label htmlFor="pad-scope">{t('pads.scope')}</label><select id="pad-scope" value={draft.scope} onChange={(event) => setDraft({ ...draft, scope: event.target.value as ScratchpadDefinition['scope'] })}><option value="global">{t('pads.scopeGlobal')}</option><option value="local">{t('pads.scopeLocal')}</option></select></div>
-          <div className="field"><label htmlFor="pad-hide">{t('pads.hideBy')}</label><select id="pad-hide" value={draft.hide} onChange={(event) => setDraft({ ...draft, hide: event.target.value as ScratchpadDefinition['hide'] })}><option value="park">{t('pads.hidePark')}</option><option value="minimize">{t('pads.hideMinimize')}</option></select></div>
+          <div className="field"><label htmlFor="pad-hide">{t('pads.hideBy')}</label><select id="pad-hide" value={draft.scope === 'local' ? 'minimize' : draft.hide} disabled={draft.scope === 'local'} onChange={(event) => setDraft({ ...draft, hide: event.target.value as ScratchpadDefinition['hide'] })}><option value="park">{t('pads.hidePark')}</option><option value="minimize">{t('pads.hideMinimize')}</option></select></div>
           <div className="field"><label htmlFor="pad-target">{t('pads.showOn')}</label><select id="pad-target" value={draft.display === null || draft.display === undefined ? draft.target : `display-${draft.display}`} onChange={(event) => { const value = event.target.value; if (value.startsWith('display-')) setDraft({ ...draft, display: Number(value.slice(8)) }); else setDraft({ ...draft, display: null, target: value as ScratchpadDefinition['target'] }) }}>
             <option value="pointer">{t('pads.targetPointer')}</option><option value="focused">{t('pads.targetFocused')}</option>
             {displays.data?.displays.map((display) => <option key={display.id} value={`display-${display.id}`}>{t('pads.alwaysDisplay', { id: display.id })}{display.primary ? ` ${t('common.primaryMark')}` : ''}</option>)}</select></div>
@@ -163,9 +163,10 @@ export function Scratchpads() {
           <div className="field"><label htmlFor="pad-offset-x">{t('pads.offsetX')}</label><input id="pad-offset-x" type="number" min={-4000} max={4000} value={draft.offset_x} onChange={(event) => setDraft({ ...draft, offset_x: Number(event.target.value) })} /></div>
           <div className="field"><label htmlFor="pad-offset-y">{t('pads.offsetY')}</label><input id="pad-offset-y" type="number" min={-4000} max={4000} value={draft.offset_y} onChange={(event) => setDraft({ ...draft, offset_y: Number(event.target.value) })} /></div>
         </div>
+        <p className="row-sub" style={{ margin: 0 }}>{draft.scope === 'local' ? t('pads.scopeLocalHint') : t('pads.scopeGlobalHint')} {draft.scope === 'local' ? t('pads.hideLocalHint') : draft.hide === 'park' ? t('pads.hideParkHint') : t('pads.hideMinimizeHint')}</p>
         {primary && <div className="row" style={{ gap: 16, justifyContent: 'flex-start', alignItems: 'flex-start' }}><GeometryPreview pad={draft} area={primary.work_area} /><span className="row-sub">{t('pads.previewNote', { id: primary.id, width: primary.work_area.width, height: primary.work_area.height })}</span></div>}
         {draft.hotkey && shortcutWarning(draft.hotkey, t) && <Notice tone="warn">{shortcutWarning(draft.hotkey, t)}</Notice>}
-        {draft.hide === 'minimize' && <Notice tone="warn">{t('pads.minimizeNotice')}</Notice>}
+        {draft.hide === 'minimize' && draft.scope !== 'local' && <Notice tone="warn">{t('pads.minimizeNotice')}</Notice>}
         <div className="form-actions"><label className="row" style={{ marginRight: 12, gap: 7 }}><input type="checkbox" checked={draft.remember_position} onChange={(event) => setDraft({ ...draft, remember_position: event.target.checked })} /> {t('pads.rememberPosition')}</label>
           <label className="row" style={{ marginRight: 'auto', gap: 7 }}><input type="checkbox" checked={draft.remember_size} onChange={(event) => setDraft({ ...draft, remember_size: event.target.checked })} /> {t('pads.rememberSize')}</label>
           <Button variant="ghost" onClick={() => setEditing(undefined)}>{t('common.cancel')}</Button><Button variant="primary" disabled={problem !== null || patch.isPending} onClick={save}>{patch.isPending ? t('common.saving') : t('pads.save')}</Button></div>
