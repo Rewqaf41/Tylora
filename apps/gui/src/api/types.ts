@@ -139,6 +139,8 @@ export type ConfigPatch =
   | { kind: 'set_gaps'; inner: number; outer: number }
   | { kind: 'set_zoom'; respect_outer_gaps: boolean }
   | { kind: 'set_menu_bar'; menu_bar: MenuBarConfig }
+  | { kind: 'create_workspace'; name: string; display: number | null; native_space_id: number }
+  | { kind: 'remove_workspace'; id: number }
   | { kind: 'set_cheat_sheet'; cheat_sheet: CheatSheetConfig }
   | { kind: 'set_window_movement'; settings: Config['window_movement'] }
   | { kind: 'set_workspace'; id: number; name: string; display: number | null; native_space_id: number | null; native_space_ids?: number[] }

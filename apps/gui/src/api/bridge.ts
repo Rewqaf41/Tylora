@@ -145,3 +145,9 @@ export async function openReleaseNotes(version?: string): Promise<void> {
   try { await invoke('open_release_notes', { version: version ?? null }) }
   catch (error) { throw normalize(error) }
 }
+
+/** Adds a Desktop on `display` (Mission Control, driven by the daemon). */
+export async function createDesktop(display: number): Promise<{ ok: boolean; space: { id: number; desktop: number; display: number } }> {
+  try { return await invoke('daemon_mutate', { action: { kind: 'create_desktop', display } }) }
+  catch (error) { throw normalize(error) }
+}

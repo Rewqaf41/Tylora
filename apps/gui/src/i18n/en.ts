@@ -116,7 +116,7 @@ export const en = {
 
   // Workspaces
   'ws.eyebrow': 'Spaces & bindings',
-  'ws.intro': 'Bind logical workspaces to stable native Space IDs. Desktop order can change without breaking bindings.',
+  'ws.intro': 'Each Desktop in Mission Control can carry a workspace, opened with Option+its number. Create a Desktop here and the next free workspace is bound to it; rename or rebind it below.',
   'ws.offline': 'Start the daemon to inspect native Spaces.',
   'ws.none': 'No native Spaces found',
   'ws.noneHint': 'Check the native backend in Diagnostics.',
@@ -135,7 +135,7 @@ export const en = {
   'ws.noWindows': 'No managed windows observed in this Space.',
   'ws.saved': 'Saved and applied by daemon.',
   'ws.focusShortcut': 'Focus shortcut:',
-  'ws.notice': 'Native Space IDs are read from WindowServer. Tylora does not create, delete, or renumber macOS Desktops.',
+  'ws.notice': 'Native Space IDs come from WindowServer and stay stable when Desktops are reordered. Remove a Desktop in Mission Control; its binding then becomes unresolved.',
 
   // Displays
   'displays.eyebrow': 'Hardware',
@@ -768,6 +768,22 @@ export const en = {
   'pads.hideParkHint': 'Hidden by moving it to a parking Desktop (recommended).',
   'pads.hideMinimizeHint': 'Hidden by minimizing it to the Dock.',
   'pads.hideLocalHint': 'Hidden by minimizing it on its own Space, so it never leaves that Space.',
+  'ws.newDesktop': 'New Desktop',
+  'ws.creating': 'Creating…',
+  'ws.createdBound': 'Desktop {desktop} created and bound to workspace {id} · {name}.',
+  'ws.createdUnbound': 'Desktop {desktop} created. Every workspace is bound already; pick one for it below.',
+  'ws.parking': 'Scratchpad parking',
+  'ws.parkingHint': 'Tylora keeps hidden global scratchpads here; it is not bound to a workspace.',
+  'ws.newWorkspace': '＋ New workspace',
+  'ws.workspaceName': 'Workspace name',
+  'ws.nameNewHint': 'Name of the new workspace',
+  'ws.nameRenameHint': 'Renames the workspace; rules and hotkeys follow',
+  'ws.create': 'Create workspace',
+  'ws.defaultName': 'Desktop {desktop}',
+  'ws.createdNew': 'Desktop {desktop} created with a new workspace “{name}”; rename it below.',
+  'ws.rename': 'Rename',
+  'ws.remove': 'Delete',
+  'ws.removeConfirm': 'Delete workspace “{name}” and its hotkeys everywhere?',
 }
 
 export type Messages = { [K in keyof typeof en]: string }

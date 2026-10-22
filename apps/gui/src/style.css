@@ -294,6 +294,8 @@
   .ws-row.active { background:var(--accent-soft); }
   .ws-line { display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; }
   .ws-line > div { display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0; }
+  .ws-hint { margin-top:0; display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px; }
+  .ws-hint > span { display:inline-flex; align-items:center; gap:6px; }
   .ws-title { font-size:13px; font-weight:500; }
   .inline-label { color:var(--faint); font-size:9px; font-weight:600; letter-spacing:1px; text-transform:uppercase; }
   .ws-row .field input { width:140px; height:32px; }
