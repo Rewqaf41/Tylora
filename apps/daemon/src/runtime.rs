@@ -4464,6 +4464,7 @@ pub fn request(command: &str) -> ExitCode {
             }
             // Opens the WindowServer connection on the main thread, as the
             // daemon does; display queries in the AX worker require it.
+            tylora_macos::hide_from_dock();
             let _ = work_areas();
             let mut scratchpads = load_scratchpads();
             for problem in recover_parked_scratchpads(&mut scratchpads) {
@@ -4590,6 +4591,9 @@ fn bind_socket() -> std::io::Result<UnixListener> {
 }
 
 pub fn serve(requested_display: Option<u32>) -> ExitCode {
+    if !tylora_macos::hide_from_dock() {
+        warn!("could not make the daemon a background app; it may show a Dock icon");
+    }
     REDUCE_MOTION.store(tylora_macos::reduce_motion(), Ordering::Release);
     if legacy_daemon_running() {
         error!("older FluxWM daemon still running; stop it before starting Tylora");

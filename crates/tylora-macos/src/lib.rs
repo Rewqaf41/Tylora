@@ -166,6 +166,25 @@ pub fn remove_spaces(
 
 /// The system "Reduce motion" accessibility setting. Read only; Tylora never
 /// changes it.
+/// Makes this process a background (accessory) app: no Dock icon and no
+/// menu bar, although the daemon's executable sits inside Tylora.app and so
+/// would otherwise show the app's icon a second time. Call it on the main
+/// thread before anything else touches AppKit; returns whether it applied.
+pub fn hide_from_dock() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+            return false;
+        };
+        let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+        app.setActivationPolicy(objc2_app_kit::NSApplicationActivationPolicy::Accessory)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 pub fn reduce_motion() -> bool {
     #[cfg(target_os = "macos")]
     {
