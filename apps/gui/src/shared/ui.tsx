@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 import type { ButtonHTMLAttributes, CSSProperties, InputHTMLAttributes, PropsWithChildren, ReactNode } from 'react'
 import { animate, utils } from 'animejs'
 import type { LucideIcon } from 'lucide-react'
@@ -94,6 +94,20 @@ const KEY_GLYPHS: Record<string, string> = { command: '⌘', control: '⌃', opt
 export function Keys({ chord }: { chord: string }) {
   return <span className="keys" aria-label={chord}>{chord.split('+').map((key, index) => <kbd key={index} className="kbd">{KEY_GLYPHS[key] ?? (key.length === 1 ? key.toUpperCase() : key)}</kbd>)}</span>
 }
+/**
+ * A button that asks inline before acting: the first click shows the prompt
+ * with Confirm and Cancel. (WKWebView in Tauri has no `window.confirm`; it
+ * returns false at once, so such buttons used to do nothing.)
+ */
 export function ConfirmButton({ children, prompt, onConfirm, disabled, variant = 'danger', size }: PropsWithChildren<{ prompt: string; onConfirm: () => void; disabled?: boolean; variant?: 'danger' | 'secondary'; size?: 'sm' | 'icon' | 'block' }>) {
-  return <Button variant={variant} size={size} disabled={disabled} onClick={() => { if (window.confirm(prompt)) onConfirm() }}>{children}</Button>
+  const t = useT()
+  const [asking, setAsking] = useState(false)
+  if (!asking) return <Button variant={variant} size={size} disabled={disabled} onClick={() => setAsking(true)}>{children}</Button>
+  return <div className={`confirm-inline${size === 'block' ? ' block' : ''}`} role="group" aria-label={prompt}>
+    <span>{prompt}</span>
+    <div className="list-actions">
+      <Button size="sm" variant="ghost" onClick={() => setAsking(false)}>{t('common.cancel')}</Button>
+      <Button size="sm" variant={variant === 'danger' ? 'danger' : 'primary'} disabled={disabled} autoFocus onClick={() => { setAsking(false); onConfirm() }}>{t('common.confirm')}</Button>
+    </div>
+  </div>
 }
