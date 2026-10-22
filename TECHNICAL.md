@@ -158,6 +158,18 @@ Core Graphics display callbacks trigger a debounced AppKit work-area refresh, wi
 
 `disconnect_policy = "recreate_desktops"` (default `"move_to_primary"`, the macOS behavior) keeps an external display's Desktops off the remaining display. The daemon remembers each connected external display's Desktops by UUID (from WindowServer, which drops a display at once). Two seconds after that display disconnects, it moves the windows from the Desktops macOS appended to the remaining display: a workspace's windows go to the same workspace's Space there, parked scratchpads go to that display's parking Desktop, and other windows follow their application rule (bundle ID rules without a title) or land on the active Desktop. It then removes those Desktops through Mission Control. When the same display returns, it recreates as many Desktops, rebinds the workspaces and the parking Desktop to them by position, and returns the windows that still sit where they were moved. The built-in display is never handled this way, so clamshell mode keeps the Mac's Desktops. State is kept in `~/.local/state/tylora/display-desktops.json`; a failed attempt is retried after the display next changes.
 
+## Hotkey cheat sheet
+
+Hold **Option alone** for three seconds and a panel over the display under the pointer lists every shortcut that is active right now, grouped into windows, workspaces and displays, layout and scratchpads; keys of one action are folded (`⌥ H J K L`, `⌥ 1…4` with the workspace names). Releasing Option, pressing any key or clicking closes it, and nothing you type is intercepted. Unbound workspace keys, disabled bindings and ones the native backend cannot serve are not listed. `tylora hotkeys sheet` shows it for four seconds without holding the key.
+
+```toml
+[cheat_sheet]
+enabled = true
+hold_ms = 3000   # 500–10000
+```
+
+General → Menu bar has the same switch.
+
 ## Event stream
 
 `tylora subscribe` keeps a connection to the daemon open and prints one JSON object per line as things change, for status bars (SketchyBar), Hammerspoon, Raycast or your own scripts. It ends when the daemon stops.

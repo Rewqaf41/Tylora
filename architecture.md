@@ -105,3 +105,7 @@ The coordinator polls its channels every 10 ms while anything happened in the la
 ## Event stream
 
 `tylora subscribe` connections are handed from the IPC thread to an `EventHub` (`apps/daemon/src/events.rs`) instead of being answered and closed. The coordinator builds a plain `EventState` (displays with their active Space, bound workspace and layout kind; managed windows keyed by pid and CGWindowID; the focused window) every 50 ms while someone subscribes and every 250 ms otherwise, and publishes the `diff`. State events are kept per key and replayed to new subscribers. Each subscriber has its own writer thread behind a 256-line queue; a full or closed queue drops that subscriber, so no client can stall the coordinator. Because the registry only holds windows on active Spaces, a window that leaves it stays known while WindowServer still lists its CGWindowID.
+
+## Hotkey cheat sheet
+
+The event tap reports `HotkeyEvent::OptionHold` transitions only: Option alone pressed, or the hold ended (released, another modifier, any key or mouse button). The coordinator times the hold against `[cheat_sheet] hold_ms`, builds the sheet from the active bindings (`cheatsheet.rs`, pure) and asks the main thread to show `cheat_sheet.m`, a non-activating, click-through panel. While it is up the coordinator also checks the hardware modifier state (`CGEventSourceFlagsState`), so a reinstalled tap cannot leave it stuck.
