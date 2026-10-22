@@ -4567,6 +4567,47 @@ pub fn request(command: &str) -> ExitCode {
     }
 }
 
+/// `tylora subscribe [EVENTS]`: prints the daemon's event stream, one JSON
+/// object per line, until the daemon stops or the reader goes away.
+pub fn subscribe(args: &[String]) -> ExitCode {
+    let filter = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--events" && arg.as_str() != "--json")
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut stream = match UnixStream::connect(socket_path()) {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("tylora is not running: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let request = if filter.is_empty() {
+        "subscribe\n".to_owned()
+    } else {
+        format!("subscribe {filter}\n")
+    };
+    if let Err(error) = stream.write_all(request.as_bytes()) {
+        eprintln!("cannot subscribe: {error}");
+        return ExitCode::FAILURE;
+    }
+    let mut stdout = std::io::stdout().lock();
+    for line in BufReader::new(stream).lines() {
+        let Ok(line) = line else { break };
+        if writeln!(stdout, "{line}")
+            .and_then(|()| stdout.flush())
+            .is_err()
+        {
+            break;
+        }
+        if line.contains("\"event\":\"error\"") {
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 pub(crate) fn query(command: &str) -> std::io::Result<String> {
     let mut stream = UnixStream::connect(socket_path())?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -4581,7 +4622,12 @@ struct IpcRequest {
     response: SyncSender<String>,
 }
 
-fn ipc_loop(listener: UnixListener, requests: SyncSender<IpcRequest>, stopping: Arc<AtomicBool>) {
+fn ipc_loop(
+    listener: UnixListener,
+    requests: SyncSender<IpcRequest>,
+    stopping: Arc<AtomicBool>,
+    events: crate::events::EventHub,
+) {
     // A blocking accept keeps the idle daemon from waking 50 times a second.
     // The thread is never joined: after `stop` it is left blocked until the
     // process exits, and the socket file is already removed.
@@ -4597,7 +4643,22 @@ fn ipc_loop(listener: UnixListener, requests: SyncSender<IpcRequest>, stopping: 
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                 let mut line = String::new();
-                let reply = if BufReader::new(&stream).read_line(&mut line).is_ok() {
+                let read = BufReader::new(&stream).read_line(&mut line).is_ok();
+                // `subscribe` keeps the connection: the hub writes to it.
+                match crate::events::parse_request(line.trim()) {
+                    Some(Ok(filter)) if read => {
+                        events.subscribe(stream, filter);
+                        continue;
+                    }
+                    Some(Err(message)) => {
+                        let reply =
+                            serde_json::json!({"version":1,"event":"error","message":message});
+                        let _ = stream.write_all(format!("{reply}\n").as_bytes());
+                        continue;
+                    }
+                    _ => {}
+                }
+                let reply = if read {
                     let (tx, rx) = mpsc::sync_channel(1);
                     match requests.try_send(IpcRequest {
                         command: line.trim().to_owned(),
@@ -4771,6 +4832,102 @@ pub fn serve(requested_display: Option<u32>) -> ExitCode {
 /// (when, display, [(pid, CGWindowID)]).
 type PendingReturn = (Instant, DisplayId, Vec<(i32, u32)>);
 
+/// Window key for events: CGWindowID when known (stable across AX token
+/// changes after native moves), else the AX token.
+fn event_window_key(id: ManagedWindowId, cg: Option<u32>) -> (i32, u64) {
+    (
+        id.process.pid,
+        cg.map(u64::from).unwrap_or(id.token | 1 << 63),
+    )
+}
+
+/// The state `tylora subscribe` diffs. The registry only holds windows on
+/// active Spaces, so a window that left it stays known while WindowServer
+/// still lists it (it moved to an inactive Space, it did not close).
+fn event_state(
+    state: &DisplayState,
+    config: &Config,
+    focused: Option<ManagedWindowId>,
+    previous: &crate::events::EventState,
+) -> crate::events::EventState {
+    use crate::events::{DisplayFacts, EventState, WindowFacts};
+    let workspace_of = |space: Option<u64>, display: DisplayId| {
+        let space = space?;
+        config
+            .workspaces
+            .iter()
+            .find(|ws| ws.binds(space) && ws.display.is_none_or(|id| id == display.0))
+    };
+    let mut next = EventState::default();
+    for display in &state.active {
+        let space = state
+            .native_spaces
+            .iter()
+            .find(|space| space.active && space.display == *display);
+        let space_id = space.map(|space| space.id.0);
+        next.displays.insert(
+            display.0,
+            DisplayFacts {
+                uuid: state
+                    .areas
+                    .get(display)
+                    .and_then(|area| area.stable_uuid)
+                    .map(|uuid| format!("{uuid:032x}")),
+                space_id,
+                desktop: space.map(|space| space.desktop.0),
+                workspace: workspace_of(space_id, *display).map(|ws| (ws.id, ws.name.clone())),
+                layout: state.coordinators.get(display).and_then(|coordinator| {
+                    serde_json::to_value(coordinator.layout.kind())
+                        .ok()
+                        .and_then(|kind| kind.as_str().map(str::to_owned))
+                }),
+            },
+        );
+    }
+    for (display, coordinator) in &state.coordinators {
+        for (id, record) in coordinator.registry.iter() {
+            if record.observed.mode == tylora_core::registry::ManagementMode::Unmanaged {
+                continue;
+            }
+            let key = event_window_key(*id, record.observed.cg_window_id);
+            next.windows.insert(
+                key,
+                WindowFacts {
+                    pid: id.process.pid,
+                    app: record.observed.application_id.clone(),
+                    title: record.observed.title.clone(),
+                    cg_window_id: record.observed.cg_window_id,
+                    display: display.0,
+                    workspace: workspace_of(record.observed.native_space_id, *display)
+                        .map(|ws| ws.id),
+                },
+            );
+            if focused == Some(*id) {
+                next.focus = Some(key);
+            }
+        }
+    }
+    let missing: Vec<_> = previous
+        .windows
+        .iter()
+        .filter(|(key, _)| !next.windows.contains_key(key))
+        .collect();
+    if missing
+        .iter()
+        .any(|(_, window)| window.cg_window_id.is_some())
+    {
+        let alive: HashSet<u32> = tylora_macos::discover_all_cg_windows()
+            .map(|windows| windows.into_iter().map(|window| window.id.0).collect())
+            .unwrap_or_default();
+        for (key, window) in missing {
+            if window.cg_window_id.is_some_and(|cg| alive.contains(&cg)) {
+                next.windows.insert(*key, window.clone());
+            }
+        }
+    }
+    next
+}
+
 /// The coordinator's side of the menu bar item owned by the main thread.
 struct MenuBarLink {
     snapshots: SyncSender<StatusSnapshot>,
@@ -4889,11 +5046,19 @@ fn run_coordinator(
     menu_bar: MenuBarLink,
 ) -> ExitCode {
     let (ipc_tx, ipc_rx) = mpsc::sync_channel(64);
+    let events = crate::events::EventHub::default();
+    events.publish(
+        Some("daemon".into()),
+        serde_json::json!({"version":1,"event":"daemon","state":"running","daemon_version":env!("CARGO_PKG_VERSION")}),
+    );
     let ipc_stopping = Arc::new(AtomicBool::new(false));
     let ipc_flag = ipc_stopping.clone();
     if thread::Builder::new()
         .name("tylora-ipc".into())
-        .spawn(move || ipc_loop(listener, ipc_tx, ipc_flag))
+        .spawn({
+            let events = events.clone();
+            move || ipc_loop(listener, ipc_tx, ipc_flag, events)
+        })
         .is_err()
     {
         error!("cannot spawn IPC thread");
@@ -4991,6 +5156,11 @@ fn run_coordinator(
     let mut early_input: Option<HotkeyEvent> = None;
     let mut menu_shown: Option<StatusSnapshot> = None;
     let mut next_menu_refresh = Instant::now();
+    let mut event_snapshot = crate::events::EventState::default();
+    let mut next_event_check = Instant::now();
+    // Windows found by the first scans were open before the daemon started;
+    // they are state, not `window_opened` events.
+    let events_baseline_until = Instant::now() + Duration::from_secs(3);
     let occupancy_wanted = Arc::new(AtomicBool::new(false));
     let occupancy = start_space_occupancy(occupancy_wanted.clone());
     let mut occupied_elsewhere: HashSet<u64> = HashSet::new();
@@ -5038,6 +5208,31 @@ fn run_coordinator(
                 }
                 MenuAction::OpenApp => {}
             }
+        }
+        if Instant::now() >= next_event_check {
+            // Fast while someone listens; slower otherwise, only to keep the
+            // state a new subscriber receives current.
+            next_event_check = Instant::now()
+                + Duration::from_millis(if events.has_subscribers() { 50 } else { 250 });
+            let next = event_state(
+                &state,
+                &config,
+                focus_trail.last().copied(),
+                &event_snapshot,
+            );
+            if Instant::now() < events_baseline_until {
+                event_snapshot.windows = next.windows.clone();
+            }
+            for (key, event) in crate::events::diff(&event_snapshot, &next) {
+                if event["event"] == "display_removed" {
+                    let display = &event["display"];
+                    for kind in ["display", "workspace", "layout"] {
+                        events.forget(&format!("{kind}:{display}"));
+                    }
+                }
+                events.publish(key, event);
+            }
+            event_snapshot = next;
         }
         if Instant::now() >= next_menu_refresh {
             next_menu_refresh = Instant::now() + Duration::from_millis(200);
@@ -7578,6 +7773,14 @@ fn run_coordinator(
         }
     }
     let _ = adapter.commands.try_send(ManagedCommand::Stop);
+    events.publish(
+        None,
+        serde_json::json!({"version":1,"event":"daemon","state":"stopped"}),
+    );
+    if events.has_subscribers() {
+        // Lets subscriber threads write the last line before the process ends.
+        thread::sleep(Duration::from_millis(100));
+    }
     ipc_stopping.store(true, Ordering::Release);
     let _ = fs::remove_file(socket_path());
     info!("tiling stopped");
@@ -8924,7 +9127,14 @@ mod tests {
         let stopping = Arc::new(AtomicBool::new(false));
         let server = {
             let stopping = stopping.clone();
-            thread::spawn(move || ipc_loop(listener, requests, stopping))
+            thread::spawn(move || {
+                ipc_loop(
+                    listener,
+                    requests,
+                    stopping,
+                    crate::events::EventHub::default(),
+                )
+            })
         };
         let answer = thread::spawn(move || {
             let request = received.recv().unwrap();
