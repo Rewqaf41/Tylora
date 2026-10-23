@@ -355,7 +355,7 @@ bundle_id = "com.apple.Terminal"
 scratchpad = "term"         # cannot be combined with workspace, display or mode
 ```
 
-- **Local scratchpads** stay on the Space where they were assigned: hiding minimizes them there (they never go to the parking Desktop), and their hotkey first switches to that Space, also from a fullscreen app. A global scratchpad cannot appear over a fullscreen app; switch to a Desktop first.
+- **Local scratchpads** stay on the Space where they were assigned and are never hidden, minimized or moved. Their hotkey switches to that Space and focuses the window, also from a fullscreen app; pressing it again switches back to the Space you came from. A global scratchpad cannot appear over a fullscreen app; switch to a Desktop first.
 - **Hide** moves the window with the verified native mover to a *parking* Desktop on its display. Tylora adds that Desktop through Mission Control the first time it needs one. There is no off-screen placement, and no window gets "all Spaces" behaviour (SIP stays enabled; nothing is injected into the Dock or WindowServer). `hide = "minimize"` uses AXMinimized instead, and only when you choose it.
 - **Show** moves the window to the active Space of the target display, sets the frame, raises and focuses it, then checks that it is on screen. Hiding returns focus to the previously focused window. Focus follows mouse is paused while a show or hide runs.
 - **Assignment**: manual assignment (CLI or Settings) always wins. A rule only fills an empty scratchpad, with the first matching new window, once.
