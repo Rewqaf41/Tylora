@@ -764,10 +764,10 @@ export const en = {
   'menuBar.cheatSheet': 'Hotkey cheat sheet',
   'menuBar.cheatSheetHint': 'Hold ⌥ alone for {seconds} s to see every active shortcut; release to close.',
   'pads.scopeGlobalHint': 'Global: appears on the current Space of the chosen display.',
-  'pads.scopeLocalHint': 'Local: lives on the Space where it was assigned; the hotkey switches there first (also from a fullscreen app).',
+  'pads.scopeLocalHint': 'Local: stays on the Space where it was assigned. The hotkey takes you there (also from a fullscreen app); pressing it again takes you back.',
   'pads.hideParkHint': 'Hidden by moving it to a parking Desktop (recommended).',
   'pads.hideMinimizeHint': 'Hidden by minimizing it to the Dock.',
-  'pads.hideLocalHint': 'Hidden by minimizing it on its own Space, so it never leaves that Space.',
+  'pads.hideLocalHint': 'The window is never hidden, minimized or moved.',
   'ws.newDesktop': 'New Desktop',
   'ws.creating': 'Creating…',
   'ws.createdBound': 'Desktop {desktop} created and bound to workspace {id} · {name}.',
@@ -784,6 +784,7 @@ export const en = {
   'ws.rename': 'Rename',
   'ws.remove': 'Delete',
   'ws.removeConfirm': 'Delete workspace “{name}” and its hotkeys everywhere?',
+  'pads.staysLocal': 'stays on its Space; the hotkey visits it and returns',
 }
 
 export type Messages = { [K in keyof typeof en]: string }
