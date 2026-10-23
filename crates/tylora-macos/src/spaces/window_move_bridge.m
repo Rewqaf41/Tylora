@@ -152,3 +152,52 @@ int tylora_submit_window_move(uint32_t wid, uint64_t target) {
         return 0;
     }
 }
+
+// One window of `pid` by verified CGWindowID, retained; NULL when absent.
+static AXUIElementRef copy_ax_window(int32_t pid, uint32_t wid) {
+    pthread_once(&his_once, open_his);
+    AXError (*get_window)(AXUIElementRef, uint32_t *) = his_handle ? dlsym(his_handle, "_AXUIElementGetWindow") : NULL;
+    if (!get_window || pid <= 0 || !wid) return NULL;
+    AXUIElementRef app = AXUIElementCreateApplication((pid_t)pid);
+    if (!app) return NULL;
+    AXUIElementRef found = NULL;
+    CFArrayRef windows = NULL;
+    if (AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, (CFTypeRef *)&windows) == kAXErrorSuccess && windows) {
+        for (CFIndex i = 0; i < CFArrayGetCount(windows) && !found; i++) {
+            AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+            uint32_t id = 0;
+            if (get_window(window, &id) == kAXErrorSuccess && id == wid) found = (AXUIElementRef)CFRetain(window);
+        }
+    }
+    if (windows) CFRelease(windows);
+    CFRelease(app);
+    return found;
+}
+
+// Native fullscreen on or off through AXFullScreen.
+// Returns AXError, or -2 when the window is not found.
+int tylora_set_window_fullscreen(int32_t pid, uint32_t wid, int fullscreen) {
+    AXUIElementRef window = copy_ax_window(pid, wid);
+    if (!window) return -2;
+    AXError error = AXUIElementSetAttributeValue(window, CFSTR("AXFullScreen"), fullscreen ? kCFBooleanTrue : kCFBooleanFalse);
+    CFRelease(window);
+    return error;
+}
+
+// Position and size in global top-left coordinates.
+// Returns AXError, or -2 when the window is not found.
+int tylora_set_window_frame(int32_t pid, uint32_t wid, double x, double y, double width, double height) {
+    AXUIElementRef window = copy_ax_window(pid, wid);
+    if (!window) return -2;
+    CGPoint origin = CGPointMake(x, y);
+    CGSize size = CGSizeMake(width, height);
+    AXValueRef position = AXValueCreate(kAXValueCGPointType, &origin);
+    AXValueRef extent = AXValueCreate(kAXValueCGSizeType, &size);
+    AXError error = position && extent ? kAXErrorSuccess : kAXErrorFailure;
+    if (error == kAXErrorSuccess) error = AXUIElementSetAttributeValue(window, kAXPositionAttribute, position);
+    if (error == kAXErrorSuccess) error = AXUIElementSetAttributeValue(window, kAXSizeAttribute, extent);
+    if (position) CFRelease(position);
+    if (extent) CFRelease(extent);
+    CFRelease(window);
+    return error;
+}

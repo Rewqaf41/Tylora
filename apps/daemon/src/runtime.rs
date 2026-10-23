@@ -6602,6 +6602,41 @@ fn run_coordinator(
                                         .then_some(*id)
                                     })
                             });
+                            if let Some(plan) =
+                                fullscreen_display_move(&state, &config, &command, cg_window)
+                            {
+                                match plan {
+                                    Ok(plan)
+                                        if !FULLSCREEN_MOVE_BUSY.swap(true, Ordering::AcqRel) =>
+                                    {
+                                        follow_mouse.cancel();
+                                        suppress_pointer_focus(true);
+                                        pointer_focus_pause_until =
+                                            Some(Instant::now() + Duration::from_secs(8));
+                                        info!(
+                                            cg_window_id = plan.cg_window_id,
+                                            target = plan.target_display.0,
+                                            "moving a fullscreen window to another display"
+                                        );
+                                        spawn_fullscreen_display_move(plan, response);
+                                    }
+                                    plan => {
+                                        let reason = plan.err().unwrap_or_else(|| {
+                                            "a fullscreen transfer is already in progress".into()
+                                        });
+                                        warn!(%reason, "fullscreen window not moved to another display");
+                                        if let Some(response) = response {
+                                            let _ = response.try_send(command_json(
+                                                CommandResult::failure(
+                                                    CommandError::Unsupported,
+                                                    reason,
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
                             match prepare_display_move(&state, &config, &command, resolved) {
                                 Ok(prepared) => {
                                     follow_mouse.cancel();
@@ -6612,6 +6647,7 @@ fn run_coordinator(
                                     spawn_display_move(prepared, native_move_tx.clone(), response);
                                 }
                                 Err(result) => {
+                                    warn!(reason = %result.message, "window not moved to another display");
                                     if let Some(response) = response {
                                         let _ = response.try_send(command_json(result));
                                     }
@@ -8773,6 +8809,37 @@ fn spawn_display_move(
     });
 }
 
+/// The fullscreen plan for the focused window, read from WindowServer now.
+fn fullscreen_display_move(
+    state: &DisplayState,
+    config: &Config,
+    command: &StateCommand,
+    cg_window: Option<(u32, i32)>,
+) -> Option<Result<FullscreenDisplayMove, String>> {
+    use tylora_macos::spaces::{ExperimentalSkyLightBackend, NativeSpaceBackend};
+    let explicit = matches!(
+        command,
+        StateCommand::MoveWindowToDisplay {
+            window: Some(_),
+            ..
+        } | StateCommand::MoveWindowToNextDisplay { window: Some(_) }
+            | StateCommand::MoveWindowToPreviousDisplay { window: Some(_) }
+    );
+    let window = cg_window.filter(|_| !explicit)?;
+    let backend = ExperimentalSkyLightBackend::new();
+    let spaces = backend.get_window_spaces(window.0).ok()?;
+    let orders = backend.display_order().ok()?;
+    plan_fullscreen_display_move(
+        &orders,
+        &spaces,
+        &ordered_displays(state),
+        &state.areas,
+        command,
+        config.window_movement.wrap_around,
+        window,
+    )
+}
+
 fn prepare_display_move(
     state: &DisplayState,
     config: &Config,
@@ -8921,6 +8988,208 @@ fn prepare_display_move(
         bind_workspace,
     })
 }
+/// A display move of a window alone in its own native fullscreen Space.
+#[derive(Debug, Clone, PartialEq)]
+struct FullscreenDisplayMove {
+    pid: i32,
+    cg_window_id: u32,
+    source_display: DisplayId,
+    target_display: DisplayId,
+    target_space: tylora_macos::spaces::NativeSpaceId,
+    target_frame: tylora_core::Rect,
+}
+
+/// Plans a display move for a window in native fullscreen; `None` when the
+/// window is not alone in a fullscreen Space and the regular move applies.
+/// The window lands on the target display's active Desktop, or its first
+/// Desktop while that display shows a fullscreen Space of its own.
+fn plan_fullscreen_display_move(
+    orders: &[tylora_macos::spaces::DisplaySpaceOrder],
+    window_spaces: &[tylora_macos::spaces::NativeSpaceId],
+    displays: &[DisplayId],
+    areas: &HashMap<DisplayId, WorkArea>,
+    command: &StateCommand,
+    wrap: bool,
+    (cg_window_id, pid): (u32, i32),
+) -> Option<Result<FullscreenDisplayMove, String>> {
+    let [space] = window_spaces else {
+        return None;
+    };
+    let source_display = orders
+        .iter()
+        .find(|order| {
+            order
+                .spaces
+                .iter()
+                .any(|entry| entry.id == *space && entry.fullscreen)
+        })?
+        .display;
+    let target_display = match command {
+        StateCommand::MoveWindowToDisplay { display, .. } => Some(*display),
+        StateCommand::MoveWindowToNextDisplay { .. } => {
+            adjacent_display(displays, source_display, false, wrap)
+        }
+        StateCommand::MoveWindowToPreviousDisplay { .. } => {
+            adjacent_display(displays, source_display, true, wrap)
+        }
+        _ => None,
+    };
+    Some((|| {
+        let target_display = target_display.ok_or("no display to move the fullscreen window to")?;
+        if target_display == source_display {
+            return Err("window is already on that display".to_string());
+        }
+        let order = orders
+            .iter()
+            .find(|order| order.display == target_display)
+            .ok_or("target display has no native Spaces")?;
+        let target_space = order
+            .spaces
+            .iter()
+            .find(|entry| entry.id == order.active && !entry.fullscreen)
+            .or_else(|| order.spaces.iter().find(|entry| !entry.fullscreen))
+            .ok_or("target display has no Desktop")?
+            .id;
+        let target_frame = areas
+            .get(&target_display)
+            .ok_or("target display unavailable")?
+            .frame;
+        Ok(FullscreenDisplayMove {
+            pid,
+            cg_window_id,
+            source_display,
+            target_display,
+            target_space,
+            target_frame,
+        })
+    })())
+}
+
+/// One fullscreen transfer at a time: it toggles fullscreen twice and owns
+/// the window for several seconds.
+static FULLSCREEN_MOVE_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Leaves fullscreen, waits for WindowServer to put the window back on a
+/// Desktop, moves it with the verified native move, and enters fullscreen
+/// again on the target display. A failed move restores fullscreen where the
+/// window was. Every outcome is logged and answered.
+fn spawn_fullscreen_display_move(
+    plan: FullscreenDisplayMove,
+    response: Option<SyncSender<String>>,
+) {
+    thread::spawn(move || {
+        let result = run_fullscreen_display_move(&plan);
+        let reply = match &result {
+            Ok(message) => {
+                info!(
+                    cg_window_id = plan.cg_window_id,
+                    source = plan.source_display.0,
+                    target = plan.target_display.0,
+                    "{message}"
+                );
+                let mut reply = CommandResult::success(message.clone());
+                reply.display = Some(plan.target_display);
+                reply
+            }
+            Err(message) => {
+                warn!(
+                    cg_window_id = plan.cg_window_id,
+                    source = plan.source_display.0,
+                    target = plan.target_display.0,
+                    reason = %message,
+                    "fullscreen window not moved to another display"
+                );
+                CommandResult::failure(CommandError::Unsupported, message.clone())
+            }
+        };
+        FULLSCREEN_MOVE_BUSY.store(false, Ordering::Release);
+        if let Some(response) = response {
+            let _ = response.try_send(command_json(reply));
+        }
+    });
+}
+
+fn run_fullscreen_display_move(plan: &FullscreenDisplayMove) -> Result<String, String> {
+    use tylora_macos::spaces::{
+        set_window_frame, set_window_fullscreen, ExperimentalSkyLightBackend, NativeSpaceBackend,
+        NativeWindowSpaceMover,
+    };
+    let backend = ExperimentalSkyLightBackend::new();
+    let (pid, window) = (plan.pid, plan.cg_window_id);
+    let wait = |check: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
+    };
+    let on_desktop = || {
+        backend
+            .get_window_spaces(window)
+            .is_ok_and(|spaces| match spaces.as_slice() {
+                [space] => backend
+                    .list_spaces()
+                    .is_ok_and(|desktops| desktops.iter().any(|desktop| desktop.id == *space)),
+                _ => false,
+            })
+    };
+    set_window_fullscreen(pid, window, false)
+        .map_err(|error| format!("cannot leave fullscreen: {error}"))?;
+    if !wait(&on_desktop) {
+        let _ = set_window_fullscreen(pid, window, true);
+        return Err("macOS did not confirm leaving fullscreen within 3 s".into());
+    }
+    // The exit animation outlives the Space change; a move submitted during
+    // it is undone when the animation lands.
+    thread::sleep(Duration::from_millis(400));
+    if let Err(error) = NativeWindowSpaceMover::move_window_to_space(window, plan.target_space) {
+        let _ = set_window_fullscreen(pid, window, true);
+        return Err(format!(
+            "native move failed, fullscreen restored on the source display: {error}"
+        ));
+    }
+    // Fullscreen opens on the display holding the window's frame.
+    if let Err(error) = set_window_frame(pid, window, plan.target_frame) {
+        warn!(%error, "cannot place the moved window on the target display");
+    }
+    if let Err(error) = set_window_fullscreen(pid, window, true) {
+        return Ok(format!(
+            "fullscreen window moved to display {}; it stays windowed: {error}",
+            plan.target_display.0
+        ));
+    }
+    let fullscreen_on_target = || {
+        backend
+            .get_window_spaces(window)
+            .is_ok_and(|spaces| match spaces.as_slice() {
+                [space] => backend.display_order().is_ok_and(|orders| {
+                    orders.iter().any(|order| {
+                        order.display == plan.target_display
+                            && order
+                                .spaces
+                                .iter()
+                                .any(|entry| entry.id == *space && entry.fullscreen)
+                    })
+                }),
+                _ => false,
+            })
+    };
+    Ok(if wait(&fullscreen_on_target) {
+        format!(
+            "fullscreen window moved to display {}",
+            plan.target_display.0
+        )
+    } else {
+        format!(
+            "window moved to display {}; macOS did not confirm fullscreen there",
+            plan.target_display.0
+        )
+    })
+}
+
 fn focus_display(
     state: &DisplayState,
     adapter: &ManagedAdapter,
@@ -9550,6 +9819,65 @@ mod tests {
         state.handle_reconciled(window.id.process, Vec::new());
         state.handle_process_exited(window.id.process);
         assert!(state.rule_tracker.is_empty());
+    }
+    #[test]
+    fn fullscreen_window_plans_move_to_next_display_desktop() {
+        use tylora_macos::spaces::{DisplaySpaceOrder, NativeSpaceId, OrderedSpace};
+        let order = |display, active, spaces: &[(u64, bool)]| DisplaySpaceOrder {
+            display: DisplayId(display),
+            uuid: None,
+            active: NativeSpaceId(active),
+            spaces: spaces
+                .iter()
+                .map(|&(id, fullscreen)| OrderedSpace {
+                    id: NativeSpaceId(id),
+                    fullscreen,
+                })
+                .collect(),
+        };
+        let areas: HashMap<_, _> = [
+            (DisplayId(1), area(1, 1000.0)),
+            (DisplayId(2), area(2, 800.0)),
+        ]
+        .into_iter()
+        .collect();
+        let displays = [DisplayId(1), DisplayId(2)];
+        let next = StateCommand::MoveWindowToNextDisplay { window: None };
+        let mut orders = vec![
+            order(1, 90, &[(4, false), (5, false), (90, true)]),
+            order(2, 21, &[(20, false), (21, false)]),
+        ];
+        let plan = |orders: &[DisplaySpaceOrder], spaces: &[u64]| {
+            let spaces: Vec<_> = spaces.iter().map(|id| NativeSpaceId(*id)).collect();
+            plan_fullscreen_display_move(orders, &spaces, &displays, &areas, &next, true, (77, 500))
+        };
+        let moved = plan(&orders, &[90]).unwrap().unwrap();
+        assert_eq!(moved.source_display, DisplayId(1));
+        assert_eq!(moved.target_display, DisplayId(2));
+        assert_eq!(moved.target_space, NativeSpaceId(21));
+        assert_eq!(moved.target_frame, areas[&DisplayId(2)].frame);
+        assert_eq!((moved.cg_window_id, moved.pid), (77, 500));
+        // Windows on a Desktop take the regular move.
+        assert_eq!(plan(&orders, &[4]), None);
+        assert_eq!(plan(&orders, &[90, 4]), None);
+        // The target display shows its own fullscreen Space: use its first Desktop.
+        orders[1] = order(2, 30, &[(20, false), (21, false), (30, true)]);
+        assert_eq!(
+            plan(&orders, &[90]).unwrap().unwrap().target_space,
+            NativeSpaceId(20)
+        );
+        // No second display: a clear failure, never a silent drop.
+        let single = [DisplayId(1)];
+        let alone = plan_fullscreen_display_move(
+            &orders[..1],
+            &[NativeSpaceId(90)],
+            &single,
+            &areas,
+            &next,
+            true,
+            (77, 500),
+        );
+        assert!(matches!(alone, Some(Err(_))));
     }
     #[test]
     fn display_move_hotkey_survives_fullscreen_space_on_a_display() {

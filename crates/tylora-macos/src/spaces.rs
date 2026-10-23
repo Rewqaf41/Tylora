@@ -265,7 +265,7 @@ pub use macos::{
 #[cfg(target_os = "macos")]
 pub use window_mover::{
     bridge_status, focused_cg_window, last_move_diagnostic, record_move_diagnostic,
-    FocusedCgWindow, MoveOutcome, NativeWindowSpaceMover,
+    set_window_frame, set_window_fullscreen, FocusedCgWindow, MoveOutcome, NativeWindowSpaceMover,
 };
 
 #[cfg(target_os = "macos")]

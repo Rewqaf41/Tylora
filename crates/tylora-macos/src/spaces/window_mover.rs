@@ -20,6 +20,8 @@ unsafe extern "C" {
     fn tylora_app_focused_cg_window(pid: i32, wid: *mut u32) -> i32;
     fn tylora_submit_window_move(wid: u32, target: u64) -> i32;
     fn tylora_ax_cg_window(element: *const c_void, wid: *mut u32) -> i32;
+    fn tylora_set_window_fullscreen(pid: i32, wid: u32, fullscreen: i32) -> i32;
+    fn tylora_set_window_frame(pid: i32, wid: u32, x: f64, y: f64, width: f64, height: f64) -> i32;
 }
 
 const BACKEND: &str = "SkyLight bridged move";
@@ -106,6 +108,37 @@ pub fn focused_cg_window() -> Result<FocusedCgWindow, SpaceError> {
 pub(crate) fn ax_cg_window(element: *const c_void) -> Option<u32> {
     let mut wid = 0;
     (unsafe { tylora_ax_cg_window(element, &mut wid) } == 0 && wid != 0).then_some(wid)
+}
+
+fn ax_result(code: i32, operation: &str) -> Result<(), SpaceError> {
+    match code {
+        0 => Ok(()),
+        -2 => Err(SpaceError::Unsupported(format!(
+            "{operation}: window not found by CGWindowID"
+        ))),
+        code => Err(SpaceError::Unsupported(format!(
+            "{operation}: AX error {code}"
+        ))),
+    }
+}
+
+/// Enters or leaves native fullscreen (`AXFullScreen`). Returns once the
+/// request is accepted; WindowServer confirms through Space membership.
+pub fn set_window_fullscreen(pid: i32, window_id: u32, fullscreen: bool) -> Result<(), SpaceError> {
+    let code = unsafe { tylora_set_window_fullscreen(pid, window_id, i32::from(fullscreen)) };
+    ax_result(code, "AXFullScreen")
+}
+
+/// Sets a window's frame in global top-left coordinates.
+pub fn set_window_frame(
+    pid: i32,
+    window_id: u32,
+    frame: tylora_core::Rect,
+) -> Result<(), SpaceError> {
+    let code = unsafe {
+        tylora_set_window_frame(pid, window_id, frame.x, frame.y, frame.width, frame.height)
+    };
+    ax_result(code, "AXPosition/AXSize")
 }
 
 #[derive(Debug, Clone, Serialize)]
