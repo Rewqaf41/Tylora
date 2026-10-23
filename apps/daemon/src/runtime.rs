@@ -2422,6 +2422,10 @@ fn scratchpad_action(
                 .find(|space| space.id.0 == home)
                 .map(|space| space.display)
         }),
+        return_to: state
+            .scratchpad_returns
+            .get(id)
+            .map(|back| (back.display, back.space)),
     };
     let plan =
         plan_scratchpad(&definition, &entry, action, context).map_err(|error| error.to_string())?;
@@ -2436,15 +2440,41 @@ fn scratchpad_action(
             }
             Ok(())
         }
+        ScratchpadPlan::Return { display, space } => {
+            let back = state.scratchpad_returns.remove(id);
+            let pointer = back.and_then(|back| back.pointer);
+            thread::spawn(move || {
+                let result =
+                    focus_workspace_space(display, tylora_macos::spaces::NativeSpaceId(space));
+                if let Some(pointer) = pointer.filter(|pointer| *pointer != display) {
+                    let _ = tylora_macos::spaces::warp_cursor_to_display(pointer);
+                }
+                if let Err(error) = result {
+                    warn!(%error, "cannot return from local scratchpad home Space");
+                }
+            });
+            let entry = state.scratchpads.get(id);
+            if let Some(response) = response {
+                let _ = response.try_send(scratchpad_reply(id, entry, "return", Ok("returned")));
+            }
+            Ok(())
+        }
         ScratchpadPlan::VisitHome {
             display,
             space: home,
         } => {
-            // Remember where the user was; hiding goes back there.
-            let back = live_spaces
-                .iter()
-                .find(|space| space.display == display && space.active)
-                .map(|space| space.id.0);
+            // Remember where the user was, a fullscreen app included; the
+            // next call goes back there.
+            let back = ExperimentalSkyLightBackend::new()
+                .display_order_for(display)
+                .map(|order| order.active.0)
+                .ok()
+                .or_else(|| {
+                    live_spaces
+                        .iter()
+                        .find(|space| space.display == display && space.active)
+                        .map(|space| space.id.0)
+                });
             if let Some(space) = back {
                 state.scratchpad_returns.insert(
                     id.to_string(),

@@ -376,6 +376,12 @@ pub enum ScratchpadPlan {
         display: DisplayId,
         space: u64,
     },
+    /// A local scratchpad called again on its home Space: switch `display`
+    /// back to `space`, where the user came from. The window stays put.
+    Return {
+        display: DisplayId,
+        space: u64,
+    },
     Nothing,
 }
 
@@ -398,6 +404,8 @@ pub struct ScratchpadContext {
     pub home_active: bool,
     /// Display holding the home Space, if it still exists.
     pub home_display: Option<DisplayId>,
+    /// Where a local scratchpad's home visit came from, if it did.
+    pub return_to: Option<(DisplayId, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -474,12 +482,12 @@ pub fn plan_scratchpad(
     if !visible {
         return Ok(ScratchpadPlan::Nothing);
     }
-    // A local scratchpad belongs to its Space: it is minimized there rather
-    // than parked with the others on a parking Desktop.
+    // A local scratchpad is never hidden or moved: calling it again goes
+    // back to the Space the visit came from (nothing to do without one).
     if definition.scope == ScratchpadScope::Local {
-        return Ok(ScratchpadPlan::Hide {
-            park: None,
-            minimize: true,
+        return Ok(match context.return_to {
+            Some((display, space)) => ScratchpadPlan::Return { display, space },
+            None => ScratchpadPlan::Nothing,
         });
     }
     match definition.hide {
@@ -796,6 +804,7 @@ mod tests {
             parking_space: Some(99),
             home_active: false,
             home_display: Some(DisplayId(1)),
+            return_to: None,
         }
     }
     fn area() -> Rect {
@@ -1016,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn local_scope_hides_on_its_own_space() {
+    fn local_scope_returns_where_the_visit_came_from() {
         let mut registry = registry();
         registry
             .assign(
@@ -1035,25 +1044,20 @@ mod tests {
         let entry = registry.get("terminal").unwrap().clone();
         let mut here = context(4, true);
         here.home_active = true;
-        // Minimized where it is, never parked with the global ones.
+        // Called on its home Space after a visit: go back, leave the window.
+        here.return_to = Some((DisplayId(1), 7));
         assert_eq!(
-            plan_scratchpad(&pad, &entry, ScratchpadAction::Hide, here),
-            Ok(ScratchpadPlan::Hide {
-                park: None,
-                minimize: true
+            plan_scratchpad(&pad, &entry, ScratchpadAction::Toggle, here),
+            Ok(ScratchpadPlan::Return {
+                display: DisplayId(1),
+                space: 7
             })
         );
-        // Shown again on the same Space by unminimizing, without a move.
-        let mut minimized = here;
-        minimized.minimized = true;
+        // Without a visit to undo, nothing changes; it is never parked.
+        here.return_to = None;
         assert_eq!(
-            plan_scratchpad(&pad, &entry, ScratchpadAction::Toggle, minimized),
-            Ok(ScratchpadPlan::Show {
-                display: DisplayId(1),
-                space: 4,
-                move_from: None,
-                unminimize: true
-            })
+            plan_scratchpad(&pad, &entry, ScratchpadAction::Toggle, here),
+            Ok(ScratchpadPlan::Nothing)
         );
     }
 
