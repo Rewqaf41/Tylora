@@ -168,6 +168,18 @@ impl Drop for ConfigWatcher {
         }
     }
 }
+/// A display move needs a second display with Desktops. Every display with
+/// Desktops counts, active or not: a display showing a native fullscreen
+/// Space has no active Desktop, and the bindings computed at that moment
+/// must keep the key until the next display change.
+fn display_move_available(spaces: &[NativeSpace], command: &StateCommand) -> bool {
+    let displays: HashSet<_> = spaces.iter().map(|space| space.display).collect();
+    displays.len() > 1
+        && match command {
+            StateCommand::MoveWindowToDisplay { display, .. } => displays.contains(display),
+            _ => true,
+        }
+}
 fn hotkey_supported(command: &StateCommand, config: &Config) -> bool {
     use tylora_macos::spaces::{ExperimentalSkyLightBackend, NativeSpaceBackend};
     if matches!(
@@ -178,20 +190,9 @@ fn hotkey_supported(command: &StateCommand, config: &Config) -> bool {
     ) {
         let backend = ExperimentalSkyLightBackend::new();
         return backend.capabilities().can_move_window_between_spaces
-            && backend.list_spaces().is_ok_and(|spaces| {
-                let displays: HashSet<_> = spaces
-                    .iter()
-                    .filter(|space| space.active)
-                    .map(|space| space.display)
-                    .collect();
-                displays.len() > 1
-                    && match command {
-                        StateCommand::MoveWindowToDisplay { display, .. } => {
-                            displays.contains(display)
-                        }
-                        _ => true,
-                    }
-            });
+            && backend
+                .list_spaces()
+                .is_ok_and(|spaces| display_move_available(&spaces, command));
     }
     if matches!(
         command,
@@ -9549,6 +9550,35 @@ mod tests {
         state.handle_reconciled(window.id.process, Vec::new());
         state.handle_process_exited(window.id.process);
         assert!(state.rule_tracker.is_empty());
+    }
+    #[test]
+    fn display_move_hotkey_survives_fullscreen_space_on_a_display() {
+        use tylora_macos::spaces::{DesktopNumber, NativeSpaceId};
+        let space = |id, display, active| NativeSpace {
+            id: NativeSpaceId(id),
+            desktop: DesktopNumber(1),
+            display: DisplayId(display),
+            active,
+        };
+        let next = StateCommand::MoveWindowToNextDisplay { window: None };
+        // Display 1 shows a fullscreen Space, so none of its Desktops is active.
+        let spaces = vec![space(4, 1, false), space(5871, 2, true)];
+        assert!(display_move_available(&spaces, &next));
+        assert!(display_move_available(
+            &spaces,
+            &StateCommand::MoveWindowToDisplay {
+                window: None,
+                display: DisplayId(1),
+            }
+        ));
+        assert!(!display_move_available(
+            &spaces,
+            &StateCommand::MoveWindowToDisplay {
+                window: None,
+                display: DisplayId(3),
+            }
+        ));
+        assert!(!display_move_available(&[space(4, 1, true)], &next));
     }
     #[test]
     fn confirmed_native_move_reflows_source_and_rebinds_target_without_ghost() {
