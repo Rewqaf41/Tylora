@@ -58,6 +58,14 @@ Users should download the Release asset, which has a stable filename:
 The README button points to GitHub's `releases/latest/download/` URL; it works
 once a non-draft, non-prerelease release has been published.
 
+The `checks` and `build` jobs run in parallel; `publish` waits for both, so a
+failing check still blocks the release. Both jobs restore Rust build caches
+(`Swatinem/rust-cache`, keys `checks` and `release`). GitHub lets a tag run
+restore only caches saved on its own tag or on the default branch, so every
+push to `master` runs the same two jobs without publishing and is the only run
+that saves the caches; a tag pushed right after the version bump restores the
+previous `master` cache and rebuilds just the Tylora crates.
+
 ## Developer ID signing and notarization
 
 Status: **BLOCKED** until an Apple Developer Program membership is available.

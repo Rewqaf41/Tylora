@@ -1,10 +1,14 @@
 # Release pipeline: a `v*` tag checks, builds and publishes a DMG.
 # The public release is ad-hoc signed and unnotarized; release notes explain
 # the extra macOS opening step.
+# Checks and build run in parallel; publish waits for both. A tag run can only
+# restore Rust caches saved on the default branch, so pushes to master run the
+# same jobs (without publishing) and are the only runs that save the caches.
 name: release
 
 on:
   push:
+    branches: [master]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -13,7 +17,8 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  # A newer master push supersedes a cache warm-up; tag runs always finish.
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
 
 jobs:
   checks:
@@ -23,6 +28,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: checks
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: oven-sh/setup-bun@v2
       - name: Versions agree with the tag
         if: startsWith(github.ref, 'refs/tags/v')
@@ -48,11 +57,14 @@ jobs:
           bun run test
 
   build:
-    needs: checks
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: oven-sh/setup-bun@v2
       - name: Build Tylora.app, Tylora.dmg and the signed update archive
         working-directory: apps/gui
@@ -89,7 +101,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [checks, build]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
